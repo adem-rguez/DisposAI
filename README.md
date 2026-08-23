@@ -5,6 +5,7 @@
 **A high-performance, resident local inference daemon & multimodal AI studio written in Rust.**  
 *Every model at your disposal — powered by Dynamic Model Toolization (DMT), Zero-OOM memory budgeting, native CUDA acceleration, and drop-in OpenAI API compatibility.*
 
+[![CI](https://github.com/adem-rguez/DisposAI/actions/workflows/ci.yml/badge.svg)](https://github.com/adem-rguez/DisposAI/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/Rust-1.78%2B-orange?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Tokio](https://img.shields.io/badge/Async-Tokio%20%7C%20Axum-blue?style=for-the-badge&logo=tokio&logoColor=white)](https://tokio.rs/)
 [![CUDA](https://img.shields.io/badge/GPU-NVIDIA%20CUDA-green?style=for-the-badge&logo=nvidia&logoColor=white)](https://developer.nvidia.com/cuda-toolkit)

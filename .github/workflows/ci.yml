@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-check:
+    name: Rust Workspace Check & Test
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cargo Check
+        run: cargo check --workspace --all-targets
+
+      - name: Cargo Test
+        run: cargo test --workspace
+
+  studio-build:
+    name: Desktop Studio (Vite + React) Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Studio Dependencies
+        working-directory: apps/dispos-studio
+        run: npm install
+
+      - name: Build Studio Frontend
+        working-directory: apps/dispos-studio
+        run: npm run build
+
+  sdks-build:
+    name: SDKs Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build TypeScript SDK
+        working-directory: sdk/typescript
+        run: |
+          npm install
+          npm run build
+
+      - name: Validate Python SDK packaging
+        working-directory: sdk/python
+        run: pip install .

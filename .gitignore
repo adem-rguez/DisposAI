@@ -6,6 +6,15 @@ models/**
 *.onnx
 *.bin
 
+# Python cache & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv*/
+venv*/
+temp_edit.py
+
+
 # Private working plan (the public README remains tracked)
 /local-inference-daemon-plan.md
 
