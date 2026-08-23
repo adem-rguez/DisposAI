@@ -64,9 +64,13 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Install Node Dependencies
+        run: npm install
+
       - name: Build TypeScript SDK
         run: npm run build --prefix sdk/typescript
 
       - name: Validate Python SDK packaging
         working-directory: sdk/python
         run: pip install .
+
