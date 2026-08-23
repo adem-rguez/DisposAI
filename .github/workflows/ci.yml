@@ -31,7 +31,7 @@ jobs:
 
   studio-build:
     name: Desktop Studio (Vite + React) Build
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -41,17 +41,15 @@ jobs:
         with:
           node-version: 20
 
-      - name: Install Studio Dependencies
-        working-directory: apps/dispos-studio
+      - name: Install Dependencies
         run: npm install
 
       - name: Build Studio Frontend
-        working-directory: apps/dispos-studio
-        run: npm run build
+        run: npm run build --prefix apps/dispos-studio
 
   sdks-build:
     name: SDKs Validation
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -67,10 +65,7 @@ jobs:
           python-version: '3.11'
 
       - name: Build TypeScript SDK
-        working-directory: sdk/typescript
-        run: |
-          npm install
-          npm run build
+        run: npm run build --prefix sdk/typescript
 
       - name: Validate Python SDK packaging
         working-directory: sdk/python
