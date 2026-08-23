@@ -70,6 +70,19 @@ fn next_free_sd_port() -> u16 {
 /// while to load.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Resolution status of one split-checkpoint sibling component, for preview
+/// in the model list/config UI (see `SdBackend::detect_image_components`).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ImageComponentStatus {
+    pub kind_name: String,
+    /// Set when an existing file satisfying this component was found.
+    pub resolved_path: Option<String>,
+    /// Set when nothing was found: the shared directory it should be placed in.
+    pub target_path: Option<String>,
+    /// Set when nothing was found and a known download source exists.
+    pub source: Option<backend_trait::MissingComponentSource>,
+}
+
 pub struct SdBackend {
     model_path: Option<PathBuf>,
     is_loaded: Arc<AtomicBool>,
@@ -325,6 +338,51 @@ impl SdBackend {
         Self::find_component_recursive(&shared_dir, &patterns)
     }
 
+    /// Preview the split-checkpoint sibling components (text encoder, VAE)
+    /// a standalone diffusion-model GGUF/checkpoint needs, without erroring
+    /// on anything missing — used by the model list/config UI to surface
+    /// resolved paths (and downloadable sources for anything absent) before
+    /// the user attempts generation. Returns `None` if the filename doesn't
+    /// match a known split-checkpoint architecture family (e.g. it's a
+    /// self-contained single-file checkpoint).
+    pub fn detect_image_components(model_path: &Path) -> Option<Vec<ImageComponentStatus>> {
+        let filename = model_path.file_name().and_then(|n| n.to_str())?;
+        let spec = match_component_spec(filename)?;
+        let diffusion_dir = model_path.parent().unwrap_or_else(|| Path::new("."));
+        let models_root = Self::resolve_models_root();
+
+        let statuses = spec
+            .components
+            .iter()
+            .map(|kind| match Self::resolve_component(kind, diffusion_dir, models_root.as_deref()) {
+                Some(path) => ImageComponentStatus {
+                    kind_name: kind.display_name().to_string(),
+                    resolved_path: Some(path.display().to_string()),
+                    target_path: None,
+                    source: None,
+                },
+                None => {
+                    let shared_dir = models_root
+                        .as_ref()
+                        .map(|root| root.join(kind.shared_subdir().replace('/', std::path::MAIN_SEPARATOR_STR)))
+                        .unwrap_or_else(|| PathBuf::from(format!("models/{}", kind.shared_subdir())));
+                    let source = spec.default_source_for(kind).map(|src| backend_trait::MissingComponentSource {
+                        repo: src.repo.to_string(),
+                        filename: src.filename.to_string(),
+                        target_filename: src.target_filename.to_string(),
+                    });
+                    ImageComponentStatus {
+                        kind_name: kind.display_name().to_string(),
+                        resolved_path: None,
+                        target_path: Some(shared_dir.display().to_string()),
+                        source,
+                    }
+                }
+            })
+            .collect();
+        Some(statuses)
+    }
+
     /// Build a `SdCommandMode::Component` for `model_path` by matching its
     /// filename against the architecture family table and resolving every
     /// required component. Returns the spec's `default_cfg_scale`/
@@ -364,7 +422,7 @@ impl SdBackend {
                     ComponentKind::ClipG => clip_g = Some(path),
                     ComponentKind::T5xxl => t5xxl = Some(path),
                     ComponentKind::Llm(_) => llm = Some(path),
-                    ComponentKind::Vae => vae = Some(path),
+                    ComponentKind::Vae(_) => vae = Some(path),
                 },
                 None => {
                     let shared_dir = models_root
@@ -428,8 +486,18 @@ impl SdBackend {
         steps_override: Option<u32>,
         gguf_progress: &Arc<Mutex<GgufProgress>>,
         cancel: Option<&Arc<AtomicBool>>,
+        init_image: Option<&[u8]>,
     ) -> Result<Vec<u8>, BackendError> {
         let out_path = std::env::temp_dir().join(format!("dispos_sd_{}.png", request_id));
+        let init_img_path = std::env::temp_dir().join(format!("dispos_sd_init_{}.png", request_id));
+        if let Some(bytes) = init_image {
+            if let Err(e) = tokio::fs::write(&init_img_path, bytes).await {
+                return Err(BackendError::InferenceError(format!(
+                    "Failed to write init image temp file: {}",
+                    e
+                )));
+            }
+        }
         let total_steps = params.steps.or(steps_override).unwrap_or(20);
         let cfg_scale = params.cfg_scale.or(cfg_scale_override).unwrap_or(7.0);
 
@@ -480,6 +548,10 @@ impl SdBackend {
         cmd.arg("-H").arg(params.height.unwrap_or(512).to_string());
         if let Some(seed) = params.seed {
             cmd.arg("-s").arg(seed.to_string());
+        }
+        if init_image.is_some() {
+            cmd.arg("-i").arg(&init_img_path);
+            cmd.arg("--strength").arg(params.strength.unwrap_or(0.75).to_string());
         }
         cmd.arg("-o").arg(&out_path);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -639,6 +711,10 @@ impl SdBackend {
 
         let status = wait_result?;
 
+        if init_image.is_some() {
+            let _ = tokio::fs::remove_file(&init_img_path).await;
+        }
+
         if !status.success() {
             let stderr = String::from_utf8_lossy(&stderr_buf).to_string();
             let _ = tokio::fs::remove_file(&out_path).await;
@@ -669,9 +745,10 @@ impl SdBackend {
         params: &ImageParams,
         gguf_progress: &Arc<Mutex<GgufProgress>>,
         cancel: Option<&Arc<AtomicBool>>,
+        init_image: Option<&[u8]>,
     ) -> Result<Vec<u8>, BackendError> {
         let legacy_mode = SdCommandMode::Legacy(model_path.to_path_buf());
-        match Self::run_sd_exe(sd_binary, &legacy_mode, request_id, prompt, params, None, None, gguf_progress, cancel).await {
+        match Self::run_sd_exe(sd_binary, &legacy_mode, request_id, prompt, params, None, None, gguf_progress, cancel, init_image).await {
             Ok(bytes) => Ok(bytes),
             Err(BackendError::InferenceError(msg)) if msg.contains(SD_VERSION_SNIFF_FAILURE) => {
                 info!(
@@ -690,6 +767,7 @@ impl SdBackend {
                     default_steps,
                     gguf_progress,
                     cancel,
+                    init_image,
                 )
                 .await
             }
@@ -703,13 +781,14 @@ impl SdBackend {
         port: u16,
         prompt: &str,
         params: &ImageParams,
+        init_image: Option<&[u8]>,
     ) -> Result<Vec<u8>, BackendError> {
         let client = reqwest::Client::builder()
             .no_proxy()
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "prompt": prompt,
             "negative_prompt": params.negative_prompt,
             "steps": params.steps.unwrap_or(20),
@@ -718,6 +797,12 @@ impl SdBackend {
             "height": params.height.unwrap_or(512),
             "seed": params.seed,
         });
+
+        if let Some(bytes) = init_image {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+            payload["init_image_base64"] = serde_json::Value::String(b64);
+            payload["strength"] = serde_json::json!(params.strength.unwrap_or(0.75));
+        }
 
         let url = format!("http://127.0.0.1:{}/generate", port);
         let response = client
@@ -945,10 +1030,11 @@ impl InferenceBackend for SdBackend {
                 &params,
                 &self.gguf_progress,
                 request.cancel.as_ref(),
+                request.image_input.as_deref(),
             )
             .await?
         } else if self.process.is_some() {
-            Self::generate_diffusers(self.port, &request.prompt, &params).await?
+            Self::generate_diffusers(self.port, &request.prompt, &params, request.image_input.as_deref()).await?
         } else {
             // Simulation mode: no sd.exe binary and no diffusers server running
             // (e.g. missing model file or missing runtime dependencies).

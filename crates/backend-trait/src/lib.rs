@@ -129,6 +129,7 @@ pub struct ImageParams {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub seed: Option<i64>,
+    pub strength: Option<f32>,
 }
 
 /// Parameters specific to 3D-mesh-generation requests (Modality::Mesh3D).
@@ -160,6 +161,29 @@ pub struct AudioParams {
     pub speed: Option<f32>,
 }
 
+/// Parameters specific to video-generation requests (Modality::Video). Every
+/// field is optional so backends fall back to their own sensible defaults;
+/// text/image/audio/mesh backends simply ignore this field.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VideoParams {
+    pub negative_prompt: Option<String>,
+    /// Conditioning image for img2video pipelines (e.g. Stable Video
+    /// Diffusion). Text-to-video pipelines simply ignore this.
+    pub image: Option<Vec<u8>>,
+    pub num_frames: Option<u32>,
+    pub height: Option<u32>,
+    pub width: Option<u32>,
+    pub num_inference_steps: Option<u32>,
+    pub guidance_scale: Option<f32>,
+    pub fps: Option<u32>,
+    pub seed: Option<i64>,
+    pub output_format: Option<String>,
+    /// Any adapter-specific parameters not covered by the named fields above,
+    /// passed straight through to `video_diffusers_server.py` untouched.
+    #[serde(default)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceRequest {
     pub request_id: String,
@@ -184,6 +208,9 @@ pub struct InferenceRequest {
     /// Speech-synthesis params (Modality::AudioTts only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_params: Option<AudioParams>,
+    /// Video-generation params (Modality::Video only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_params: Option<VideoParams>,
     /// Cooperative cancellation flag. Backends that support cancelling an
     /// in-flight generation (e.g. sd-backend's `sd.exe` subprocess,
     /// llama-backend's HTTP request) poll this and return

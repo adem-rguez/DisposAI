@@ -1,8 +1,69 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
+
+/// A model/image/video/mesh generation the orchestrator produced (or a user
+/// image upload), tracked per-conversation so a later "edit it" style request
+/// can be resolved to the right media handle without vision input.
+#[derive(Debug, Clone)]
+pub struct GeneratedAsset {
+    pub id: String,
+    pub modality: String,
+    pub model: String,
+    pub prompt: String,
+    pub created_at: Instant,
+}
+
+/// Per-conversation registry of generated assets, keyed by conversation_id.
+pub type GeneratedAssetRegistry = Arc<Mutex<HashMap<String, Vec<GeneratedAsset>>>>;
+
+/// Cap on how many assets we remember per conversation before evicting the oldest.
+const MAX_ASSETS_PER_CONVERSATION: usize = 30;
+/// Conversations idle longer than this are dropped entirely on the periodic sweep.
+const CONVERSATION_ASSET_TTL_SECS: u64 = 1800;
+
+/// Record a newly generated or uploaded asset for a conversation, evicting the
+/// oldest entry first if the conversation is already at capacity.
+pub async fn record_generated_asset(
+    registry: &GeneratedAssetRegistry,
+    conversation_id: &str,
+    asset: GeneratedAsset,
+) {
+    let mut map = registry.lock().await;
+    let bucket = map.entry(conversation_id.to_string()).or_default();
+    if bucket.len() >= MAX_ASSETS_PER_CONVERSATION {
+        bucket.remove(0);
+    }
+    bucket.push(asset);
+}
+
+/// Most recently generated/uploaded asset of a given modality for a conversation.
+pub async fn latest_asset_of_modality(
+    registry: &GeneratedAssetRegistry,
+    conversation_id: &str,
+    modality: &str,
+) -> Option<GeneratedAsset> {
+    let map = registry.lock().await;
+    map.get(conversation_id)?
+        .iter()
+        .rev()
+        .find(|a| a.modality == modality)
+        .cloned()
+}
+
+/// Remove assets past their TTL and drop conversations left with none. Mirrors
+/// `MediaStore::cleanup_expired`'s sweep pattern.
+pub async fn cleanup_expired_assets(registry: &GeneratedAssetRegistry) {
+    let ttl = Duration::from_secs(CONVERSATION_ASSET_TTL_SECS);
+    let mut map = registry.lock().await;
+    map.retain(|_, assets| {
+        assets.retain(|a| a.created_at.elapsed() < ttl);
+        !assets.is_empty()
+    });
+}
 
 pub struct MediaEntry {
     pub data: Vec<u8>,

@@ -2126,8 +2126,10 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "backend-trait",
+ "base64",
  "bytes",
  "futures",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror",
@@ -2234,8 +2236,10 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "backend-trait",
+ "base64",
  "bytes",
  "futures",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror",

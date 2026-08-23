@@ -14,7 +14,7 @@ use crate::profiler::{FitEstimationRequest, FitEstimationResult, HardwareProfile
 use crate::session::{ActiveSession, SessionManager};
 use crate::tool_fallback;
 use crate::orchestrator_tools;
-use crate::media_store::MediaStore;
+use crate::media_store::{GeneratedAsset, GeneratedAssetRegistry, MediaStore};
 use backend_trait::{GenerationProgress, InferenceBackend, InferenceRequest, Modality, SamplingParams, ToolCall};
 use llama_backend::process_tracker::ChildRegistry;
 use moe_cache::MoeExpertCache;
@@ -28,12 +28,15 @@ pub struct LoadedModelEntry {
     pub gpu_layers: u32,
     pub context_size: u32,
     pub port: u16,
-    pub modality: String,
+    /// HuggingFace-style task tag(s) this model is classified with (e.g.
+    /// `"text-to-image"`, `"image-to-3d"`). May contain more than one tag.
+    pub task_tags: Vec<String>,
     /// True when this loaded instance can accept image input — either a native
     /// vision model, or a text model launched with an `--mmproj` projector.
     pub image_input_available: bool,
-    /// For `modality == "mesh3d"`, which input kinds this model accepts
-    /// (subset of "text", "image", "multi_image"). `None` for other modalities.
+    /// For mesh3d models (task_tags containing "text-to-3d"/"image-to-3d"),
+    /// which input kinds this model accepts (subset of "text", "image",
+    /// "multi_image"). `None` for other models.
     pub mesh_input_kinds: Option<Vec<String>>,
 }
 
@@ -71,9 +74,9 @@ pub struct AppState {
     /// Broadcast channel for graceful shutdown. Sent by `/shutdown` endpoint.
     pub shutdown_signal: tokio::sync::broadcast::Sender<()>,
     pub media_store: Arc<MediaStore>,
-    /// Tracks in-progress Hugging Face model downloads, keyed by filename.
+    /// Tracks in-progress Hugging Face model downloads, keyed by repo+filename.
     pub hf_downloads: Arc<tokio::sync::Mutex<HashMap<String, DownloadProgress>>>,
-    /// Cancellation flags for in-progress Hugging Face downloads, keyed by filename.
+    /// Cancellation flags for in-progress Hugging Face downloads, keyed by repo+filename.
     pub hf_cancel: Arc<tokio::sync::Mutex<HashMap<String, Arc<AtomicBool>>>>,
     /// Progress records for in-progress/completed generation jobs (image/mesh/tts), keyed by job_id.
     pub job_progress: Arc<tokio::sync::Mutex<HashMap<String, GenerationProgress>>>,
@@ -84,10 +87,11 @@ pub struct AppState {
     pub studio_models: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
     /// Runtime-configurable Hugging Face auth token (overrides HF_TOKEN env var / cached token file).
     pub hf_token: Arc<tokio::sync::Mutex<Option<String>>>,
-    /// Media handle of the most recently attached user image, so `run_model` can fall back to
-    /// it when the orchestrator calls an image-consuming tool (e.g. 3D mesh) without an
-    /// explicit `image` argument.
-    pub last_image_handle: Arc<tokio::sync::Mutex<Option<String>>>,
+    /// Every image/video/mesh (generated or user-uploaded) produced in each conversation,
+    /// keyed by `conversation_id`. Lets `run_model` resolve pronoun references like "edit
+    /// it" to the right media handle, and lets the orchestrator fall back to the most
+    /// recent matching asset when a media-consuming tool call omits its argument.
+    pub generated_assets: GeneratedAssetRegistry,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,6 +151,34 @@ fn image_handle_note(media_id: &str) -> String {
     )
 }
 
+/// Plain-text manifest of every asset generated/uploaded so far in this conversation,
+/// appended to the system prompt so the model can resolve pronoun references like
+/// "edit it" to a concrete media handle. Omits the section entirely when empty.
+async fn generated_assets_manifest(state: &AppState, conversation_id: &str) -> String {
+    let map = state.generated_assets.lock().await;
+    match map.get(conversation_id) {
+        Some(assets) if !assets.is_empty() => {
+            let mut note = String::from("\n\nAssets generated in this conversation (most recent first):");
+            for (i, a) in assets.iter().rev().enumerate() {
+                let suffix = if i == 0 { " (most recent)" } else { "" };
+                note.push_str(&format!(
+                    "\n- id={} modality={} model={} prompt=\"{}\"{}",
+                    a.id, a.modality, a.model, a.prompt, suffix
+                ));
+            }
+            note.push_str(
+                "\n\nWhen the user refers to something generated above (e.g. \"it\", \"that image\", \
+                 \"the one you just made\", or asks to redo/retry/fix/improve it) — reuse the exact \
+                 `model` and `prompt` values from that entry automatically. Do NOT ask the user to \
+                 repeat the model name or prompt; you already have them. Only ask the user a question \
+                 if they request something the list above cannot resolve.",
+            );
+            note
+        }
+        _ => String::new(),
+    }
+}
+
 
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
@@ -157,6 +189,20 @@ pub struct ChatCompletionRequest {
     pub max_tokens: Option<u32>,
     pub enable_tools: Option<bool>,
     pub tool_choice: Option<String>,
+    /// Whether the model should generate reasoning/thinking tokens. Defaults
+    /// to true (preserves prior hardcoded behavior) when omitted.
+    pub enable_thinking: Option<bool>,
+    /// Client-supplied identifier for the chat thread this request belongs to.
+    /// Used to scope the generated-assets registry so "edit it" style follow-ups
+    /// resolve correctly across separate HTTP requests in the same conversation.
+    /// Requests without one share a common `"default"` bucket (backward compatible).
+    pub conversation_id: Option<String>,
+}
+
+/// Conversation bucket key for the generated-assets registry, falling back to a
+/// shared `"default"` bucket when the client sent no `conversation_id`.
+fn conversation_key(conversation_id: &Option<String>) -> String {
+    conversation_id.clone().unwrap_or_else(|| "default".to_string())
 }
 
 #[derive(Debug, Serialize)]
@@ -188,6 +234,10 @@ pub struct ImageGenerationRequest {
     pub seed: Option<i64>,
     #[serde(default)]
     pub job_id: Option<String>,
+    #[serde(default)]
+    pub image: Option<String>,
+    #[serde(default)]
+    pub strength: Option<f32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -232,6 +282,37 @@ pub struct Mesh3dGenerationResponse {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct VideoGenerationRequest {
+    pub prompt: String,
+    pub negative_prompt: Option<String>,
+    /// Base64-encoded conditioning image for img2video pipelines (e.g. Stable
+    /// Video Diffusion). Text-to-video pipelines simply ignore this.
+    pub image: Option<String>,
+    pub num_frames: Option<u32>,
+    pub height: Option<u32>,
+    pub width: Option<u32>,
+    pub num_inference_steps: Option<u32>,
+    pub guidance_scale: Option<f32>,
+    pub fps: Option<u32>,
+    pub seed: Option<i64>,
+    pub output_format: Option<String>,
+    #[serde(default)]
+    pub job_id: Option<String>,
+    /// Any adapter-specific parameters not matching the named fields above,
+    /// passed straight through to `video_diffusers_server.py` untouched.
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VideoGenerationResponse {
+    pub created: u64,
+    pub video_b64: String,
+    pub generation_time_ms: u64,
+    pub job_id: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct SpeechRequest {
     pub model: String,
     pub input: String,
@@ -248,9 +329,51 @@ pub struct SpeechResponse {
     pub job_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct TranscriptionRequest {
+    /// Base64-encoded audio file bytes (wav/flac/ogg/mp3).
+    pub audio_b64: String,
+    #[serde(default)]
+    pub language: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct TranscriptionResponse {
     pub text: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum EmbeddingsInput {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EmbeddingsRequest {
+    pub model: String,
+    pub input: EmbeddingsInput,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmbeddingObject {
+    pub object: &'static str,
+    pub embedding: Vec<f32>,
+    pub index: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmbeddingsUsage {
+    pub prompt_tokens: u32,
+    pub total_tokens: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmbeddingsResponse {
+    pub object: &'static str,
+    pub data: Vec<EmbeddingObject>,
+    pub model: String,
+    pub usage: EmbeddingsUsage,
 }
 
 #[derive(Debug, Serialize)]
@@ -269,8 +392,11 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/chat/completions/stream", post(stream_chat_completions))
+        .route("/v1/embeddings", post(embeddings))
         .route("/v1/media/:id", get(get_media))
         .route("/v1/images/generations", post(generate_images))
+        .route("/v1/videos/generations", post(generate_videos))
+        .route("/v1/videos/schema", get(get_video_schema))
         .route("/v1/models3d/generations", post(generate_mesh3d))
         .route("/v1/models3d/schema", get(get_mesh3d_schema))
         .route("/v1/audio/transcriptions", post(transcribe_audio))
@@ -806,7 +932,7 @@ async fn dashboard_landing() -> Html<&'static str> {
             overflow: hidden;
             position: relative;
         }
-        .media-preview img {
+        .media-preview img, .media-preview video {
             width: 100%;
             height: 100%;
             object-fit: contain;
@@ -978,10 +1104,10 @@ async fn dashboard_landing() -> Html<&'static str> {
                 <div class="card" style="max-width: 700px;">
                     <div class="form-group">
                         <label>Video Prompt</label>
-                        <input type="text" value="A serene waterfall in a mystical forest, cinematic motion, 4k">
+                        <input type="text" id="videoPrompt" value="A serene waterfall in a mystical forest, cinematic motion, 4k">
                     </div>
-                    <button class="btn-action"><i class="fa-solid fa-film"></i> Render Video Sequence</button>
-                    <div class="media-preview" style="margin-top: 1rem;">
+                    <button class="btn-action" id="videoGenBtn" onclick="generateVideo()"><i class="fa-solid fa-film"></i> Render Video Sequence</button>
+                    <div class="media-preview" id="videoPreview" style="margin-top: 1rem;">
                         <i class="fa-solid fa-circle-play" style="font-size: 3rem;"></i>
                         <span>Video output player preview</span>
                     </div>
@@ -1137,6 +1263,66 @@ async fn dashboard_landing() -> Html<&'static str> {
             }
         }
 
+        async function generateVideo() {
+            const prompt = document.getElementById('videoPrompt').value;
+            const btn = document.getElementById('videoGenBtn');
+            const preview = document.getElementById('videoPreview');
+            const jobId = 'job-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+
+            btn.disabled = true;
+            preview.innerHTML = `
+                <i class="fa-solid fa-circle-notch fa-spin" style="font-size: 2rem;"></i>
+                <span id="videoProgressText">Rendering video sequence...</span>
+                <div class="stat-progress" style="width: 80%;"><div class="stat-bar" id="videoProgressBar" style="width: 0%;"></div></div>
+            `;
+
+            let polling = true;
+            const pollProgress = async () => {
+                while (polling) {
+                    try {
+                        const pres = await fetch(`/v1/jobs/${jobId}/progress`);
+                        if (pres.ok) {
+                            const p = await pres.json();
+                            const bar = document.getElementById('videoProgressBar');
+                            const text = document.getElementById('videoProgressText');
+                            if (bar && text) {
+                                if (p.percent >= 0) {
+                                    bar.style.width = `${p.percent}%`;
+                                    text.textContent = `${p.phase} (${Math.round(p.percent)}%)`;
+                                } else {
+                                    text.textContent = p.phase || 'Rendering video sequence...';
+                                }
+                            }
+                            if (p.status === 'done' || p.status === 'error' || p.status === 'cancelled') break;
+                        }
+                    } catch (e) { /* ignore transient poll errors */ }
+                    await new Promise(r => setTimeout(r, 300));
+                }
+            };
+            const pollPromise = pollProgress();
+
+            try {
+                const res = await fetch('/v1/videos/generations', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ prompt: prompt, job_id: jobId })
+                });
+                polling = false;
+                await pollPromise;
+                if (!res.ok) {
+                    throw new Error((await res.text()) || res.statusText);
+                }
+                const data = await res.json();
+                preview.innerHTML = `<video controls autoplay src="data:video/mp4;base64,${data.video_b64}"></video>`;
+            } catch (e) {
+                polling = false;
+                await pollPromise;
+                preview.innerHTML = `<span style="color: #ef4444;">Video generation error: ${e.message || e}</span>`;
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
         async function synthesizeSpeech() {
             const text = document.getElementById('ttsInput').value;
             const container = document.getElementById('audioPlayerContainer');
@@ -1234,9 +1420,62 @@ fn extract_message_text(content: &serde_json::Value) -> String {
 fn first_chat_port(models: &HashMap<String, LoadedModelEntry>) -> u16 {
     models
         .values()
-        .find(|e| matches!(e.modality.as_str(), "text" | "vision"))
+        .find(|e| crate::task_tags::backend_category_for_tags(&e.task_tags).is_none())
         .map(|e| e.port)
         .unwrap_or(50052)
+}
+
+/// OpenAI-compatible `/v1/embeddings` — thin passthrough to the loaded text
+/// model's own llama-server `/v1/embeddings` endpoint.
+async fn embeddings(
+    State(state): State<AppState>,
+    Json(payload): Json<EmbeddingsRequest>,
+) -> Result<Json<EmbeddingsResponse>, (axum::http::StatusCode, String)> {
+    let port: u16 = {
+        let models = state.loaded_models.lock().await;
+        first_chat_port(&models)
+    };
+
+    let inputs: Vec<String> = match payload.input {
+        EmbeddingsInput::Single(s) => vec![s],
+        EmbeddingsInput::Multiple(v) => v,
+    };
+
+    let client = reqwest::Client::builder().no_proxy().build().unwrap_or_else(|_| reqwest::Client::new());
+    let url = format!("http://127.0.0.1:{}/v1/embeddings", port);
+    let req_body = serde_json::json!({ "model": "local", "input": inputs });
+
+    let res = client.post(&url).json(&req_body).send().await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e.to_string()))?;
+
+    if !res.status().is_success() {
+        let status = res.status();
+        let err = res.text().await.unwrap_or_default();
+        return Err((axum::http::StatusCode::BAD_GATEWAY, format!("llama-server /v1/embeddings {} error: {}", status, err)));
+    }
+
+    let body: serde_json::Value = res.json().await
+        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e.to_string()))?;
+
+    let data: Vec<EmbeddingObject> = body["data"].as_array()
+        .map(|arr| arr.iter().enumerate().map(|(i, item)| {
+            let embedding = item["embedding"].as_array()
+                .map(|e| e.iter().filter_map(|v| v.as_f64()).map(|v| v as f32).collect())
+                .unwrap_or_default();
+            let index = item["index"].as_u64().map(|v| v as usize).unwrap_or(i);
+            EmbeddingObject { object: "embedding", embedding, index }
+        }).collect())
+        .unwrap_or_default();
+
+    let prompt_tokens = body["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32;
+    let total_tokens = body["usage"]["total_tokens"].as_u64().unwrap_or(prompt_tokens as u64) as u32;
+
+    Ok(Json(EmbeddingsResponse {
+        object: "list",
+        data,
+        model: payload.model,
+        usage: EmbeddingsUsage { prompt_tokens, total_tokens },
+    }))
 }
 
 async fn stream_chat_completions(
@@ -1293,9 +1532,24 @@ async fn stream_chat_completions(
     } else {
         None
     };
+    let conversation_id = conversation_key(&payload.inner.conversation_id);
     let image_media_id = if let Some((bytes, mime)) = image_input {
         let id = state.media_store.store(bytes, &mime).await;
-        *state.last_image_handle.lock().await = Some(id.clone());
+        let upload_prompt = payload.inner.messages.iter().rev()
+            .find(|m| m.role == "user")
+            .map(|m| extract_message_text(&m.content))
+            .unwrap_or_default();
+        crate::media_store::record_generated_asset(
+            &state.generated_assets,
+            &conversation_id,
+            GeneratedAsset {
+                id: id.clone(),
+                modality: "image".to_string(),
+                model: "user_upload".to_string(),
+                prompt: upload_prompt,
+                created_at: std::time::Instant::now(),
+            },
+        ).await;
         Some(id)
     } else {
         None
@@ -1322,6 +1576,11 @@ async fn stream_chat_completions(
         Some(id) => format!("{}{}", system_content, image_handle_note(id)),
         None => system_content,
     };
+    let system_content = format!(
+        "{}{}",
+        system_content,
+        generated_assets_manifest(&state, &conversation_id).await
+    );
 
     let mut chat_messages: Vec<serde_json::Value> = vec![
         serde_json::json!({ "role": "system", "content": system_content })
@@ -1341,6 +1600,21 @@ async fn stream_chat_completions(
             chat_messages.push(serde_json::json!({ "role": msg.role, "content": msg.content }));
         }
     }
+    // The user resolved a list_models ambiguity by picking one option. Pin it
+    // as a hint rather than assuming the goal was run_model — the original
+    // request might have been e.g. "what params does this model take?", which
+    // should still resolve to inspect_model.
+    if let Some(model) = payload.forced_model.as_ref().filter(|m| !m.is_empty()) {
+        chat_messages.push(serde_json::json!({
+            "role": "system",
+            "content": format!(
+                "The user picked '{}' from the list of matching models. Use exactly \
+                 this model name for whichever tool call fits their request \
+                 (run_model or inspect_model).",
+                model
+            )
+        }));
+    }
 
     let tools_json: Vec<serde_json::Value> = tool_schemas.iter().map(|t| {
         serde_json::json!({
@@ -1356,12 +1630,13 @@ async fn stream_chat_completions(
     let max_tokens = payload.inner.max_tokens.unwrap_or(4096);
     let temperature = payload.inner.temperature.unwrap_or(0.7);
     let top_p = payload.inner.top_p.unwrap_or(0.9);
+    let thinking = payload.inner.enable_thinking.unwrap_or(true);
 
     let url = format!("http://127.0.0.1:{}/v1/chat/completions", port);
     let client = reqwest::Client::builder().no_proxy().build().unwrap_or_else(|_| reqwest::Client::new());
     let upstream = client
         .post(&url)
-        .json(&stream_request_body(&chat_messages, &tools_json, max_tokens, temperature, top_p))
+        .json(&stream_request_body(&chat_messages, &tools_json, max_tokens, temperature, top_p, thinking))
         .send()
         .await
         .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e.to_string()))?;
@@ -1375,70 +1650,11 @@ async fn stream_chat_completions(
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(512);
 
     let autopilot = payload.autopilot.unwrap_or(false);
-    let forced_model = payload.forced_model.clone();
 
     let task_state = state.clone();
     let task_tool_schemas = tool_schemas.clone();
+    let task_conversation_id = conversation_id.clone();
     tokio::spawn(async move {
-        // Forced-model short-circuit: skip the orchestrator loop entirely and
-        // run the requested model directly against the last user message.
-        if let Some(model) = forced_model.as_ref().filter(|m| !m.is_empty()) {
-            let prompt = payload.inner.messages.iter().rev()
-                .find(|m| m.role == "user")
-                .map(|m| extract_message_text(&m.content))
-                .unwrap_or_default();
-
-            let tool_call = ToolCall {
-                id: format!("forced-{}", uuid::Uuid::new_v4()),
-                name: "run_model".to_string(),
-                arguments: serde_json::json!({ "model": model, "prompt": prompt }),
-            };
-
-            let job_id = format!("tool-{}", uuid::Uuid::new_v4());
-
-            let status_event = serde_json::json!({
-                "type": "tool_status",
-                "tool_name": tool_call.name,
-                "arguments": tool_call.arguments,
-                "status": "executing",
-                "job_id": job_id,
-            });
-            if tx.send(Ok(Event::default().data(status_event.to_string()))).await.is_err() {
-                return;
-            }
-
-            let result = match orchestrator_tools::dispatch(&task_state, &tool_call, &job_id).await {
-                Some(result) => result,
-                None => backend_trait::ToolResult {
-                    tool_call_id: tool_call.id.clone(),
-                    content: format!("Unknown tool: '{}'.", tool_call.name),
-                    media_handle: None,
-                    media_data: None,
-                    media_type: None,
-                    is_error: true,
-                },
-            };
-
-            let mut result_event = serde_json::json!({
-                "type": "tool_result",
-                "tool_name": tool_call.name,
-                "arguments": tool_call.arguments,
-                "content": result.content,
-                "is_error": result.is_error,
-                "job_id": job_id,
-            });
-            if let Some(handle) = &result.media_handle {
-                result_event["media_url"] = serde_json::Value::String(handle.clone());
-            }
-            if let Some(media_type) = &result.media_type {
-                result_event["media_type"] = serde_json::Value::String(media_type.clone());
-            }
-            let _ = tx.send(Ok(Event::default().data(result_event.to_string()))).await;
-
-            let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
-            return;
-        }
-
         // The orchestrator loop: generate, run whatever tool the model asked for,
         // hand the result back, generate again. Ends on a turn that asks for none.
         let mut messages = chat_messages;
@@ -1448,7 +1664,7 @@ async fn stream_chat_completions(
             let response = match pending.take() {
                 Some(response) => response,
                 None => {
-                    let body = stream_request_body(&messages, &tools_json, max_tokens, temperature, top_p);
+                    let body = stream_request_body(&messages, &tools_json, max_tokens, temperature, top_p, thinking);
                     match client.post(&url).json(&body).send().await {
                         Ok(response) => response,
                         Err(e) => {
@@ -1572,7 +1788,7 @@ async fn stream_chat_completions(
             }
 
             // Dispatch via the orchestrator tools (list_models / run_model).
-            let result = match orchestrator_tools::dispatch(&task_state, &tool_call, &job_id).await {
+            let result = match orchestrator_tools::dispatch(&task_state, &tool_call, &job_id, &task_conversation_id).await {
                 Some(result) => result,
                 None => backend_trait::ToolResult {
                     tool_call_id: tool_call.id.clone(),
@@ -1609,7 +1825,12 @@ async fn stream_chat_completions(
                 if let Ok(mut rows) = serde_json::from_str::<Vec<serde_json::Value>>(&result.content) {
                     if let Some(target) = infer_modality(&last_user_prompt) {
                         let filtered: Vec<serde_json::Value> = rows.iter()
-                            .filter(|row| row["modality"].as_str() == Some(target))
+                            .filter(|row| {
+                                let tags: Vec<String> = row["task_tags"].as_array()
+                                    .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                                    .unwrap_or_default();
+                                crate::task_tags::backend_category_for_tags(&tags) == Some(target)
+                            })
                             .cloned()
                             .collect();
                         if !filtered.is_empty() {
@@ -1665,17 +1886,17 @@ async fn stream_chat_completions(
 
 /// Best-effort guess of the output modality the user is asking for, so the
 /// model picker only offers compatible models. Returns None when unsure.
-fn infer_modality(prompt: &str) -> Option<&'static str> {
+fn infer_modality(prompt: &str) -> Option<Modality> {
     let p = prompt.to_lowercase();
     let has = |words: &[&str]| words.iter().any(|w| p.contains(w));
     if has(&["image", "picture", "photo", "draw", "render", "paint", "logo", "wallpaper", "illustration"]) {
-        Some("image")
+        Some(Modality::Image)
     } else if has(&["video", "animate", "animation", "movie", " clip"]) {
-        Some("video")
+        Some(Modality::Video)
     } else if has(&["transcribe", "transcription", "transcript"]) {
-        Some("audio")
+        Some(Modality::AudioAsr)
     } else if has(&["speak", "voice", "narrate", "read aloud", "speech", "pronounce", "text to speech", "tts"]) {
-        Some("tts")
+        Some(Modality::AudioTts)
     } else {
         None
     }
@@ -1688,6 +1909,7 @@ fn stream_request_body(
     max_tokens: u32,
     temperature: f32,
     top_p: f32,
+    thinking: bool,
 ) -> serde_json::Value {
     let mut body = serde_json::json!({
         "model": "local",
@@ -1697,7 +1919,7 @@ fn stream_request_body(
         "top_p": top_p,
         "repeat_penalty": 1.15,
         "stream": true,
-        "thinking": true,
+        "thinking": thinking,
     });
     if !tools.is_empty() {
         body["tools"] = serde_json::Value::Array(tools.to_vec());
@@ -1739,9 +1961,24 @@ async fn chat_completions(
     } else {
         None
     };
+    let conversation_id = conversation_key(&payload.conversation_id);
     let image_media_id = if let Some((bytes, mime)) = image_input {
         let id = state.media_store.store(bytes, &mime).await;
-        *state.last_image_handle.lock().await = Some(id.clone());
+        let upload_prompt = payload.messages.iter().rev()
+            .find(|m| m.role == "user")
+            .map(|m| extract_message_text(&m.content))
+            .unwrap_or_default();
+        crate::media_store::record_generated_asset(
+            &state.generated_assets,
+            &conversation_id,
+            GeneratedAsset {
+                id: id.clone(),
+                modality: "image".to_string(),
+                model: "user_upload".to_string(),
+                prompt: upload_prompt,
+                created_at: std::time::Instant::now(),
+            },
+        ).await;
         Some(id)
     } else {
         None
@@ -1769,6 +2006,11 @@ async fn chat_completions(
         Some(id) => format!("{}{}", system_content, image_handle_note(id)),
         None => system_content,
     };
+    let system_content = format!(
+        "{}{}",
+        system_content,
+        generated_assets_manifest(&state, &conversation_id).await
+    );
 
     let mut chat_messages: Vec<serde_json::Value> = vec![
         serde_json::json!({"role": "system", "content": system_content})
@@ -1797,7 +2039,7 @@ async fn chat_completions(
         "temperature": payload.temperature.unwrap_or(0.7),
         "top_p": payload.top_p.unwrap_or(0.9),
         "repeat_penalty": 1.15,
-        "thinking": true,
+        "thinking": payload.enable_thinking.unwrap_or(true),
     });
 
     // Try native tool calling first
@@ -1862,7 +2104,7 @@ async fn chat_completions(
                     ).unwrap_or(serde_json::json!({})),
                 };
                 let job_id = format!("tool-{}", uuid::Uuid::new_v4());
-                let result = match orchestrator_tools::dispatch(&state, &tc, &job_id).await {
+                let result = match orchestrator_tools::dispatch(&state, &tc, &job_id, &conversation_id).await {
                     Some(result) => result,
                     None => backend_trait::ToolResult {
                         tool_call_id: tc.id.clone(),
@@ -1910,7 +2152,7 @@ async fn chat_completions(
                 "temperature": payload.temperature.unwrap_or(0.7),
                 "top_p": payload.top_p.unwrap_or(0.9),
                 "repeat_penalty": 1.15,
-                "thinking": true,
+                "thinking": payload.enable_thinking.unwrap_or(true),
             });
 
             let followup_res = client.post(&url).json(&followup_body).send().await
@@ -1961,7 +2203,7 @@ async fn chat_completions(
 
         if let Some((text_before, tool_call)) = resolved_call {
             let job_id = format!("tool-{}", uuid::Uuid::new_v4());
-            let result = match orchestrator_tools::dispatch(&state, &tool_call, &job_id).await {
+            let result = match orchestrator_tools::dispatch(&state, &tool_call, &job_id, &conversation_id).await {
                 Some(result) => result,
                 None => backend_trait::ToolResult {
                     tool_call_id: tool_call.id.clone(),
@@ -1992,7 +2234,7 @@ async fn chat_completions(
                 "temperature": payload.temperature.unwrap_or(0.7),
                 "top_p": payload.top_p.unwrap_or(0.9),
                 "repeat_penalty": 1.15,
-                "thinking": true,
+                "thinking": payload.enable_thinking.unwrap_or(true),
             });
 
             let followup_res = client.post(&url).json(&followup_body).send().await
@@ -2155,6 +2397,7 @@ async fn generate_images(
     State(state): State<AppState>,
     Json(payload): Json<ImageGenerationRequest>,
 ) -> Result<Json<ImageGenerationResponse>, GenerateImagesError> {
+    use base64::Engine;
     let backend_arc = state
         .registry
         .get_backend(Modality::Image)
@@ -2188,7 +2431,13 @@ async fn generate_images(
         // the literal value (sd.exe treats -1 as random, but diffusers'
         // manual_seed(-1) would lock every render to one fixed seed).
         seed: payload.seed.filter(|s| *s >= 0),
+        strength: payload.strength,
     };
+
+    let image_input = payload
+        .image
+        .as_deref()
+        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok());
 
     let inf_req = InferenceRequest {
         request_id,
@@ -2196,12 +2445,13 @@ async fn generate_images(
         messages: None,
         sampling: SamplingParams::default(),
         modality: Modality::Image,
-        image_input: None,
+        image_input,
         tools: None,
         tool_choice: None,
         image_params: Some(image_params),
         mesh_params: None,
         audio_params: None,
+        video_params: None,
         cancel: None,
     };
 
@@ -2329,6 +2579,7 @@ async fn generate_mesh3d(
         image_params: None,
         mesh_params: Some(mesh_params),
         audio_params: None,
+        video_params: None,
         cancel: None,
     };
 
@@ -2382,6 +2633,116 @@ async fn generate_mesh3d(
     }))
 }
 
+async fn generate_videos(
+    State(state): State<AppState>,
+    Json(payload): Json<VideoGenerationRequest>,
+) -> Result<Json<VideoGenerationResponse>, (axum::http::StatusCode, String)> {
+    use base64::Engine;
+
+    let backend_arc = state
+        .registry
+        .get_backend(Modality::Video)
+        .await
+        .ok_or((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "No video backend registered".to_string(),
+        ))?;
+
+    let is_loaded = {
+        let b = backend_arc.read().await;
+        b.is_loaded()
+    };
+    if !is_loaded {
+        return Err((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "No video model loaded".to_string(),
+        ));
+    }
+
+    let job_id = payload.job_id.clone().unwrap_or_else(|| format!("job-{}", uuid_simple()));
+    let request_id = format!("video-{}", uuid_simple());
+
+    let image = payload
+        .image
+        .as_ref()
+        .map(|b64| base64::engine::general_purpose::STANDARD.decode(b64))
+        .transpose()
+        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, format!("Invalid base64 image: {}", e)))?;
+
+    let video_params = backend_trait::VideoParams {
+        negative_prompt: payload.negative_prompt.clone(),
+        image,
+        num_frames: payload.num_frames,
+        height: payload.height,
+        width: payload.width,
+        num_inference_steps: payload.num_inference_steps,
+        guidance_scale: payload.guidance_scale,
+        fps: payload.fps,
+        seed: payload.seed,
+        output_format: payload.output_format.clone(),
+        extra: payload.extra.clone(),
+    };
+
+    let inf_req = InferenceRequest {
+        request_id,
+        prompt: payload.prompt.clone(),
+        messages: None,
+        sampling: SamplingParams::default(),
+        modality: Modality::Video,
+        image_input: None,
+        tools: None,
+        tool_choice: None,
+        image_params: None,
+        mesh_params: None,
+        audio_params: None,
+        video_params: Some(video_params),
+        cancel: None,
+    };
+
+    init_job_progress(&state, &job_id, "video").await;
+    let done_flag = Arc::new(AtomicBool::new(false));
+    let poller = spawn_progress_poller(
+        state.job_progress.clone(),
+        backend_arc.clone(),
+        job_id.clone(),
+        "video",
+        done_flag.clone(),
+    );
+
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    state.job_cancel.lock().await.insert(job_id.clone(), cancel_flag.clone());
+    let mut inf_req = inf_req;
+    inf_req.cancel = Some(cancel_flag);
+
+    let backend = backend_arc.read().await;
+    let inf_res = backend.generate(inf_req).await;
+    done_flag.store(true, AtomicOrdering::Relaxed);
+    poller.abort();
+    state.job_cancel.lock().await.remove(&job_id);
+
+    let inf_res = match inf_res {
+        Ok(res) => res,
+        Err(e) => {
+            finalize_job_progress(&state, &job_id, "video", Some(&e.to_string())).await;
+            return Err((axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+        }
+    };
+    finalize_job_progress(&state, &job_id, "video", None).await;
+
+    let video_bytes = inf_res.output_data.unwrap_or_default();
+    let video_b64 = use_base64_encode(&video_bytes);
+
+    Ok(Json(VideoGenerationResponse {
+        created: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        video_b64,
+        generation_time_ms: inf_res.generation_time_ms,
+        job_id,
+    }))
+}
+
 /// Proxies `GET /schema` from the running `threed_server.py` process, exposing
 /// each 3D adapter's declared parameter spec so a future UI can build a
 /// dynamic parameter form.
@@ -2407,8 +2768,34 @@ async fn get_mesh3d_schema(
     }
 }
 
+/// Proxies `GET /schema` from the running `video_diffusers_server.py`
+/// process, exposing the loaded pipeline's actually-accepted params so the
+/// UI can build a dynamic parameter form. Mirrors `get_mesh3d_schema`.
+async fn get_video_schema(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    let backend_arc = state
+        .registry
+        .get_backend(Modality::Video)
+        .await
+        .ok_or((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "No video backend registered".to_string(),
+        ))?;
+
+    let backend = backend_arc.read().await;
+    match backend.get_param_schema().await {
+        Some(schema) => Ok(Json(schema)),
+        None => Err((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Video backend has no schema available (not loaded or running in simulation mode)".to_string(),
+        )),
+    }
+}
+
 async fn transcribe_audio(
     State(state): State<AppState>,
+    Json(payload): Json<TranscriptionRequest>,
 ) -> Result<Json<TranscriptionResponse>, (axum::http::StatusCode, String)> {
     let backend_arc = state
         .registry
@@ -2419,6 +2806,16 @@ async fn transcribe_audio(
             "No audio ASR backend registered".to_string(),
         ))?;
 
+    use base64::Engine;
+    let audio_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&payload.audio_b64)
+        .map_err(|e| {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("Invalid audio_b64: {}", e),
+            )
+        })?;
+
     let request_id = format!("asr-{}", uuid_simple());
 
     let inf_req = InferenceRequest {
@@ -2427,12 +2824,13 @@ async fn transcribe_audio(
         messages: None,
         sampling: SamplingParams::default(),
         modality: Modality::AudioAsr,
-        image_input: None,
+        image_input: Some(audio_bytes),
         tools: None,
         tool_choice: None,
         image_params: None,
         mesh_params: None,
         audio_params: None,
+        video_params: None,
         cancel: None,
     };
 
@@ -2488,6 +2886,7 @@ async fn synthesize_speech(
         image_params: None,
         mesh_params: None,
         audio_params: Some(backend_trait::AudioParams { speed: payload.speed }),
+        video_params: None,
         cancel: None,
     };
 
@@ -2501,7 +2900,7 @@ async fn synthesize_speech(
                 let models = state.loaded_models.lock().await;
                 models
                     .values()
-                    .find(|entry| entry.modality == "tts")
+                    .find(|entry| crate::task_tags::backend_category_for_tags(&entry.task_tags) == Some(Modality::AudioTts))
                     .map(|entry| entry.model_path.clone())
             };
             let Some(tts_model_path) = tts_model_path else {
@@ -2657,19 +3056,26 @@ pub struct DetectedModelEntry {
     pub size_bytes: u64,
     /// `None` means this GGUF does not expose a readable context limit.
     pub max_context_size: Option<u32>,
-    /// Inferred from the model's embedded metadata or its file type.
-    pub modality: String,
+    /// HuggingFace-style task tag(s) inferred from the model's HF metadata (if
+    /// known) or its embedded metadata/file type. May contain more than one tag.
+    pub task_tags: Vec<String>,
     /// A vision GGUF also needs a local image projector before chat can accept images.
     pub image_input_available: bool,
     pub mmproj_path: Option<String>,
-    /// For `modality == "mesh3d"`, which input kinds this model accepts
-    /// (subset of "text", "image", "multi_image"). `None` for other modalities.
+    /// For mesh3d models (task_tags containing "text-to-3d"/"image-to-3d"),
+    /// which input kinds this model accepts (subset of "text", "image",
+    /// "multi_image"). `None` for other models.
     pub mesh_input_kinds: Option<Vec<String>>,
     /// For mesh3d models with multi-component repos (e.g. Hunyuan3D):
     /// path to the VAE component subfolder.
     pub mesh_vae_path: Option<String>,
     /// Path to the texture/paint component subfolder.
     pub mesh_texgen_path: Option<String>,
+    /// For split-checkpoint image models (e.g. FLUX.2 GGUF, Z-Image): the
+    /// resolved (or missing, with a download source if known) sibling
+    /// text-encoder/VAE components. `None` for models that aren't
+    /// split-checkpoint diffusion-model files.
+    pub image_components: Option<Vec<sd_backend::ImageComponentStatus>>,
 }
 
 fn find_sibling_mmproj(path: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -2712,7 +3118,7 @@ fn find_mesh3d_siblings(path: &std::path::Path) -> (Option<String>, Option<Strin
 /// A `.safetensors` model is a text LLM if the sibling `config.json` in the
 /// same directory declares a `ForCausalLM` architecture (vLLM-style
 /// config-driven detection), e.g. `LlamaForCausalLM`, `Qwen2ForCausalLM`.
-fn detect_safetensors_causal_lm(path: &std::path::Path) -> bool {
+pub(crate) fn detect_safetensors_causal_lm(path: &std::path::Path) -> bool {
     let Some(directory) = path.parent() else { return false };
     let config_path = directory.join("config.json");
     let Ok(contents) = std::fs::read_to_string(&config_path) else { return false };
@@ -2738,13 +3144,13 @@ const MESH3D_NAME_TOKENS: &[&str] = &[
     "wonder3d", "sv3d", "lgm", "crm", "-3d", "_3d", " 3d", "llama-mesh", "llama_mesh", "llamamesh",
 ];
 
-fn is_mesh3d_name(file_name: &str) -> bool {
+pub(crate) fn is_mesh3d_name(file_name: &str) -> bool {
     MESH3D_NAME_TOKENS.iter().any(|token| file_name.contains(token))
 }
 
 /// Which input kinds a detected 3D mesh-generator model accepts, keyed off
 /// the same "parent dir name + file name" string used by `is_mesh3d_name`.
-fn detect_mesh_input_kinds(path: &std::path::Path) -> Option<Vec<String>> {
+pub(crate) fn detect_mesh_input_kinds(path: &std::path::Path) -> Option<Vec<String>> {
     let file_name = {
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
         let parent = path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or_default();
@@ -2781,91 +3187,6 @@ fn detect_mesh_input_kinds(path: &std::path::Path) -> Option<Vec<String>> {
     };
 
     Some(kinds)
-}
-
-fn detect_model_modality(path: &std::path::Path) -> String {
-    let extension = path.extension().and_then(|extension| extension.to_str()).unwrap_or_default().to_ascii_lowercase();
-    // Match keywords against the parent directory name too: HF downloads land
-    // in a repo-named folder (e.g. `kostakoff_stable-diffusion-v1-5-GGUF/`)
-    // while the file itself is often generically named (`v1-5-pruned_Q4_K.gguf`).
-    let file_name = {
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-        let parent = path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or_default();
-        format!("{parent} {name}").to_ascii_lowercase()
-    };
-    match extension.as_str() {
-        "gguf" => {
-            use std::io::Read;
-            let mut bytes = Vec::new();
-            let _ = std::fs::File::open(path)
-                .and_then(|mut file| file.by_ref().take(2 * 1024 * 1024).read_to_end(&mut bytes));
-            if bytes.windows(b"image-text-to-text".len()).any(|window| window == b"image-text-to-text") {
-                "vision".to_string()
-            } else if file_name.contains("kokoro") || file_name.contains("tts") || file_name.contains("vits") || file_name.contains("bark") || file_name.contains("piper") {
-                "tts".to_string()
-            } else if file_name.contains("whisper") || file_name.contains("wav2vec") || file_name.contains("hubert") || file_name.contains("asr") {
-                "audio".to_string()
-            } else if file_name.contains("stable") || file_name.contains("diffusion") || file_name.contains("sdxl") || file_name.contains("flux") || file_name.contains("vae") || file_name.contains("unet") || file_name.contains("qwen-image") || file_name.contains("image-edit") || file_name.contains("z-image") || file_name.contains("z_image") {
-                "image".to_string()
-            } else if file_name.contains("video") || file_name.contains("wan") || file_name.contains("mochi") {
-                "video".to_string()
-            } else if is_mesh3d_name(&file_name) {
-                "mesh3d".to_string()
-            } else {
-                "text".to_string()
-            }
-        }
-        "safetensors" if detect_safetensors_causal_lm(path) => "text".to_string(),
-        "safetensors" | "ckpt" => {
-            if is_mesh3d_name(&file_name) {
-                "mesh3d".to_string()
-            } else if file_name.contains("whisper") || file_name.contains("wav2vec") || file_name.contains("hubert") {
-                "audio".to_string()
-            } else if file_name.contains("kokoro") || file_name.contains("tts") || file_name.contains("vits") || file_name.contains("bark") {
-                "tts".to_string()
-            } else {
-                "image".to_string()
-            }
-        }
-        "pth" | "pt" => {
-            if is_mesh3d_name(&file_name) {
-                "mesh3d".to_string()
-            } else if file_name.contains("kokoro") || file_name.contains("tts") || file_name.contains("vits") || file_name.contains("bark") || file_name.contains("tacotron") || file_name.contains("fastspeech") {
-                "tts".to_string()
-            } else if file_name.contains("whisper") || file_name.contains("wav2vec") || file_name.contains("hubert") || file_name.contains("asr") {
-                "audio".to_string()
-            } else if file_name.contains("stable") || file_name.contains("diffusion") || file_name.contains("vae") || file_name.contains("unet") {
-                "image".to_string()
-            } else if file_name.contains("video") || file_name.contains("wan") || file_name.contains("mochi") {
-                "video".to_string()
-            } else {
-                "text".to_string()
-            }
-        }
-        "bin" => {
-            if file_name.contains("kokoro") || file_name.contains("tts") || file_name.contains("vits") || file_name.contains("piper") {
-                "tts".to_string()
-            } else {
-                "audio".to_string()
-            }
-        }
-        "onnx" => {
-            if is_mesh3d_name(&file_name) {
-                "mesh3d".to_string()
-            } else if file_name.contains("whisper") || file_name.contains("wav2vec") || file_name.contains("asr") {
-                "audio".to_string()
-            } else if file_name.contains("stable") || file_name.contains("diffusion") || file_name.contains("unet") || file_name.contains("vae") {
-                "image".to_string()
-            } else if file_name.contains("video") || file_name.contains("wan") {
-                "video".to_string()
-            } else {
-                "tts".to_string()
-            }
-        }
-        "ot" | "tflite" | "mlmodel" | "engine" => "text".to_string(),
-        "mp4" | "webm" => "video".to_string(),
-        _ => "unknown".to_string(),
-    }
 }
 
 fn read_u32(bytes: &[u8], position: &mut usize) -> Option<u32> {
@@ -2957,43 +3278,6 @@ fn sum_model_weight_bytes(dir: &std::path::Path) -> u64 {
     total
 }
 
-/// Classify a HuggingFace model directory that has its own `config.json`
-/// (transformers-style), mirroring the rules `detect_model_modality` applies
-/// to a standalone `.safetensors` file: `ForCausalLM` architectures are
-/// "text", everything else falls back to filename/dirname keyword matching.
-fn detect_hf_config_dir_modality(dir: &std::path::Path) -> String {
-    let config_path = dir.join("config.json");
-    let is_causal_lm = std::fs::read_to_string(&config_path)
-        .ok()
-        .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
-        .map(|config| {
-            config
-                .get("architectures")
-                .and_then(|a| a.as_array())
-                .map(|architectures| {
-                    architectures
-                        .iter()
-                        .filter_map(|a| a.as_str())
-                        .any(|a| a.ends_with("ForCausalLM"))
-                })
-                .unwrap_or(false)
-        })
-        .unwrap_or(false);
-    if is_causal_lm {
-        return "text".to_string();
-    }
-    let dir_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_ascii_lowercase();
-    if is_mesh3d_name(&dir_name) {
-        "mesh3d".to_string()
-    } else if dir_name.contains("whisper") || dir_name.contains("wav2vec") || dir_name.contains("hubert") {
-        "audio".to_string()
-    } else if dir_name.contains("kokoro") || dir_name.contains("tts") || dir_name.contains("vits") || dir_name.contains("bark") {
-        "tts".to_string()
-    } else {
-        "image".to_string()
-    }
-}
-
 /// If `dir` is directly a HuggingFace model directory — it contains its own
 /// `config.json` (transformers-style) or `model_index.json` (diffusers-style)
 /// — build one collapsed `DetectedModelEntry` for the whole directory.
@@ -3006,27 +3290,32 @@ fn hf_model_dir_entry(dir: &std::path::Path) -> Option<DetectedModelEntry> {
     }
 
     let dir_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_ascii_lowercase();
-    let modality = if is_mesh3d_name(&dir_name) {
-        "mesh3d".to_string()
+    let is_mesh3d = is_mesh3d_name(&dir_name);
+    let task_tags = if let Some(hint) = read_task_tags_hint(dir) {
+        hint
+    } else if is_mesh3d {
+        crate::task_tags::mesh_tags_from_kinds(detect_mesh_input_kinds(dir))
     } else if has_model_index {
-        "image".to_string()
+        vec!["text-to-image".to_string()]
     } else {
-        detect_hf_config_dir_modality(dir)
+        crate::task_tags::local_heuristic_tags_for_dir(dir)
     };
-    let mesh_input_kinds = if modality == "mesh3d" { detect_mesh_input_kinds(dir) } else { None };
-    let (mesh_vae_path, mesh_texgen_path) = if modality == "mesh3d" { find_mesh3d_siblings(dir) } else { (None, None) };
+    let is_mesh3d = is_mesh3d || task_tags.iter().any(|t| t == "text-to-3d" || t == "image-to-3d");
+    let mesh_input_kinds = if is_mesh3d { detect_mesh_input_kinds(dir) } else { None };
+    let (mesh_vae_path, mesh_texgen_path) = if is_mesh3d { find_mesh3d_siblings(dir) } else { (None, None) };
 
     Some(DetectedModelEntry {
         name: dir.file_name().and_then(|name| name.to_str()).unwrap_or("Unknown model").to_string(),
         path: dir.to_string_lossy().to_string(),
         size_bytes: sum_model_weight_bytes(dir),
         max_context_size: None,
-        image_input_available: modality == "vision",
+        image_input_available: crate::task_tags::image_input_available(&task_tags),
         mmproj_path: None,
         mesh_input_kinds,
         mesh_vae_path,
         mesh_texgen_path,
-        modality,
+        image_components: None,
+        task_tags,
     })
 }
 
@@ -3042,8 +3331,14 @@ fn collect_model_files(directory: &std::path::Path, entries: &mut Vec<DetectedMo
             // backend needs the repo-root folder to locate those subfolders, so
             // short-circuit on the dir name before recursing.
             let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_ascii_lowercase();
+            // Skip "shared" folder — it contains cross-backend component files
+            // (shared VAE, text-encoders, etc.), not standalone models.
+            if dir_name == "shared" {
+                continue;
+            }
             if is_mesh3d_name(&dir_name) {
                 let (mesh_vae_path, mesh_texgen_path) = find_mesh3d_siblings(&path);
+                let mesh_input_kinds = detect_mesh_input_kinds(&path);
                 entries.push(DetectedModelEntry {
                     name: path.file_name().and_then(|name| name.to_str()).unwrap_or("Unknown model").to_string(),
                     path: path.to_string_lossy().to_string(),
@@ -3051,10 +3346,11 @@ fn collect_model_files(directory: &std::path::Path, entries: &mut Vec<DetectedMo
                     max_context_size: None,
                     image_input_available: false,
                     mmproj_path: None,
-                    mesh_input_kinds: detect_mesh_input_kinds(&path),
+                    task_tags: crate::task_tags::mesh_tags_from_kinds(mesh_input_kinds.clone()),
+                    mesh_input_kinds,
                     mesh_vae_path,
                     mesh_texgen_path,
-                    modality: "mesh3d".to_string(),
+                    image_components: None,
                 });
                 continue;
             }
@@ -3072,20 +3368,27 @@ fn collect_model_files(directory: &std::path::Path, entries: &mut Vec<DetectedMo
                 continue;
             }
             let size_bytes = child.metadata().map(|metadata| metadata.len()).unwrap_or(0);
-            let modality = detect_model_modality(&path);
-            let mesh_input_kinds = if modality == "mesh3d" { detect_mesh_input_kinds(&path) } else { None };
+            let task_tags = path
+                .parent()
+                .and_then(read_task_tags_hint)
+                .unwrap_or_else(|| crate::task_tags::local_heuristic_tags_for_file(&path));
+            let is_mesh3d = task_tags.iter().any(|t| t == "text-to-3d" || t == "image-to-3d");
+            let mesh_input_kinds = if is_mesh3d { detect_mesh_input_kinds(&path) } else { None };
             let sibling_mmproj = find_sibling_mmproj(&path).map(|p| p.to_string_lossy().to_string());
+            let is_image = task_tags.iter().any(|t| t == "text-to-image" || t == "image-to-image");
+            let image_components = if is_image { sd_backend::SdBackend::detect_image_components(&path) } else { None };
             entries.push(DetectedModelEntry {
                 name: path.file_name().and_then(|name| name.to_str()).unwrap_or("Unknown model").to_string(),
                 path: path.to_string_lossy().to_string(),
                 size_bytes,
                 max_context_size: gguf_context_length(&path),
-                image_input_available: modality == "vision" || sibling_mmproj.is_some(),
+                image_input_available: crate::task_tags::image_input_available(&task_tags) || sibling_mmproj.is_some(),
                 mmproj_path: sibling_mmproj,
                 mesh_input_kinds,
                 mesh_vae_path: None,
                 mesh_texgen_path: None,
-                modality,
+                image_components,
+                task_tags,
             });
         }
     }
@@ -3233,15 +3536,20 @@ async fn resolve_hf_token(state_token: &Arc<tokio::sync::Mutex<Option<String>>>)
             return Some(t);
         }
     }
-    let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).ok()?;
-    let token_path = std::path::PathBuf::from(home).join(".cache").join("huggingface").join("token");
-    if let Ok(t) = tokio::fs::read_to_string(&token_path).await {
+    if let Ok(t) = tokio::fs::read_to_string(hf_token_cache_path()?).await {
         let t = sanitize_hf_token(&t);
         if !t.is_empty() {
             return Some(t);
         }
     }
     None
+}
+
+/// Path to the standard Hugging Face CLI token cache file, used both as a
+/// read fallback and as where the UI-set token is persisted across restarts.
+fn hf_token_cache_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).ok()?;
+    Some(std::path::PathBuf::from(home).join(".cache").join("huggingface").join("token"))
 }
 
 async fn hf_search(
@@ -3397,6 +3705,61 @@ struct HfSibling {
 struct HfRepoInfo {
     #[serde(default)]
     siblings: Vec<HfSibling>,
+    #[serde(default)]
+    pipeline_tag: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+/// Filename of the per-model-directory sidecar written after download that
+/// caches the HF `pipeline_tag`-derived task tag(s), so a later local scan
+/// doesn't have to re-derive them from directory contents alone. Stores a
+/// JSON array of tags. An old plain-text `.dispos-modality` sidecar (from
+/// before this format existed) simply fails to parse as JSON and is ignored —
+/// it self-heals the next time `write_task_tags_hint` runs after a fresh
+/// HF fetch.
+const TASK_TAGS_HINT_FILE: &str = ".dispos-task-tags";
+
+/// Read a cached task-tag hint written by `write_task_tags_hint`, if present
+/// and valid. Each tag is validated against `task_tags::known_task_tag`;
+/// unrecognized entries are dropped. Returns `None` if the file is missing,
+/// isn't valid JSON, or has no recognized tags left after filtering, so the
+/// caller falls back to the local heuristic.
+fn read_task_tags_hint(dir: &std::path::Path) -> Option<Vec<String>> {
+    let contents = std::fs::read_to_string(dir.join(TASK_TAGS_HINT_FILE)).ok()?;
+    let raw: Vec<String> = serde_json::from_str(&contents).ok()?;
+    let valid: Vec<String> = raw
+        .into_iter()
+        .filter(|tag| crate::task_tags::known_task_tag(tag).is_some())
+        .collect();
+    (!valid.is_empty()).then_some(valid)
+}
+
+/// Best-effort: fetch the repo's `pipeline_tag` from the HF API and cache the
+/// derived task tag as a sidecar file in its model directory. Failures are
+/// silently ignored — the local heuristic remains the fallback.
+async fn write_task_tags_hint(repo: &str, dir: &std::path::Path, hf_token: Option<String>) {
+    let Ok(client) = reqwest::Client::builder().user_agent("dispos-ai/0.1").build() else { return };
+    let mut req = client.get(format!("https://huggingface.co/api/models/{repo}"));
+    if let Some(t) = hf_token {
+        req = req.header("Authorization", format!("Bearer {t}"));
+    }
+    let Ok(response) = req.send().await else { return };
+    let Ok(info) = response.json::<HfRepoInfo>().await else { return };
+    let mut tags: Vec<&str> = Vec::new();
+    if let Some(tag) = info.pipeline_tag.as_deref().and_then(crate::task_tags::known_task_tag) {
+        tags.push(tag);
+    }
+    for t in info.tags.iter().filter_map(|t| crate::task_tags::known_task_tag(t)) {
+        if !tags.contains(&t) {
+            tags.push(t);
+        }
+    }
+    if tags.is_empty() {
+        return;
+    }
+    let Ok(json) = serde_json::to_string(&tags) else { return };
+    let _ = tokio::fs::write(dir.join(TASK_TAGS_HINT_FILE), json).await;
 }
 
 #[derive(Debug, Deserialize)]
@@ -3548,6 +3911,14 @@ fn standalone_weight_ext(filename: &str) -> Option<&'static str> {
         Some("safetensors")
     } else if lower.ends_with(".gguf") {
         Some("gguf")
+    } else if lower.ends_with(".ckpt") {
+        Some("ckpt")
+    } else if lower.ends_with(".bin") {
+        Some("bin")
+    } else if lower.ends_with(".pt") {
+        Some("pt")
+    } else if lower.ends_with(".pth") {
+        Some("pth")
     } else {
         None
     }
@@ -3561,6 +3932,15 @@ fn pick_variant_weights_file<'a>(
     free_vram_bytes: u64,
 ) -> Option<(&'a HfFileEntry, String)> {
     let variants: Vec<&HfFileEntry> = entries.iter().filter(|e| e.role == "weights" && e.variant_group.is_some()).collect();
+    pick_best_variant(&variants, free_vram_bytes)
+}
+
+/// Core "pick the best-fitting weight file among a set of interchangeable
+/// variants" logic, sized against `free_vram_bytes`: a variant with a known
+/// free-VRAM fit else the largest that fits else the smallest overall.
+/// Shared by the top-level "variants" repo kind and per-component grouping in
+/// "components" repos.
+fn pick_best_variant<'a>(variants: &[&'a HfFileEntry], free_vram_bytes: u64) -> Option<(&'a HfFileEntry, String)> {
     if variants.is_empty() {
         return None;
     }
@@ -3588,6 +3968,24 @@ fn pick_variant_weights_file<'a>(
     let smallest = sized.iter().copied().min_by_key(|e| e.size.unwrap())?;
     let label = smallest.quant.clone().unwrap_or_else(|| smallest.filename.clone());
     Some((smallest, format!("picked {} (smallest) — may exceed {:.1} GB free VRAM", label, free_gb)))
+}
+
+/// Extracts the `rel="next"` URL from an RFC 5988 `Link` header value,
+/// as returned by HF's paginated tree API.
+fn parse_hf_link_next(header: &str) -> Option<String> {
+    header.split(',').find_map(|part| {
+        let part = part.trim();
+        if !part.contains("rel=\"next\"") {
+            return None;
+        }
+        let start = part.find('<')?;
+        let end = part.find('>')?;
+        if end > start {
+            Some(part[start + 1..end].to_string())
+        } else {
+            None
+        }
+    })
 }
 
 async fn hf_files(
@@ -3635,32 +4033,50 @@ async fn hf_files(
     // list from `type == "file"` entries, using `lfs.size` else `size` for
     // each file's size. Fall back to `info.siblings` if the tree fetch fails
     // or yields no file entries.
-    let tree_url = format!(
+    // The HF tree API paginates large repos via an RFC 5988 `Link: <url>; rel="next"`
+    // response header rather than a body cursor. Repos with many files/subfolders
+    // (e.g. MiniMaxAI/MiniMax-H3) span multiple pages, so we must follow `next`
+    // links until exhausted or a request fails, otherwise later pages are silently
+    // dropped and the catalog looks truncated.
+    let mut tree_files: Vec<(String, Option<u64>)> = Vec::new();
+    let mut next_url = Some(format!(
         "https://huggingface.co/api/models/{}/tree/main?recursive=true&expand=1",
         params.repo
-    );
-    let mut tree_files: Vec<(String, Option<u64>)> = Vec::new();
-    let mut tree_req = client.get(&tree_url);
-    if let Some(ref t) = token {
-        tree_req = tree_req.header("Authorization", format!("Bearer {}", t));
-    }
-    match tree_req.send().await {
-        Ok(resp) => match resp.json::<Vec<HfTreeEntry>>().await {
-            Ok(entries) => {
-                for entry in entries {
-                    if entry.r#type != "file" {
-                        continue;
+    ));
+    const MAX_TREE_PAGES: usize = 100;
+    for _ in 0..MAX_TREE_PAGES {
+        let Some(url) = next_url.take() else { break };
+        let mut tree_req = client.get(&url);
+        if let Some(ref t) = token {
+            tree_req = tree_req.header("Authorization", format!("Bearer {}", t));
+        }
+        match tree_req.send().await {
+            Ok(resp) => {
+                next_url = resp
+                    .headers()
+                    .get("link")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(parse_hf_link_next);
+                match resp.json::<Vec<HfTreeEntry>>().await {
+                    Ok(entries) => {
+                        for entry in entries {
+                            if entry.r#type != "file" {
+                                continue;
+                            }
+                            let size = entry.lfs.map(|lfs| lfs.size).or(entry.size);
+                            tree_files.push((entry.path, size));
+                        }
                     }
-                    let size = entry.lfs.map(|lfs| lfs.size).or(entry.size);
-                    tree_files.push((entry.path, size));
+                    Err(err) => {
+                        tracing::warn!("hf-files tree parse failed: {err}");
+                        break;
+                    }
                 }
             }
             Err(err) => {
-                tracing::warn!("hf-files tree parse failed: {err}");
+                tracing::warn!("hf-files tree request failed: {err}");
+                break;
             }
-        },
-        Err(err) => {
-            tracing::warn!("hf-files tree request failed: {err}");
         }
     }
 
@@ -3692,7 +4108,7 @@ async fn hf_files(
     // unrelated root-level convenience copy of the same extension.
     let mut variant_counts: std::collections::HashMap<(String, &'static str), usize> = std::collections::HashMap::new();
     for f in files.iter() {
-        if f.role != "weights" {
+        if !matches!(f.role.as_str(), "weights" | "unet" | "vae" | "text_encoder") {
             continue;
         }
         if let Some(ext) = standalone_weight_ext(&f.filename) {
@@ -3700,7 +4116,7 @@ async fn hf_files(
         }
     }
     for f in files.iter_mut() {
-        if f.role != "weights" {
+        if !matches!(f.role.as_str(), "weights" | "unet" | "vae" | "text_encoder") {
             continue;
         }
         if let Some(ext) = standalone_weight_ext(&f.filename) {
@@ -3743,12 +4159,27 @@ async fn hf_files(
             (names, Some(format!("Complete {}-shard set + config & tokenizer", shard_count)))
         }
         "components" => {
-            let names: Vec<String> = files
+            let sys = HardwareProfiler::probe();
+            let free_vram_bytes = if sys.free_vram_bytes > 0 { sys.free_vram_bytes } else { sys.available_ram_bytes };
+
+            let mut groups: std::collections::HashMap<(String, String), Vec<&HfFileEntry>> = std::collections::HashMap::new();
+            for f in files.iter() {
+                if let Some(group) = &f.variant_group {
+                    groups.entry((parent_dir(&f.filename).to_string(), group.clone())).or_default().push(f);
+                }
+            }
+
+            let mut names: Vec<String> = files
                 .iter()
                 .filter(|f| f.variant_group.is_none())
                 .map(|f| f.filename.clone())
                 .collect();
-            (names, Some("All pipeline components".to_string()))
+            for variants in groups.values() {
+                if let Some((chosen, _reason)) = pick_best_variant(variants, free_vram_bytes) {
+                    names.push(chosen.filename.clone());
+                }
+            }
+            (names, Some("All pipeline components (best-fit variant per part)".to_string()))
         }
         "variants" => {
             let sys = HardwareProfiler::probe();
@@ -3829,10 +4260,11 @@ async fn hf_download(
     };
     let save_path_string = save_path.to_string_lossy().to_string();
 
+    let key = download_key(&payload.repo, &payload.filename);
     {
         let mut downloads = state.hf_downloads.lock().await;
         downloads.insert(
-            payload.filename.clone(),
+            key.clone(),
             DownloadProgress {
                 filename: payload.filename.clone(),
                 repo: payload.repo.clone(),
@@ -3847,7 +4279,7 @@ async fn hf_download(
     let cancel_flag = Arc::new(AtomicBool::new(false));
     {
         let mut cancel_map = state.hf_cancel.lock().await;
-        cancel_map.insert(payload.filename.clone(), cancel_flag.clone());
+        cancel_map.insert(key.clone(), cancel_flag.clone());
     }
 
     let downloads_map = state.hf_downloads.clone();
@@ -3856,11 +4288,24 @@ async fn hf_download(
     let target_path = save_path.clone();
     let hf_token = resolve_hf_token(&state.hf_token).await;
 
+    // Only the default per-repo layout (no target_dir override) produces a
+    // model directory worth tagging — shared components (VAE, text encoders)
+    // land in a shared folder that isn't itself a model.
+    if payload.target_dir.is_none() {
+        if let Some(model_dir) = save_path.parent().map(|p| p.to_path_buf()) {
+            let hint_repo = payload.repo.clone();
+            let hint_token = hf_token.clone();
+            tokio::spawn(async move {
+                write_task_tags_hint(&hint_repo, &model_dir, hint_token).await;
+            });
+        }
+    }
+
     tokio::spawn(async move {
         if let Err(err) = run_hf_download(&repo, &filename, &target_path, &downloads_map, &cancel_flag, hf_token).await {
             tracing::warn!("hf-download failed for {filename}: {err}");
             let mut downloads = downloads_map.lock().await;
-            if let Some(entry) = downloads.get_mut(&filename) {
+            if let Some(entry) = downloads.get_mut(&key) {
                 entry.status = "error".to_string();
                 entry.error = Some(err.to_string());
             }
@@ -3891,6 +4336,16 @@ async fn hf_set_token(
     let mut lock = state.hf_token.lock().await;
     let sanitized = sanitize_hf_token(&payload.token);
     let has = !sanitized.is_empty();
+    if let Some(path) = hf_token_cache_path() {
+        if has {
+            if let Some(parent) = path.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+            let _ = tokio::fs::write(&path, &sanitized).await;
+        } else {
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+    }
     *lock = if has { Some(sanitized) } else { None };
     Json(HfTokenResponse { status: "ok", has_token: has })
 }
@@ -3985,6 +4440,12 @@ async fn delete_model(
     Ok(Json(ModelActionResponse { status: "deleted" }))
 }
 
+/// Composite key for `hf_downloads`/`hf_cancel` maps — filename alone can
+/// collide across different repos, so key on both.
+fn download_key(repo: &str, filename: &str) -> String {
+    format!("{repo}::{filename}")
+}
+
 /// Turn a HuggingFace repo id (`org/model`) into a filesystem-safe folder name.
 fn sanitize_repo_id(repo: &str) -> String {
     repo.chars()
@@ -4005,6 +4466,8 @@ async fn run_hf_download(
 ) -> Result<(), String> {
     use futures::StreamExt;
     use tokio::io::AsyncWriteExt;
+
+    let key = download_key(repo, filename);
 
     if let Some(parent) = target_path.parent() {
         tokio::fs::create_dir_all(parent)
@@ -4060,7 +4523,7 @@ async fn run_hf_download(
     let total_bytes = response.content_length();
     {
         let mut downloads = downloads_map.lock().await;
-        if let Some(entry) = downloads.get_mut(filename) {
+        if let Some(entry) = downloads.get_mut(&key) {
             entry.total_bytes = total_bytes;
         }
     }
@@ -4080,7 +4543,7 @@ async fn run_hf_download(
             drop(file);
             let _ = tokio::fs::remove_file(target_path).await;
             let mut downloads = downloads_map.lock().await;
-            if let Some(entry) = downloads.get_mut(filename) {
+            if let Some(entry) = downloads.get_mut(&key) {
                 entry.status = "cancelled".to_string();
             }
             return Ok(());
@@ -4090,7 +4553,7 @@ async fn run_hf_download(
         downloaded += chunk.len() as u64;
         if last_reported.elapsed() >= std::time::Duration::from_millis(250) {
             let mut downloads = downloads_map.lock().await;
-            if let Some(entry) = downloads.get_mut(filename) {
+            if let Some(entry) = downloads.get_mut(&key) {
                 entry.downloaded_bytes = downloaded;
             }
             last_reported = std::time::Instant::now();
@@ -4099,7 +4562,7 @@ async fn run_hf_download(
     file.flush().await.map_err(|e| e.to_string())?;
 
     let mut downloads = downloads_map.lock().await;
-    if let Some(entry) = downloads.get_mut(filename) {
+    if let Some(entry) = downloads.get_mut(&key) {
         entry.downloaded_bytes = downloaded;
         entry.status = "complete".to_string();
     }
@@ -4115,6 +4578,7 @@ async fn hf_download_status(
 
 #[derive(Debug, Deserialize)]
 struct HfDownloadCancelRequest {
+    repo: String,
     filename: String,
 }
 
@@ -4127,8 +4591,9 @@ async fn hf_download_cancel(
     State(state): State<AppState>,
     Json(payload): Json<HfDownloadCancelRequest>,
 ) -> Json<HfDownloadCancelResponse> {
+    let key = download_key(&payload.repo, &payload.filename);
     let cancel_map = state.hf_cancel.lock().await;
-    match cancel_map.get(&payload.filename) {
+    match cancel_map.get(&key) {
         Some(flag) => {
             flag.store(true, AtomicOrdering::Relaxed);
             Json(HfDownloadCancelResponse { status: "cancelling" })
@@ -4289,20 +4754,26 @@ pub(crate) async fn load_model(
     // the same way the catalog scan does before falling back to the
     // extension/content-based file classifier.
     let dir_name = model_path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_ascii_lowercase();
-    let modality = if model_path.is_dir() {
-        if is_mesh3d_name(&dir_name) {
-            "mesh3d".to_string()
+    let task_tags = if model_path.is_dir() {
+        if let Some(hint) = read_task_tags_hint(&model_path) {
+            hint
+        } else if is_mesh3d_name(&dir_name) {
+            crate::task_tags::mesh_tags_from_kinds(detect_mesh_input_kinds(&model_path))
         } else if model_path.join("model_index.json").is_file() {
-            "image".to_string()
+            vec!["text-to-image".to_string()]
         } else if model_path.join("config.json").is_file() {
-            detect_hf_config_dir_modality(&model_path)
+            crate::task_tags::local_heuristic_tags_for_dir(&model_path)
         } else {
-            detect_model_modality(&model_path)
+            crate::task_tags::local_heuristic_tags_for_file(&model_path)
         }
     } else {
-        detect_model_modality(&model_path)
+        model_path
+            .parent()
+            .and_then(read_task_tags_hint)
+            .unwrap_or_else(|| crate::task_tags::local_heuristic_tags_for_file(&model_path))
     };
-    tracing::info!("Detected modality '{}' for model: {}", modality, model_path.display());
+    tracing::info!("Detected task tags {:?} for model: {}", task_tags, model_path.display());
+    let backend_category = crate::task_tags::backend_category_for_tags(&task_tags);
 
     // Allocate a new port
     let port = state.next_port.fetch_add(1, AtomicOrdering::SeqCst);
@@ -4312,8 +4783,8 @@ pub(crate) async fn load_model(
     // loaded entry can advertise image input even for models detected as "text".
     let mut mmproj_loaded = false;
 
-    match modality.as_str() {
-        "tts" => {
+    match backend_category {
+        Some(Modality::AudioTts) => {
             tracing::info!("Loading TTS model via TTS backend: {}", model_path.display());
             let backend_arc = state.registry.get_backend(Modality::AudioTts).await;
             if let Some(backend_arc) = backend_arc {
@@ -4332,7 +4803,7 @@ pub(crate) async fn load_model(
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
-        "audio" => {
+        Some(Modality::AudioAsr) => {
             tracing::info!("Loading ASR model via whisper backend: {}", model_path.display());
             let backend_arc = state.registry.get_backend(Modality::AudioAsr).await;
             if let Some(backend_arc) = backend_arc {
@@ -4349,7 +4820,7 @@ pub(crate) async fn load_model(
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
-        "image" => {
+        Some(Modality::Image) => {
             tracing::info!("Loading image model via SD backend: {}", model_path.display());
             let backend_arc = state.registry.get_backend(Modality::Image).await;
             if let Some(backend_arc) = backend_arc {
@@ -4366,7 +4837,7 @@ pub(crate) async fn load_model(
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
-        "video" => {
+        Some(Modality::Video) => {
             tracing::info!("Loading video model via video backend: {}", model_path.display());
             let backend_arc = state.registry.get_backend(Modality::Video).await;
             if let Some(backend_arc) = backend_arc {
@@ -4383,7 +4854,7 @@ pub(crate) async fn load_model(
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
-        "mesh3d" => {
+        Some(Modality::Mesh3D) => {
             tracing::info!("Loading 3D mesh model via mesh3d backend: {}", model_path.display());
             let backend_arc = state.registry.get_backend(Modality::Mesh3D).await;
             if let Some(backend_arc) = backend_arc {
@@ -4403,7 +4874,7 @@ pub(crate) async fn load_model(
         _ => {
             // A directory here is a collapsed HF model dir with its own
             // `config.json` (the `model_index.json` / image case is routed
-            // through the "image" arm above via modality detection). Spawn
+            // through the Image arm above via task-tag detection). Spawn
             // the transformers server directly against it.
             let is_safetensors = if model_path.is_dir() {
                 true
@@ -4481,7 +4952,8 @@ pub(crate) async fn load_model(
         }
     }
 
-    let mesh_input_kinds = if modality == "mesh3d" { detect_mesh_input_kinds(&model_path) } else { None };
+    let is_mesh3d = task_tags.iter().any(|t| t == "text-to-3d" || t == "image-to-3d");
+    let mesh_input_kinds = if is_mesh3d { detect_mesh_input_kinds(&model_path) } else { None };
 
     let entry = LoadedModelEntry {
         model_id: model_id.clone(),
@@ -4489,9 +4961,9 @@ pub(crate) async fn load_model(
         gpu_layers,
         context_size,
         port,
-        modality: modality.clone(),
-        image_input_available: modality == "vision" || mmproj_loaded,
+        image_input_available: crate::task_tags::image_input_available(&task_tags) || mmproj_loaded,
         mesh_input_kinds,
+        task_tags,
     };
 
     {
@@ -4511,24 +4983,6 @@ pub(crate) async fn load_model(
     }
 
     Ok(Json(entry))
-}
-
-/// Map the `modality` string stored on a `LoadedModelEntry` (as produced by
-/// `detect_model_modality` / `detect_hf_config_dir_modality`) to the backend
-/// registry's `Modality` enum, but only for modalities whose load path
-/// dispatches to a registered `InferenceBackend` (see the `match modality.as_str()`
-/// arms in `load_model`). "text"/"vision" models are spawned directly as a
-/// llama-server child keyed by model_id and are fully handled by
-/// `state.children.take`, so they intentionally return `None` here.
-fn modality_backend_for_unload(modality: &str) -> Option<Modality> {
-    match modality {
-        "tts" => Some(Modality::AudioTts),
-        "audio" => Some(Modality::AudioAsr),
-        "image" => Some(Modality::Image),
-        "video" => Some(Modality::Video),
-        "mesh3d" => Some(Modality::Mesh3D),
-        _ => None,
-    }
 }
 
 /// Unload a model by model_id. Kills its llama-server process.
@@ -4560,14 +5014,14 @@ async fn unload_model(
             // register a child in `state.children` at load time — their
             // process is owned by the backend itself. Tear it down via the
             // backend trait so VRAM/metrics don't keep reporting it as loaded.
-            if let Some(backend_modality) = modality_backend_for_unload(&e.modality) {
+            if let Some(backend_modality) = crate::task_tags::backend_category_for_tags(&e.task_tags) {
                 if let Some(backend_arc) = state.registry.get_backend(backend_modality).await {
                     let mut b = backend_arc.write().await;
                     if let Err(err) = b.unload_model().await {
-                        tracing::warn!("unload_model: backend unload for '{}' ({}) failed: {}", mid, e.modality, err);
+                        tracing::warn!("unload_model: backend unload for '{}' ({:?}) failed: {}", mid, e.task_tags, err);
                     }
                 } else {
-                    tracing::warn!("unload_model: no backend registered for modality '{}' (model '{}')", e.modality, mid);
+                    tracing::warn!("unload_model: no backend registered for task tags '{:?}' (model '{}')", e.task_tags, mid);
                 }
             }
         }

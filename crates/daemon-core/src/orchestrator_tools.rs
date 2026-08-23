@@ -21,16 +21,18 @@ pub fn schemas() -> Vec<ToolSchema> {
     vec![
         ToolSchema {
             name: "list_models".into(),
-            description: "List every model available on this machine, with its modality \
-                          (text, vision, tts, audio, image, video) and whether it is currently \
-                          loaded. Call this first when you need to know what you can run."
+            description: "List every model available on this machine, with its task tag(s) \
+                          (e.g. text-generation, image-text-to-text, text-to-image, \
+                          text-to-speech, automatic-speech-recognition, text-to-video, \
+                          text-to-3d/image-to-3d) and whether it is currently loaded. Call this \
+                          first when you need to know what you can run."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "modality": {
+                    "task_tag": {
                         "type": "string",
-                        "description": "Optional filter, e.g. 'tts' to list only speech models"
+                        "description": "Optional filter, e.g. 'text-to-speech' to list only speech models"
                     }
                 }
             }),
@@ -60,9 +62,36 @@ pub fn schemas() -> Vec<ToolSchema> {
                         "description": "Optional media handle from a previous run_model result \
                                         (the '/v1/media/<id>' path, or just the id) to use as \
                                         image input, e.g. for image-to-3D or image-to-image."
+                    },
+                    "params": {
+                        "type": "object",
+                        "description": "Optional generation parameters for this model, as \
+                                        returned by inspect_model. e.g. {\"steps\":30,\"seed\":42} \
+                                        for image/3D/video models, or {\"temperature\":0.8} for \
+                                        text models."
                     }
                 },
                 "required": ["model", "prompt"]
+            }),
+        },
+        ToolSchema {
+            name: "inspect_model".into(),
+            description: "Look up what generation parameters a model accepts before calling \
+                          run_model with a 'params' object. Call this whenever you want to set \
+                          something like steps, cfg_scale, seed or temperature. Requires the \
+                          exact model name from list_models — call list_models first if you \
+                          don't already have it verbatim."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "model": {
+                        "type": "string",
+                        "description": "Name of the model, exactly as given by list_models. \
+                                        Do not guess this — call list_models first."
+                    }
+                },
+                "required": ["model"]
             }),
         },
         ToolSchema {
@@ -86,10 +115,11 @@ pub fn schemas() -> Vec<ToolSchema> {
 
 /// Handle `tool_call` if it is one of ours. Returns `None` for anything else so the
 /// caller can fall through to the per-backend dispatcher.
-pub async fn dispatch(state: &AppState, tool_call: &ToolCall, job_id: &str) -> Option<ToolResult> {
+pub async fn dispatch(state: &AppState, tool_call: &ToolCall, job_id: &str, conversation_id: &str) -> Option<ToolResult> {
     match tool_call.name.as_str() {
         "list_models" => Some(list_models(state, tool_call).await),
-        "run_model" => Some(run_model(state, tool_call, job_id).await),
+        "run_model" => Some(run_model(state, tool_call, job_id, conversation_id).await),
+        "inspect_model" => Some(inspect_model(state, tool_call).await),
         "get_generation_progress" => Some(get_generation_progress(state, tool_call).await),
         _ => None,
     }
@@ -97,6 +127,10 @@ pub async fn dispatch(state: &AppState, tool_call: &ToolCall, job_id: &str) -> O
 
 fn arg<'a>(tool_call: &'a ToolCall, key: &str) -> Option<&'a str> {
     tool_call.arguments.get(key).and_then(|v| v.as_str())
+}
+
+fn arg_object<'a>(tool_call: &'a ToolCall, key: &str) -> Option<&'a serde_json::Value> {
+    tool_call.arguments.get(key).filter(|v| v.is_object())
 }
 
 fn ok(tool_call: &ToolCall, content: String) -> ToolResult {
@@ -134,7 +168,7 @@ async fn inventory(state: &AppState) -> Vec<serde_json::Value> {
             let running = loaded.values().find(|l| paths_match(&l.model_path, &entry.path));
             serde_json::json!({
                 "model": entry.name,
-                "modality": running.map(|l| l.modality.clone()).unwrap_or_else(|| entry.modality.clone()),
+                "task_tags": running.map(|l| l.task_tags.clone()).unwrap_or_else(|| entry.task_tags.clone()),
                 "loaded": running.is_some(),
             })
         })
@@ -146,7 +180,7 @@ async fn inventory(state: &AppState) -> Vec<serde_json::Value> {
         if !rows.iter().any(|r| r["model"] == serde_json::Value::String(name.clone())) {
             rows.push(serde_json::json!({
                 "model": name,
-                "modality": entry.modality,
+                "task_tags": entry.task_tags,
                 "loaded": true,
             }));
         }
@@ -167,10 +201,15 @@ fn paths_match(a: &str, b: &str) -> bool {
 }
 
 async fn list_models(state: &AppState, tool_call: &ToolCall) -> ToolResult {
-    let filter = arg(tool_call, "modality").map(|m| m.to_ascii_lowercase());
+    let filter = arg(tool_call, "task_tag").map(|m| m.to_ascii_lowercase());
     let mut rows = inventory(state).await;
     if let Some(filter) = &filter {
-        rows.retain(|r| r["modality"].as_str().unwrap_or("").eq_ignore_ascii_case(filter));
+        rows.retain(|r| {
+            r["task_tags"]
+                .as_array()
+                .map(|tags| tags.iter().any(|t| t.as_str().unwrap_or("").eq_ignore_ascii_case(filter)))
+                .unwrap_or(false)
+        });
     }
 
     if rows.is_empty() {
@@ -210,19 +249,17 @@ async fn get_generation_progress(state: &AppState, tool_call: &ToolCall) -> Tool
     }
 }
 
-async fn run_model(state: &AppState, tool_call: &ToolCall, job_id: &str) -> ToolResult {
+async fn run_model(state: &AppState, tool_call: &ToolCall, job_id: &str, conversation_id: &str) -> ToolResult {
     let Some(target) = arg(tool_call, "model") else {
         return err(tool_call, "run_model needs a 'model' argument.".into());
     };
     let prompt = arg(tool_call, "prompt").unwrap_or("");
+    let params = arg_object(tool_call, "params");
 
     // Resolve against what is already loaded, else load it from the catalog.
     let mut entry = find_loaded(state, target).await;
     if entry.is_none() {
-        let catalog = list_detected_models().await.0;
-        let Some(found) = catalog.into_iter().find(|c| {
-            c.name.eq_ignore_ascii_case(target) || paths_match(&c.path, target)
-        }) else {
+        let Some(found) = find_in_catalog(target).await else {
             return err(tool_call, format!(
                 "No model named '{}'. Call list_models to see what is available.", target
             ));
@@ -245,38 +282,39 @@ async fn run_model(state: &AppState, tool_call: &ToolCall, job_id: &str) -> Tool
     }
 
     let entry = entry.expect("resolved above");
-    let modality = entry.modality.as_str();
-    info!("run_model: '{}' ({}) <- {:?}", entry.model_path, modality, prompt);
+    let backend_category = crate::task_tags::backend_category_for_tags(&entry.task_tags);
+    info!("run_model: '{}' ({:?}) <- {:?}", entry.model_path, entry.task_tags, prompt);
 
-    match modality {
-        "text" | "vision" => {
+    match backend_category {
+        None => {
             if prompt.is_empty() {
                 return err(tool_call, "run_model needs a 'prompt' for text/vision models.".into());
             }
-            run_text_model(state, tool_call, entry.port, prompt).await
+            run_text_model(state, tool_call, entry.port, prompt, params).await
         }
-        _ => {
+        Some(backend_modality) => {
             let image = match arg(tool_call, "image") {
                 Some(handle) => match resolve_media_handle(state, handle).await {
                     Ok(bytes) => Some(bytes),
                     Err(e) => return err(tool_call, e),
                 },
                 // The orchestrator often omits the 'image' argument even when the user just
-                // attached one (e.g. "make a 3d model out of this"). Mesh generation always
-                // needs an image, so fall back to the most recently attached one.
-                None if modality == "mesh3d" => {
-                    let fallback = state.last_image_handle.lock().await.clone();
-                    match fallback {
-                        Some(id) => match resolve_media_handle(state, &id).await {
+                // attached or generated one earlier in this conversation (e.g. "make a 3d
+                // model out of this", or "edit it"). Fall back to the most recent image
+                // asset in this conversation for any media-consuming modality.
+                None => {
+                    match crate::media_store::latest_asset_of_modality(
+                        &state.generated_assets, conversation_id, "image",
+                    ).await {
+                        Some(asset) => match resolve_media_handle(state, &asset.id).await {
                             Ok(bytes) => Some(bytes),
                             Err(_) => None,
                         },
                         None => None,
                     }
                 }
-                None => None,
             };
-            run_media_model(state, tool_call, modality, prompt, job_id, image).await
+            run_media_model(state, tool_call, backend_modality, prompt, job_id, image, params, &entry.model_id, target, conversation_id).await
         }
     }
 }
@@ -302,24 +340,108 @@ async fn find_loaded(state: &AppState, target: &str) -> Option<crate::http::Load
         .cloned()
 }
 
+/// Find `target` in the on-disk catalog (used to load-on-demand in `run_model`, and to
+/// resolve a modality without loading in `inspect_model`).
+async fn find_in_catalog(target: &str) -> Option<crate::http::DetectedModelEntry> {
+    let catalog = list_detected_models().await.0;
+    catalog
+        .into_iter()
+        .find(|c| c.name.eq_ignore_ascii_case(target) || paths_match(&c.path, target))
+}
+
+/// A hand-written description of the parameters `run_model` accepts for a given modality,
+/// returned to the orchestrator by `inspect_model`.
+async fn inspect_model(state: &AppState, tool_call: &ToolCall) -> ToolResult {
+    let Some(target) = arg(tool_call, "model") else {
+        return err(tool_call, "inspect_model needs a 'model' argument.".into());
+    };
+
+    let task_tags = match find_loaded(state, target).await {
+        Some(entry) => entry.task_tags,
+        None => match find_in_catalog(target).await {
+            Some(entry) => entry.task_tags,
+            None => {
+                return err(tool_call, format!(
+                    "No model named '{}'. Call list_models to see what is available.", target
+                ));
+            }
+        },
+    };
+    let backend_category = crate::task_tags::backend_category_for_tags(&task_tags);
+
+    let content = match backend_category {
+        None => serde_json::json!([
+            {"name": "temperature", "type": "float", "default": 0.7},
+            {"name": "top_p", "type": "float", "default": 0.9},
+            {"name": "top_k", "type": "int", "default": 40},
+            {"name": "max_tokens", "type": "int", "default": 512},
+            {"name": "stop_sequences", "type": "array[string]", "default": []}
+        ]),
+        Some(Modality::Image) => serde_json::json!([
+            {"name": "negative_prompt", "type": "string", "optional": true, "note": "backend default if omitted"},
+            {"name": "steps", "type": "int", "optional": true, "note": "backend default if omitted"},
+            {"name": "cfg_scale", "type": "float", "optional": true, "note": "backend default if omitted"},
+            {"name": "width", "type": "int", "optional": true, "note": "backend default if omitted"},
+            {"name": "height", "type": "int", "optional": true, "note": "backend default if omitted"},
+            {"name": "seed", "type": "int", "optional": true, "note": "backend default if omitted"},
+            {"name": "image", "type": "string", "optional": true, "note": "Optional base64-encoded reference image for image-to-image generation"},
+            {"name": "strength", "type": "number", "optional": true, "note": "Denoising strength 0-1 for image-to-image, default 0.75; ignored for pure text-to-image"}
+        ]),
+        Some(Modality::AudioTts) => serde_json::json!([
+            {"name": "speed", "type": "float", "optional": true, "note": "backend default if omitted"}
+        ]),
+        Some(Modality::AudioAsr) => {
+            return ok(tool_call, "This modality (speech-to-text) takes no extra parameters.".into());
+        }
+        Some(backend_modality @ (Modality::Video | Modality::Mesh3D)) => {
+            let schema = match state.registry.get_backend(backend_modality).await {
+                Some(backend_arc) => backend_arc.read().await.get_param_schema().await,
+                None => None,
+            };
+            match schema {
+                Some(v) => v,
+                None if backend_modality == Modality::Mesh3D => serde_json::json!({
+                    "note": "No detailed schema available; generic fields:",
+                    "fields": ["input_kind", "steps", "guidance_scale", "seed", "output_format", "texture", "foreground_ratio"]
+                }),
+                None => serde_json::json!({
+                    "note": "No detailed schema available; generic fields:",
+                    "fields": ["negative_prompt", "num_frames", "height", "width", "num_inference_steps", "guidance_scale", "fps", "seed", "output_format"]
+                }),
+            }
+        }
+        Some(other) => return err(tool_call, format!("Modality '{:?}' cannot be run yet.", other)),
+    };
+
+    ok(tool_call, serde_json::to_string(&content).unwrap_or_else(|_| "[]".into()))
+}
+
 /// Text and vision models are served by llama-server on their own port.
 async fn run_text_model(
     _state: &AppState,
     tool_call: &ToolCall,
     port: u16,
     prompt: &str,
+    params: Option<&serde_json::Value>,
 ) -> ToolResult {
     let client = reqwest::Client::builder()
         .no_proxy()
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": "local",
         "messages": [{ "role": "user", "content": prompt }],
         "max_tokens": 1024,
         "stream": false,
     });
+    if let Some(obj) = params.and_then(|p| p.as_object()) {
+        for key in ["temperature", "top_p", "top_k", "max_tokens"] {
+            if let Some(v) = obj.get(key) {
+                body[key] = v.clone();
+            }
+        }
+    }
 
     let url = format!("http://127.0.0.1:{}/v1/chat/completions", port);
     let response = match client.post(&url).json(&body).send().await {
@@ -352,29 +474,102 @@ async fn run_text_model(
 async fn run_media_model(
     state: &AppState,
     tool_call: &ToolCall,
-    modality: &str,
+    backend_modality: Modality,
     prompt: &str,
     job_id: &str,
     image: Option<Vec<u8>>,
+    params: Option<&serde_json::Value>,
+    model_id: &str,
+    catalog_name: &str,
+    conversation_id: &str,
 ) -> ToolResult {
-    let (backend_modality, mime, modality_static): (Modality, &str, &'static str) = match modality {
-        "tts" => (Modality::AudioTts, "audio/wav", "tts"),
-        "audio" => (Modality::AudioAsr, "text/plain", "audio"),
-        "image" => (Modality::Image, "image/png", "image"),
-        "video" => (Modality::Video, "video/mp4", "video"),
-        "mesh3d" => (Modality::Mesh3D, "model/gltf-binary", "mesh"),
-        other => return err(tool_call, format!("Modality '{}' cannot be run yet.", other)),
+    let (mime, modality_static): (&str, &'static str) = match backend_modality {
+        Modality::AudioTts => ("audio/wav", "tts"),
+        Modality::AudioAsr => ("text/plain", "audio"),
+        Modality::Image => ("image/png", "image"),
+        Modality::Video => ("video/mp4", "video"),
+        Modality::Mesh3D => ("model/gltf-binary", "mesh"),
+        other => return err(tool_call, format!("Modality '{:?}' cannot be run yet.", other)),
     };
 
     let Some(backend_arc) = state.registry.get_backend(backend_modality).await else {
         return err(tool_call, format!("No backend is registered for {:?}.", backend_modality));
     };
 
+    let image_params = if backend_modality == Modality::Image {
+        match params {
+            Some(p) => match serde_json::from_value::<backend_trait::ImageParams>(p.clone()) {
+                Ok(v) => Some(v),
+                Err(e) => return err(tool_call, format!("Invalid params for image model: {}", e)),
+            },
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    let audio_params = if backend_modality == Modality::AudioTts {
+        match params {
+            Some(p) => match serde_json::from_value::<backend_trait::AudioParams>(p.clone()) {
+                Ok(v) => Some(v),
+                Err(e) => return err(tool_call, format!("Invalid params for tts model: {}", e)),
+            },
+            None => None,
+        }
+    } else {
+        None
+    };
+
     let mesh_params = if backend_modality == Modality::Mesh3D {
-        Some(backend_trait::Mesh3dParams {
-            images: image.clone().map(|b| vec![b]),
-            ..Default::default()
-        })
+        let mut base = serde_json::json!({ "images": image.clone().map(|b| vec![b]) });
+        if let Some(obj) = params.and_then(|p| p.as_object()) {
+            const KNOWN: &[&str] = &[
+                "input_kind", "steps", "guidance_scale", "seed", "output_format", "texture",
+                "foreground_ratio",
+            ];
+            let mut extra = serde_json::Map::new();
+            for (k, v) in obj {
+                if KNOWN.contains(&k.as_str()) {
+                    base[k] = v.clone();
+                } else {
+                    extra.insert(k.clone(), v.clone());
+                }
+            }
+            if !extra.is_empty() {
+                base["extra"] = serde_json::Value::Object(extra);
+            }
+        }
+        match serde_json::from_value::<backend_trait::Mesh3dParams>(base) {
+            Ok(v) => Some(v),
+            Err(e) => return err(tool_call, format!("Invalid params for 3D model: {}", e)),
+        }
+    } else {
+        None
+    };
+
+    let video_params = if backend_modality == Modality::Video {
+        let mut base = serde_json::json!({ "image": image.clone() });
+        if let Some(obj) = params.and_then(|p| p.as_object()) {
+            const KNOWN: &[&str] = &[
+                "negative_prompt", "num_frames", "height", "width", "num_inference_steps",
+                "guidance_scale", "fps", "seed", "output_format",
+            ];
+            let mut extra = serde_json::Map::new();
+            for (k, v) in obj {
+                if KNOWN.contains(&k.as_str()) {
+                    base[k] = v.clone();
+                } else {
+                    extra.insert(k.clone(), v.clone());
+                }
+            }
+            if !extra.is_empty() {
+                base["extra"] = serde_json::Value::Object(extra);
+            }
+        }
+        match serde_json::from_value::<backend_trait::VideoParams>(base) {
+            Ok(v) => Some(v),
+            Err(e) => return err(tool_call, format!("Invalid params for video model: {}", e)),
+        }
     } else {
         None
     };
@@ -388,9 +583,10 @@ async fn run_media_model(
         image_input: image,
         tools: None,
         tool_choice: None,
-        image_params: None,
+        image_params,
         mesh_params,
-        audio_params: None,
+        audio_params,
+        video_params,
         cancel: None,
     };
 
@@ -422,6 +618,9 @@ async fn run_media_model(
     if let Err(e) = backend_arc.write().await.unload_model().await {
         tracing::warn!("Failed to unload {:?} backend after tool call: {}", backend_modality, e);
     }
+    // The backend is now unloaded; drop the stale registry entry too, or the next
+    // run_model call for this model will find it via find_loaded() and skip re-loading.
+    state.loaded_models.lock().await.remove(model_id);
 
     match gen_result {
         Ok(Ok(response)) => {
@@ -430,6 +629,17 @@ async fn run_media_model(
                 return ok(tool_call, response.output_text);
             };
             let media_id = state.media_store.store(data, mime).await;
+            crate::media_store::record_generated_asset(
+                &state.generated_assets,
+                conversation_id,
+                crate::media_store::GeneratedAsset {
+                    id: media_id.clone(),
+                    modality: modality_static.to_string(),
+                    model: catalog_name.to_string(),
+                    prompt: prompt.to_string(),
+                    created_at: std::time::Instant::now(),
+                },
+            ).await;
             ToolResult {
                 tool_call_id: tool_call.id.clone(),
                 content: response.output_text,

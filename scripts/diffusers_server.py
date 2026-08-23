@@ -53,12 +53,15 @@ if sys.platform == "win32":
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 try:
-    from diffusers import AutoPipelineForText2Image, StableDiffusionPipeline
+    from diffusers import AutoPipelineForText2Image, AutoPipelineForImage2Image, StableDiffusionPipeline
 except ImportError as e:
     print(f"Failed to import diffusers/torch: {e}", file=sys.stderr)
     sys.exit(1)
 
+from PIL import Image
+
 PIPE = None
+IMG2IMG_PIPE = None
 DEVICE = None
 
 PROGRESS_LOCK = threading.Lock()
@@ -102,6 +105,7 @@ def generate(req: dict) -> "PIL.Image.Image":  # noqa: F821
     width = int(req.get("width") or 512)
     height = int(req.get("height") or 512)
     seed = req.get("seed")
+    init_image_b64 = req.get("init_image_base64")
 
     generator = None
     if seed is not None:
@@ -115,6 +119,37 @@ def generate(req: dict) -> "PIL.Image.Image":  # noqa: F821
 
     def _cb_legacy(step, timestep, latents):
         _progress_update(step=step + 1, total=steps)
+
+    if init_image_b64:
+        global IMG2IMG_PIPE
+        if IMG2IMG_PIPE is None:
+            IMG2IMG_PIPE = AutoPipelineForImage2Image.from_pipe(PIPE)
+        init_image = Image.open(io.BytesIO(base64.b64decode(init_image_b64))).convert("RGB")
+        strength = float(req.get("strength") or 0.75)
+        try:
+            result = IMG2IMG_PIPE(
+                prompt=prompt,
+                image=init_image,
+                strength=strength,
+                negative_prompt=negative_prompt,
+                num_inference_steps=steps,
+                guidance_scale=guidance_scale,
+                generator=generator,
+                callback_on_step_end=_cb_on_step_end,
+            )
+        except TypeError:
+            result = IMG2IMG_PIPE(
+                prompt=prompt,
+                image=init_image,
+                strength=strength,
+                negative_prompt=negative_prompt,
+                num_inference_steps=steps,
+                guidance_scale=guidance_scale,
+                generator=generator,
+                callback=_cb_legacy,
+                callback_steps=1,
+            )
+        return result.images[0]
 
     try:
         result = PIPE(

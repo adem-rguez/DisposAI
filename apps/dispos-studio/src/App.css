@@ -870,6 +870,12 @@ textarea {
 
 .btn-send:hover { opacity: 0.9; transform: scale(1.05); }
 
+.btn-send-stop {
+  background: #ef4444;
+}
+
+.btn-send-stop:hover { opacity: 0.9; transform: scale(1.05); }
+
 /* Common Studio Cards */
 .grid-2 {
   display: grid;
@@ -1951,10 +1957,33 @@ input[type="text"], input[type="number"], select {
 }
 
 .hf-folder-header {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
   font-size: 0.72rem;
   color: var(--text-secondary);
   font-weight: 600;
   padding-top: 0.3rem;
+  cursor: pointer;
+  user-select: none;
+}
+
+.hf-folder-header:hover {
+  color: var(--text-primary);
+}
+
+.hf-folder-chevron {
+  flex-shrink: 0;
+  transition: transform 0.12s ease;
+}
+
+.hf-folder-chevron-open {
+  transform: rotate(90deg);
+}
+
+.hf-folder-count {
+  font-weight: 400;
+  opacity: 0.6;
 }
 
 .hf-file-info {

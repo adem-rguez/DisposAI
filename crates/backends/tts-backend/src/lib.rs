@@ -55,7 +55,7 @@ impl TtsBackend {
 
     /// Spawn `scripts/kokoro_tts_server.py` and block (on a worker thread) until
     /// it prints "READY" on stdout or `STARTUP_TIMEOUT` elapses.
-    fn spawn_server(model_path: &Path, port: u16) -> Result<Child, String> {
+    fn spawn_kokoro_server(model_path: &Path, port: u16) -> Result<Child, String> {
         let script_path = PathBuf::from("scripts").join("kokoro_tts_server.py");
         if !script_path.exists() {
             return Err(format!(
@@ -107,6 +107,94 @@ impl TtsBackend {
 
         Ok(child)
     }
+
+    /// Spawn `scripts/tts_server.py` (generic transformers-based TTS) and
+    /// block (on a worker thread) until it prints "READY" on stdout or
+    /// `STARTUP_TIMEOUT` elapses.
+    fn spawn_generic_tts_server(model_path: &Path, port: u16) -> Result<Child, String> {
+        let script_path = PathBuf::from("scripts").join("tts_server.py");
+        if !script_path.exists() {
+            return Err(format!(
+                "Generic TTS server script not found at: {}",
+                script_path.display()
+            ));
+        }
+
+        let mut cmd = Command::new("python");
+        cmd.arg(&script_path)
+            .arg("--model-path")
+            .arg(model_path)
+            .arg("--port")
+            .arg(port.to_string())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("Failed to spawn tts_server.py: {}", e))?;
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "Failed to capture stdout of tts_server.py".to_string())?;
+
+        let start = Instant::now();
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    return Err("tts_server.py exited before signalling READY".to_string());
+                }
+                Ok(_) => {
+                    if line.trim() == "READY" {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    return Err(format!("Error reading tts_server.py stdout: {}", e));
+                }
+            }
+            if start.elapsed() > STARTUP_TIMEOUT {
+                let _ = child.kill();
+                return Err("Timed out waiting for tts_server.py to start".to_string());
+            }
+        }
+
+        Ok(child)
+    }
+}
+
+/// Heuristic: does this model path point at a Kokoro (ONNX) model? Kokoro is
+/// handled by its own special-cased script (custom G2P + voice-embedding
+/// pipeline that doesn't generalize); everything else goes through the
+/// generic transformers-based `tts_server.py`.
+fn is_kokoro_model(model_path: &Path) -> bool {
+    let path_str = model_path.to_string_lossy().to_lowercase();
+    if path_str.contains("kokoro") {
+        return true;
+    }
+
+    if model_path.is_file() {
+        return model_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("onnx"))
+            .unwrap_or(false);
+    }
+
+    if model_path.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(model_path) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_lowercase();
+                if name.ends_with(".onnx") && name.contains("kokoro") {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
 }
 
 impl Default for TtsBackend {
@@ -169,7 +257,12 @@ impl InferenceBackend for TtsBackend {
             return Ok(());
         }
 
-        info!("Loading Kokoro TTS model: {}", model_path.display());
+        let is_kokoro = is_kokoro_model(model_path);
+        if is_kokoro {
+            info!("Loading Kokoro TTS model: {}", model_path.display());
+        } else {
+            info!("Loading generic (transformers) TTS model: {}", model_path.display());
+        }
 
         // Kill any previously running server before spawning a new one.
         if let Some(mut child) = self.process.take() {
@@ -180,12 +273,20 @@ impl InferenceBackend for TtsBackend {
         let port = next_free_tts_port();
         let model_path_owned = model_path.to_path_buf();
 
-        match tokio::task::spawn_blocking(move || Self::spawn_server(&model_path_owned, port))
-            .await
+        let spawn_result = if is_kokoro {
+            tokio::task::spawn_blocking(move || Self::spawn_kokoro_server(&model_path_owned, port))
+                .await
+        } else {
+            tokio::task::spawn_blocking(move || Self::spawn_generic_tts_server(&model_path_owned, port))
+                .await
+        };
+
+        match spawn_result
             .map_err(|e| BackendError::LoadError(format!("spawn_blocking join error: {}", e)))?
         {
             Ok(child) => {
-                info!("kokoro_tts_server.py ready on port {} (PID: {})", port, child.id());
+                let script_name = if is_kokoro { "kokoro_tts_server.py" } else { "tts_server.py" };
+                info!("{} ready on port {} (PID: {})", script_name, port, child.id());
                 self.process = Some(child);
                 self.port = port;
             }
@@ -206,7 +307,11 @@ impl InferenceBackend for TtsBackend {
         self.model_path = Some(model_path.to_path_buf());
         self.is_loaded.store(true, Ordering::SeqCst);
 
-        info!("Successfully loaded model in Kokoro TTS backend");
+        if is_kokoro {
+            info!("Successfully loaded model in Kokoro TTS backend");
+        } else {
+            info!("Successfully loaded model in generic TTS backend");
+        }
         Ok(())
     }
 

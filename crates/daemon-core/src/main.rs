@@ -5,6 +5,7 @@ mod orchestrator_tools;
 mod profiler;
 mod registry;
 mod session;
+mod task_tags;
 mod tool_fallback;
 mod vram;
 
@@ -88,14 +89,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let media_disk_dir = std::env::current_dir()?.join("generated-media");
     let media_store = Arc::new(MediaStore::new(1800, media_disk_dir)); // 30-minute TTL by default
 
-    // Periodic sweep of expired in-memory media (no-op when persisting to disk)
+    // Per-conversation registry of generated/uploaded media assets, so the orchestrator
+    // can resolve pronoun references like "edit it" without vision input.
+    let generated_assets: media_store::GeneratedAssetRegistry =
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+    // Periodic sweep of expired in-memory media (no-op when persisting to disk) and
+    // idle conversation asset buckets.
     {
         let media_store = media_store.clone();
+        let generated_assets = generated_assets.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
                 interval.tick().await;
                 media_store.cleanup_expired().await;
+                media_store::cleanup_expired_assets(&generated_assets).await;
             }
         });
     }
@@ -133,7 +142,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         job_cancel: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         studio_models: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         hf_token: Arc::new(tokio::sync::Mutex::new(None)),
-        last_image_handle: Arc::new(tokio::sync::Mutex::new(None)),
+        generated_assets: generated_assets.clone(),
     };
     let app = http::create_router(http_state);
     let http_addr: SocketAddr = "0.0.0.0:8080".parse()?;

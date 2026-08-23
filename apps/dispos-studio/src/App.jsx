@@ -4,7 +4,7 @@ import {
   Cpu, HardDrive, Zap, Send, Play, Image, FileAudio, RefreshCw,
   Brain, ChevronDown, ChevronRight, Sliders, Folder, Power, Layers, Settings,
   CheckCircle2, XCircle, PackagePlus, Box, Boxes, Paperclip, X, Pencil,
-  Search, Download, Globe, Loader, Check, Heart, Wand2, ArrowUpRight, Trash2
+  Search, Download, Globe, Loader, Check, Heart, Wand2, ArrowUpRight, Trash2, Square
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -216,6 +216,45 @@ function meshParamDefaultValue(p) {
   return null;
 }
 
+// Generic control for a single `GET /v1/.../schema`-style param (used by both
+// the mesh3d and video panels, which share the same {name, type, ...} shape).
+function SchemaParamField({ param: p, value, onChange }) {
+  if (p.type === 'bool') {
+    return (
+      <div className="slider-header" style={{ marginBottom: '1rem' }}>
+        <div><strong>{p.name}</strong></div>
+        <input
+          type="checkbox"
+          checked={Boolean(value)}
+          onChange={e => onChange(e.target.checked)}
+        />
+      </div>
+    );
+  }
+  let control;
+  if (p.type === 'enum') {
+    control = (
+      <select value={value ?? ''} onChange={e => onChange(e.target.value)}>
+        {(p.choices || []).map(choice => <option key={choice} value={choice}>{choice}</option>)}
+      </select>
+    );
+  } else if (p.type === 'int' || p.type === 'float') {
+    control = (
+      <input
+        type="number"
+        step={p.type === 'float' ? '0.1' : '1'}
+        min={p.min ?? undefined}
+        max={p.max ?? undefined}
+        value={value ?? ''}
+        onChange={e => onChange(e.target.value === '' ? null : Number(e.target.value))}
+      />
+    );
+  } else {
+    control = <input type="text" value={value ?? ''} onChange={e => onChange(e.target.value)} />;
+  }
+  return <div className="form-group"><label>{p.name}</label>{control}</div>;
+}
+
 function AttachmentPreview({ attachment }) {
   if (attachment.type.startsWith('image/')) {
     return <img className="chat-attachment-image" src={attachment.dataUrl} alt={attachment.name} />;
@@ -230,6 +269,41 @@ function AttachmentPreview({ attachment }) {
     return <Mesh3DViewer base64={attachment.dataUrl} format={guessMeshFormat(attachment.name)} />;
   }
   return <a className="chat-attachment-file" href={attachment.dataUrl} download={attachment.name}>{attachment.name}</a>;
+}
+
+// Mirrors crates/daemon-core/src/task_tags.rs::backend_category_for_tags priority
+// order (AudioTts > AudioAsr > Image > Video > Mesh3D > chat/llama-server path),
+// reimplemented here since there's no shared code between the daemon and this
+// frontend. Category keys line up with the studio tab ids used below.
+const TASK_TAG_CATEGORY = {
+  'text-to-speech': 'tts',
+  'automatic-speech-recognition': 'audio',
+  'audio-classification': 'audio',
+  'text-to-image': 'image',
+  'image-to-image': 'image',
+  'unconditional-image-generation': 'image',
+  'image-classification': 'image',
+  'image-segmentation': 'image',
+  'zero-shot-image-classification': 'image',
+  'text-to-video': 'video',
+  'image-to-video': 'video',
+  'video-to-video': 'video',
+  'video-classification': 'video',
+  'video-text-to-text': 'video',
+  'text-to-3d': 'mesh3d',
+  'image-to-3d': 'mesh3d',
+  'feature-extraction': 'embeddings',
+  'text-generation': 'chat',
+  'text2text-generation': 'chat',
+  'conversational': 'chat',
+  'image-text-to-text': 'chat',
+  'visual-question-answering': 'chat',
+};
+const CATEGORY_PRIORITY = ['tts', 'audio', 'image', 'video', 'mesh3d', 'embeddings', 'chat'];
+function categoryForTags(tags) {
+  const set = new Set((tags || []).map(t => TASK_TAG_CATEGORY[t]).filter(Boolean));
+  for (const c of CATEGORY_PRIORITY) if (set.has(c)) return c;
+  return 'chat';
 }
 
 const HF_MODEL_TYPE_GROUPS = [
@@ -401,6 +475,7 @@ function AppInner() {
 
   const [autopilot, setAutopilot] = useState(appSettings.autopilot ?? false);
   useEffect(() => { setAutopilot(appSettings.autopilot ?? false); }, [appSettings.autopilot]);
+  const [reasoningEnabled, setReasoningEnabled] = useState(true);
 
   // Hardware stats state
   const [sysInfo, setSysInfo] = useState({
@@ -424,6 +499,22 @@ function AppInner() {
   const [imgProgress, setImgProgress] = useState(null);
   const [imgMissingComponents, setImgMissingComponents] = useState(null);
   const [activeImageJobId, setActiveImageJobId] = useState(null);
+  const [imgInitImage, setImgInitImage] = useState(null);
+  const [imgInitImageName, setImgInitImageName] = useState(null);
+  const [imgStrength, setImgStrength] = useState(0.75);
+  const imgInitImageInputRef = useRef(null);
+
+  // Video Studio State
+  const [videoPrompt, setVideoPrompt] = useState('A serene waterfall in a mystical forest, cinematic motion');
+  const [videoSchema, setVideoSchema] = useState(null); // { params: [...] } from GET /v1/videos/schema, null if unavailable
+  const [videoParamValues, setVideoParamValues] = useState({}); // current values of the dynamic schema-driven params (all fields but prompt)
+  const [videoSrc, setVideoSrc] = useState(null);
+  const [isGeneratingVideo, setIsGeneratingVideo] = useState(false);
+  const [videoProgress, setVideoProgress] = useState(null);
+  const [activeVideoJobId, setActiveVideoJobId] = useState(null);
+  const [videoInitImage, setVideoInitImage] = useState(null);
+  const [videoInitImageName, setVideoInitImageName] = useState(null);
+  const videoInitImageInputRef = useRef(null);
 
   // 3D Model Studio State
   const [mesh3dPrompt, setMesh3dPrompt] = useState('A low-poly wooden treasure chest, game-ready asset');
@@ -449,6 +540,19 @@ function AppInner() {
   const [ttsProgress, setTtsProgress] = useState(null);
   const [activeTtsJobId, setActiveTtsJobId] = useState(null);
 
+  // Transcribe (ASR) Studio State
+  const [asrFileName, setAsrFileName] = useState(null);
+  const [asrLanguage, setAsrLanguage] = useState('');
+  const [asrText, setAsrText] = useState('');
+  const [isTranscribing, setIsTranscribing] = useState(false);
+  const asrFileInputRef = useRef(null);
+
+  // Embeddings State
+  const [embedModelId, setEmbedModelId] = useState('');
+  const [embedInput, setEmbedInput] = useState('');
+  const [embedResults, setEmbedResults] = useState(null); // { data: [{embedding, index}], model, usage }
+  const [isEmbedding, setIsEmbedding] = useState(false);
+
   // Default values used by the fit preview and new model configuration.
   const [gpuLayers, setGpuLayers] = useState(99);
   const [contextSize, setContextSize] = useState(4096);
@@ -457,7 +561,7 @@ function AppInner() {
   // Multi-model state
   const [loadedModels, setLoadedModels] = useState([]); // array of LoadedModelEntry from backend
   const [selectedModelId, setSelectedModelId] = useState(null); // which model chat uses
-  const [openStudios, setOpenStudios] = useState([]); // { modelId, name, modality }
+  const [openStudios, setOpenStudios] = useState([]); // { modelId, name, task_tags }
   const [chatSessions, setChatSessions] = useState(() => {
     try {
       const stored = JSON.parse(localStorage.getItem('dispos.chat-sessions'));
@@ -614,6 +718,7 @@ function AppInner() {
   const [hfRepoKind, setHfRepoKind] = useState(null);
   const [hfAutodownload, setHfAutodownload] = useState([]);
   const [hfAutodownloadReason, setHfAutodownloadReason] = useState(null);
+  const [hfCollapsedFolders, setHfCollapsedFolders] = useState(() => new Set());
   const [hfDownloads, setHfDownloads] = useState({});
   const [showDownloadsPanel, setShowDownloadsPanel] = useState(false);
   const [pendingCatalogJump, setPendingCatalogJump] = useState(null);
@@ -743,6 +848,7 @@ function AppInner() {
     setHfRepoKind(null);
     setHfAutodownload([]);
     setHfAutodownloadReason(null);
+    setHfCollapsedFolders(new Set());
     setHfDownloads(current => {
       const next = { ...current };
       for (const key of Object.keys(next)) {
@@ -765,7 +871,8 @@ function AppInner() {
   };
 
   const startHfDownload = (repoId, filename, targetDir, targetFilename) => {
-    setHfDownloads(current => ({ ...current, [filename]: { status: 'downloading', downloaded_bytes: 0, total_bytes: 0 } }));
+    const key = `${repoId}::${filename}`;
+    setHfDownloads(current => ({ ...current, [key]: { status: 'downloading', downloaded_bytes: 0, total_bytes: 0, repo: repoId, filename } }));
     fetch('http://127.0.0.1:8080/v1/model/hf-download', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -776,29 +883,29 @@ function AppInner() {
         ...(targetFilename ? { target_filename: targetFilename } : {}),
       }),
     }).catch(() => {
-      setHfDownloads(current => ({ ...current, [filename]: { ...current[filename], status: 'error' } }));
+      setHfDownloads(current => ({ ...current, [key]: { ...current[key], status: 'error' } }));
     });
   };
 
   const startHfDownloadAll = (repoId) => {
     hfRepoFiles.forEach(file => {
-      if (hfDownloads[file.filename]?.status === 'complete') return;
+      if (hfDownloads[`${repoId}::${file.filename}`]?.status === 'complete') return;
       startHfDownload(repoId, file.filename);
     });
   };
 
   const startHfAutodownload = (repoId) => {
     hfAutodownload.forEach(filename => {
-      if (hfDownloads[filename]?.status === 'complete') return;
+      if (hfDownloads[`${repoId}::${filename}`]?.status === 'complete') return;
       startHfDownload(repoId, filename);
     });
   };
 
-  const cancelHfDownload = (filename) => {
+  const cancelHfDownload = (repo, filename) => {
     fetch('http://127.0.0.1:8080/v1/model/hf-download/cancel', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ filename }),
+      body: JSON.stringify({ repo, filename }),
     }).catch(() => {});
   };
 
@@ -872,14 +979,14 @@ function AppInner() {
         .then(res => res.ok ? res.json() : {})
         .then(status => {
           const anyCompleted = Object.entries(status).some(
-            ([filename, info]) =>
+            ([key, info]) =>
               info.status === 'complete' &&
-              hfDownloads[filename] && hfDownloads[filename].status !== 'complete'
+              hfDownloads[key] && hfDownloads[key].status !== 'complete'
           );
           setHfDownloads(current => {
             const next = { ...current };
-            for (const [filename, info] of Object.entries(status)) {
-              next[filename] = { ...next[filename], ...info };
+            for (const [key, info] of Object.entries(status)) {
+              next[key] = { ...next[key], ...info };
             }
             return next;
           });
@@ -900,7 +1007,7 @@ function AppInner() {
     if (!imgMissingComponents || imgMissingComponents.length === 0) return;
     const downloadable = imgMissingComponents.filter(c => c.source);
     if (downloadable.length === 0) return;
-    const allDone = downloadable.every(c => hfDownloads[c.source.filename]?.status === 'complete');
+    const allDone = downloadable.every(c => hfDownloads[`${c.source.repo}::${c.source.filename}`]?.status === 'complete');
     if (allDone) {
       setImgMissingComponents(null);
       handleGenerateImage();
@@ -950,7 +1057,7 @@ function AppInner() {
       cardId: card.id,
       model_path: card.modelPath,
       name: card.name,
-      modality: card.modality || 'text',
+      task_tags: card.task_tags || [],
       mesh_input_kinds: card.mesh_input_kinds || detectedModels.find(m => m.path === card.modelPath)?.mesh_input_kinds || null,
       gpu_layers: s.gpu_layers ?? 99,
       context_size: maxContextSize ? Math.min(s.context_size ?? 4096, maxContextSize) : (s.context_size ?? 4096),
@@ -968,6 +1075,7 @@ function AppInner() {
       mmproj_path: s.mmproj_path || card.mmproj_path || detectedModels.find(m => m.path === card.modelPath)?.mmproj_path || '',
       mesh_vae_path: s.mesh_vae_path || card.mesh_vae_path || detectedModels.find(m => m.path === card.modelPath)?.mesh_vae_path || '',
       mesh_texgen_path: s.mesh_texgen_path || card.mesh_texgen_path || detectedModels.find(m => m.path === card.modelPath)?.mesh_texgen_path || '',
+      image_components: detectedModels.find(m => m.path === card.modelPath)?.image_components || null,
     });
   };
 
@@ -1000,14 +1108,16 @@ function AppInner() {
           mmproj_path: configuration.mmproj_path || undefined,
         }),
       });
-      const data = await res.json();
+      const text = await res.text();
+      let data = null;
+      try { data = text ? JSON.parse(text) : null; } catch { /* plain-text error body */ }
       if (res.ok && data?.model_id) {
         await fetchLoadedModels();
         fetchSystemInfo();
         setTimeout(fetchSystemInfo, 1500);
         return data.model_id;
       } else {
-        pushError('Failed to load model: ' + (data?.error || res.statusText));
+        pushError('Failed to load model: ' + (data?.error || text || res.statusText));
         return null;
       }
     } catch (err) {
@@ -1023,9 +1133,8 @@ function AppInner() {
   // generation. Fallbacks match each studio's own defaults.
   const applyModelDefaults = (cfg) => {
     if (!cfg) return;
-    switch (cfg.modality) {
-      case 'text':
-      case 'vision':
+    switch (categoryForTags(cfg.task_tags)) {
+      case 'chat':
         setTemperature(cfg.temperature ?? 0.7);
         setTopP(cfg.top_p ?? 0.9);
         break;
@@ -1069,7 +1178,7 @@ function AppInner() {
       mmproj_path: mmproj,
     });
     if (modelId) {
-      applyModelDefaults({ ...s, modality: card.modality });
+      applyModelDefaults({ ...s, task_tags: card.task_tags });
       setModelCards(current => current.map(item => item.id === card.id ? { ...item, settings: s, loadedModelId: modelId } : item));
     }
     return modelId;
@@ -1108,8 +1217,10 @@ function AppInner() {
         body: JSON.stringify({ path: modelPath }),
       });
       if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        pushError('Failed to open folder: ' + (data?.error || res.statusText));
+        const text = await res.text();
+        let data = null;
+        try { data = text ? JSON.parse(text) : null; } catch { /* plain-text error body */ }
+        pushError('Failed to open folder: ' + (data?.error || text || res.statusText));
       }
     } catch (err) {
       pushError('Error opening folder: ' + err.message);
@@ -1128,8 +1239,10 @@ function AppInner() {
         fetchCatalog();
         setModelCards(current => current.filter(card => card.modelPath !== model.path));
       } else {
-        const data = await res.json().catch(() => ({}));
-        pushError('Failed to delete model: ' + (data?.error || res.statusText));
+        const text = await res.text();
+        let data = null;
+        try { data = text ? JSON.parse(text) : null; } catch { /* plain-text error body */ }
+        pushError('Failed to delete model: ' + (data?.error || text || res.statusText));
       }
     } catch (err) {
       pushError('Error deleting model: ' + err.message);
@@ -1149,15 +1262,15 @@ function AppInner() {
   const selectedModel = loadedModels.find(model => model.model_id === selectedModelId) ?? null;
   const selectedCatalogModel = detectedModels.find(model => model.path === selectedModel?.model_path);
   const acceptsImageInput = selectedModel?.image_input_available === true || selectedCatalogModel?.image_input_available === true;
-  const cfgModality = configTarget?.modality || 'text';
+  const cfgCategory = categoryForTags(configTarget?.task_tags);
   const openModelStudio = (model) => {
-    const modalityMap = { vision: 'chat', tts: 'audio', text: 'chat', mesh3d: 'mesh3d' };
-    const studio = modalityMap[model.modality] ?? model.modality;
-    setActiveTab(['chat', 'image', 'audio', 'video', 'mesh3d'].includes(studio) ? studio : 'chat');
+    const category = categoryForTags(model.task_tags);
+    const studio = category === 'tts' ? 'audio' : category === 'audio' ? 'transcribe' : category;
+    setActiveTab(['chat', 'image', 'audio', 'transcribe', 'video', 'mesh3d', 'embeddings'].includes(studio) ? studio : 'chat');
   };
-  // Most recently opened loaded model with modality "mesh3d" drives which
+  // Most recently opened loaded model with category "mesh3d" drives which
   // input kinds the 3D Model Studio panel adapts to.
-  const activeMesh3dStudio = openStudios.filter(studio => studio.modality === 'mesh3d').slice(-1)[0];
+  const activeMesh3dStudio = openStudios.filter(studio => categoryForTags(studio.task_tags) === 'mesh3d').slice(-1)[0];
   const activeMesh3dLoaded = activeMesh3dStudio ? loadedModels.find(model => model.model_id === activeMesh3dStudio.modelId) : null;
   const activeMesh3dCatalog = activeMesh3dLoaded ? detectedModels.find(model => model.path === activeMesh3dLoaded.model_path) : null;
   const mesh3dAvailableKinds = activeMesh3dLoaded?.mesh_input_kinds?.length
@@ -1191,6 +1304,43 @@ function AppInner() {
     setMesh3dParamValues(defaults);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mesh3dAdapterId, mesh3dSchema, mesh3dCfgOverrides]);
+
+  // Most recently opened loaded model with category "image" drives whether
+  // the Image Studio panel exposes the optional reference-image (img2img) UI.
+  const activeImageStudio = openStudios.filter(studio => categoryForTags(studio.task_tags) === 'image').slice(-1)[0];
+  const imageStudioSupportsImg2Img = !!activeImageStudio?.task_tags?.includes('image-to-image');
+
+  // Most recently opened loaded model with category "video" drives the
+  // Video Studio panel's dynamic param schema.
+  const activeVideoStudio = openStudios.filter(studio => categoryForTags(studio.task_tags) === 'video').slice(-1)[0];
+  const activeVideoLoaded = activeVideoStudio ? loadedModels.find(model => model.model_id === activeVideoStudio.modelId) : null;
+
+  // Param schema reflecting what the loaded video pipeline's `__call__`
+  // actually accepts, so the panel renders fields like height/width/
+  // negative_prompt only when the loaded architecture supports them.
+  // Re-fetched whenever the active video model changes because the daemon's
+  // schema endpoint 503s until a video model's video_diffusers_server.py
+  // subprocess is actually running.
+  useEffect(() => {
+    fetch('http://127.0.0.1:8080/v1/videos/schema')
+      .then(res => (res.ok ? res.json() : Promise.reject(new Error('schema fetch failed'))))
+      .then(schema => setVideoSchema(schema))
+      .catch(() => setVideoSchema(null));
+  }, [activeVideoLoaded?.model_path]);
+  // "prompt" has its own dedicated field above the dynamic params; "image"
+  // (img2video conditioning) has its own dedicated upload control below.
+  const videoSchemaParams = (videoSchema?.params || []).filter(p => p.name !== 'prompt' && p.type !== 'image_b64');
+  const videoSchemaSupportsImage = !videoSchema || (videoSchema.params || []).some(p => p.type === 'image_b64');
+  // Re-seed the dynamic param values whenever the schema changes.
+  useEffect(() => {
+    const defaults = {};
+    videoSchemaParams.forEach(p => {
+      defaults[p.name] = meshParamDefaultValue(p);
+    });
+    setVideoParamValues(defaults);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [videoSchema]);
+  const setVideoParam = (name, value) => setVideoParamValues(current => ({ ...current, [name]: value }));
   const setMesh3dParam = (name, value) => setMesh3dParamValues(current => ({ ...current, [name]: value }));
   // Which required field (if any) is currently unfilled for the selected input
   // kind — mirrors the backend's run_model requirement: prompt for "text",
@@ -1199,7 +1349,7 @@ function AppInner() {
     ? (!mesh3dPrompt.trim() ? 'prompt' : null)
     : (mesh3dImages.length === 0 ? 'image' : null);
   const startStudio = (loadedEntry, catalogModel) => {
-    const modality = catalogModel?.modality ?? loadedEntry?.modality ?? 'text';
+    const task_tags = catalogModel?.task_tags ?? loadedEntry?.task_tags ?? [];
     const modelName = catalogModel?.name ?? loadedEntry.model_path?.split('\\').pop() ?? 'Local model';
     const chatId = `chat-${Date.now()}`;
     const initialMessages = [{ id: 'welcome', role: 'assistant', content: `Ready to use ${modelName}.`, telemetry: null }];
@@ -1209,13 +1359,13 @@ function AppInner() {
       : [...current, {
           modelId: loadedEntry.model_id,
           name: modelName,
-          modality,
+          task_tags,
         }]);
-    const session = { id: chatId, title: 'New chat', modelId: loadedEntry.model_id, modelPath: loadedEntry.model_path, modelName, modality, studioKey: canonicalStudioKey(loadedEntry.model_path, modelName), messages: initialMessages, createdAt: Date.now() };
+    const session = { id: chatId, title: 'New chat', modelId: loadedEntry.model_id, modelPath: loadedEntry.model_path, modelName, task_tags, studioKey: canonicalStudioKey(loadedEntry.model_path, modelName), messages: initialMessages, createdAt: Date.now() };
     setChatSessions(current => [...current, session]);
     setActiveChatId(chatId);
     setMessages(initialMessages);
-    openModelStudio({ modality });
+    openModelStudio({ task_tags });
   };
   const syncMessages = (updater) => setMessages(previous => {
     const next = typeof updater === 'function' ? updater(previous) : updater;
@@ -1255,15 +1405,18 @@ function AppInner() {
       body: JSON.stringify({
         model_size_bytes: sizeBytes,
         context_size: configTarget.context_size ?? 4096,
-        modality: configTarget.modality || 'text',
+        modality: categoryForTags(configTarget.task_tags),
       }),
     })
       .then(res => res.json())
       .then(data => setModelFitPreview(data))
       .catch(() => {});
-  }, [configTarget?.cardId, configTarget?.context_size, configTarget?.modality, modelCards]);
+  }, [configTarget?.cardId, configTarget?.context_size, configTarget?.task_tags, modelCards]);
 
   const messagesEndRef = useRef(null);
+  // Tracks the AbortController for the in-flight chat stream so a "Stop"
+  // button can cancel it; cleared once the stream ends (success or abort).
+  const streamAbortRef = useRef(null);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -1345,11 +1498,15 @@ function AppInner() {
       );
     };
 
+    const controller = new AbortController();
+    streamAbortRef.current = controller;
+
     try {
       const res = await fetch('http://127.0.0.1:8080/v1/chat/completions/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(requestBody),
+        signal: controller.signal,
       });
 
       if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
@@ -1478,17 +1635,24 @@ function AppInner() {
         generateChatTitle(activeChatId, titleText);
       }
     } catch (err) {
-      syncMessages(prev =>
-        prev.map(m =>
-          m.id === aiId
-            ? { ...m, content: 'Error: ' + err.message, loading: false }
-            : m
-        )
-      );
+      if (err.name === 'AbortError') {
+        // User-initiated stop — keep whatever partial content streamed in,
+        // just drop the loading spinner instead of showing an error.
+        updateMsg(true);
+      } else {
+        syncMessages(prev =>
+          prev.map(m =>
+            m.id === aiId
+              ? { ...m, content: 'Error: ' + err.message, loading: false }
+              : m
+          )
+        );
+      }
     } finally {
       jobIntervals.forEach(interval => clearInterval(interval));
       jobIntervals.clear();
       setIsGenerating(false);
+      if (streamAbortRef.current === controller) streamAbortRef.current = null;
     }
   };
 
@@ -1510,6 +1674,7 @@ function AppInner() {
     const requestBody = {
       model: modelPath,
       model_id: selectedModelId,
+      conversation_id: activeChatId,
       messages: [{ role: 'user', content: imageAttachments.length ? [
         { type: 'text', text: userText },
         ...imageAttachments.map(attachment => ({ type: 'image_url', image_url: { url: attachment.dataUrl } })),
@@ -1518,9 +1683,18 @@ function AppInner() {
       temperature: parseFloat(temperature),
       top_p: parseFloat(topP),
       autopilot,
+      enable_thinking: reasoningEnabled,
     };
 
     await streamAssistantResponse(requestBody, aiId, userText);
+  };
+
+  // Aborts the in-flight chat stream fetch. This stops the UI from waiting
+  // on further tokens immediately; whether the backend model keeps computing
+  // after the client disconnects depends on the daemon/llama-server's own
+  // handling of a dropped connection.
+  const handleStopGeneration = () => {
+    streamAbortRef.current?.abort();
   };
 
   const handlePickModel = async (option) => {
@@ -1625,6 +1799,8 @@ function AppInner() {
         width: Number(imgWidth),
         height: Number(imgHeight),
         seed: Number(imgSeed),
+        image: imgInitImage ? imgInitImage.split(',')[1] : null,
+        strength: Number(imgStrength),
       }, setImgProgress, setActiveImageJobId);
       if (data?.data?.[0]?.b64_json) {
         setImgSrc('data:image/png;base64,' + data.data[0].b64_json);
@@ -1641,6 +1817,28 @@ function AppInner() {
       }
     } finally {
       setIsGeneratingImg(false);
+    }
+  };
+
+  const handleGenerateVideo = async () => {
+    setIsGeneratingVideo(true);
+    try {
+      const data = await runGenerationJob('http://127.0.0.1:8080/v1/videos/generations', {
+        prompt: videoPrompt,
+        image_b64: videoInitImage ? videoInitImage.split(',')[1] : null,
+        ...videoParamValues,
+      }, setVideoProgress, setActiveVideoJobId);
+      if (data?.video_b64) {
+        setVideoSrc('data:video/mp4;base64,' + data.video_b64);
+      }
+    } catch (e) {
+      if (e.cancelled) {
+        pushError('Generation cancelled', 'info');
+      } else {
+        pushError('Video generation error: ' + e);
+      }
+    } finally {
+      setIsGeneratingVideo(false);
     }
   };
 
@@ -1665,6 +1863,28 @@ function AppInner() {
     link.download = `generated-${Date.now()}.${ext}`;
     link.click();
     URL.revokeObjectURL(objectUrl);
+  };
+
+  const handleImgInitImage = (files) => {
+    const file = files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      setImgInitImage(reader.result);
+      setImgInitImageName(file.name);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleVideoInitImage = (files) => {
+    const file = files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      setVideoInitImage(reader.result);
+      setVideoInitImageName(file.name);
+    };
+    reader.readAsDataURL(file);
   };
 
   const handleMesh3dSingleImage = (files) => {
@@ -1729,6 +1949,52 @@ function AppInner() {
       }
     } finally {
       setIsGeneratingTts(false);
+    }
+  };
+
+  const handleTranscribeAudio = (files) => {
+    const file = files?.[0];
+    if (!file) return;
+    setAsrFileName(file.name);
+    setAsrText('');
+    const reader = new FileReader();
+    reader.onload = async () => {
+      const audioB64 = reader.result.split(',')[1];
+      setIsTranscribing(true);
+      try {
+        const response = await fetch('http://127.0.0.1:8080/v1/audio/transcriptions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ audio_b64: audioB64, language: asrLanguage || undefined }),
+        });
+        if (!response.ok) throw new Error(await response.text());
+        const data = await response.json();
+        setAsrText(data?.text || '');
+      } catch (e) {
+        pushError('Transcription error: ' + e);
+      } finally {
+        setIsTranscribing(false);
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleGenerateEmbeddings = async () => {
+    const inputs = embedInput.split('\n').map(s => s.trim()).filter(Boolean);
+    if (inputs.length === 0) return;
+    setIsEmbedding(true);
+    try {
+      const response = await fetch('http://127.0.0.1:8080/v1/embeddings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: embedModelId || 'local', input: inputs }),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      setEmbedResults(await response.json());
+    } catch (e) {
+      pushError('Embeddings error: ' + e);
+    } finally {
+      setIsEmbedding(false);
     }
   };
 
@@ -1807,14 +2073,14 @@ function AppInner() {
                   <p>No downloads yet.</p>
                 </div>
               )}
-              {sortedDownloads.map(([filename, download]) => {
+              {sortedDownloads.map(([key, download]) => {
                 const hasTotal = download.total_bytes != null && download.total_bytes > 0;
                 const progressPct = hasTotal ? Math.min(100, (download.downloaded_bytes / download.total_bytes) * 100) : 0;
                 return (
-                  <div key={filename} className="hf-file-row">
+                  <div key={key} className="hf-file-row">
                     <div className="hf-file-info">
                       <div className="hf-file-name-row">
-                        <span className="hf-file-name">{filename}</span>
+                        <span className="hf-file-name">{download.filename}</span>
                       </div>
                       {download.repo && <span className="modal-list-item-meta">{download.repo}</span>}
                       {hasTotal ? (
@@ -1858,12 +2124,12 @@ function AppInner() {
                     </div>
                     <div className="hf-file-actions">
                       {download.status === 'downloading' && (
-                        <button className="hf-cancel-btn" onClick={() => cancelHfDownload(filename)} title="Cancel download">
+                        <button className="hf-cancel-btn" onClick={() => cancelHfDownload(download.repo, download.filename)} title="Cancel download">
                           <X size={14} />
                         </button>
                       )}
                       {download.repo && (
-                        <button className="hf-download-btn" onClick={() => jumpToCatalogEntry(download.repo, filename)}>
+                        <button className="hf-download-btn" onClick={() => jumpToCatalogEntry(download.repo, download.filename)}>
                           Find in catalog
                         </button>
                       )}
@@ -2286,7 +2552,7 @@ function AppInner() {
                       {pendingModelChoice.options.map(option => (
                         <button key={option.model} className="model-choice-option" onClick={() => handlePickModel(option)}>
                           <span className="model-choice-name">{option.model}</span>
-                          <span className="model-choice-modality">{option.modality}{option.loaded ? ' · loaded' : ''}</span>
+                          <span className="model-choice-modality">{option.task_tags?.join(', ')}{option.loaded ? ' · loaded' : ''}</span>
                         </button>
                       ))}
                     </div>
@@ -2299,6 +2565,9 @@ function AppInner() {
                     <button className={`btn-toggle-controls ${autopilot ? 'active' : ''}`} onClick={() => setAutopilot(v => !v)} title="Autopilot: let the model pick among compatible models automatically">
                       <Wand2 size={16} /> Autopilot
                     </button>
+                    <button className={`btn-toggle-controls ${reasoningEnabled ? 'active' : ''}`} onClick={() => setReasoningEnabled(v => !v)} title="Reasoning: let the model think before answering">
+                      <Brain size={16} /> Reasoning
+                    </button>
                     <textarea
                       value={inputPrompt}
                       onChange={e => setInputPrompt(e.target.value)}
@@ -2310,9 +2579,15 @@ function AppInner() {
                       }}
                       placeholder={acceptsImageInput ? 'Ask about an image or type a message...' : modelStatus.is_loaded ? 'Ask DisposAI anything...' : 'Load a model to start chatting...'}
                     />
-                    <button className="btn-send" onClick={handleSendMessage} disabled={isGenerating}>
-                      <Send size={18} />
-                    </button>
+                    {isGenerating ? (
+                      <button className="btn-send btn-send-stop" onClick={handleStopGeneration} title="Stop generating">
+                        <Square size={16} />
+                      </button>
+                    ) : (
+                      <button className="btn-send" onClick={handleSendMessage} disabled={isGenerating}>
+                        <Send size={18} />
+                      </button>
+                    )}
                   </div>
                 </div>
               </div>
@@ -2350,7 +2625,7 @@ function AppInner() {
                             <X size={13} />
                           </button>
                         </div>
-                        <div style={{ color: 'var(--text-secondary)', fontSize: '0.8rem', margin: '0.25rem 0 0.65rem' }}>{card.modality?.toUpperCase()} · {(card.size_bytes / 1e9).toFixed(2)} GB</div>
+                        <div style={{ color: 'var(--text-secondary)', fontSize: '0.8rem', margin: '0.25rem 0 0.65rem' }}>{card.task_tags?.map(t => t.toUpperCase()).join(', ')} · {(card.size_bytes / 1e9).toFixed(2)} GB</div>
                         <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', alignItems: 'center', marginTop: '0.25rem' }}>
                           <button className="btn-load-model" onClick={() => openConfigPanel(card)}>
                             <Settings size={14} /> {isLoaded ? 'Settings' : 'Configure'}
@@ -2413,7 +2688,7 @@ function AppInner() {
                                     id: crypto.randomUUID(),
                                     modelPath: model.path,
                                     name: model.name,
-                                    modality: model.modality,
+                                    task_tags: model.task_tags,
                                     size_bytes: model.size_bytes,
                                     max_context_size: model.max_context_size ?? null,
                                     image_input_available: model.image_input_available === true,
@@ -2427,7 +2702,7 @@ function AppInner() {
                               >
                                 <strong>{model.name}</strong>
                                 <span className="modal-list-item-meta">
-                                  {model.modality?.toUpperCase()}
+                                  {model.task_tags?.map(t => t.toUpperCase()).join(', ')}
                                   <span className="hf-param-badge">{(model.size_bytes / 1e9).toFixed(2)} GB</span>
                                 </span>
                               </button>
@@ -2735,15 +3010,25 @@ function AppInner() {
                                       });
                                       return Array.from(groups.entries()).map(([dir, files]) => {
                                         const depth = dir === '' ? 0 : dir.split('/').length;
+                                        const collapsed = dir !== '' && hfCollapsedFolders.has(dir);
                                         return (
                                           <div key={dir || '__root__'} className="hf-folder-group">
                                             {dir !== '' && (
-                                              <div className="hf-folder-header" style={{ paddingLeft: `${(depth - 1) * 1.1}rem` }}>
-                                                {dir}/
+                                              <div
+                                                className="hf-folder-header"
+                                                style={{ paddingLeft: `${(depth - 1) * 1.1}rem` }}
+                                                onClick={() => setHfCollapsedFolders(current => {
+                                                  const next = new Set(current);
+                                                  if (next.has(dir)) next.delete(dir); else next.add(dir);
+                                                  return next;
+                                                })}
+                                              >
+                                                <ChevronRight size={12} className={`hf-folder-chevron${collapsed ? '' : ' hf-folder-chevron-open'}`} />
+                                                {dir}/ <span className="hf-folder-count">({files.length})</span>
                                               </div>
                                             )}
-                                            {files.map(file => {
-                                              const download = hfDownloads[file.filename];
+                                            {!collapsed && files.map(file => {
+                                              const download = hfDownloads[`${hfSelectedRepo}::${file.filename}`];
                                               const progressPct = download && download.total_bytes > 0
                                                 ? Math.min(100, (download.downloaded_bytes / download.total_bytes) * 100)
                                                 : 0;
@@ -2769,7 +3054,7 @@ function AppInner() {
                                                           </span>
                                                           <button
                                                             className="hf-cancel-btn"
-                                                            onClick={() => cancelHfDownload(file.filename)}
+                                                            onClick={() => cancelHfDownload(hfSelectedRepo, file.filename)}
                                                             title="Cancel download"
                                                           >
                                                             <X size={12} />
@@ -2899,16 +3184,114 @@ function AppInner() {
             </div>
           )}
 
+          {/* Embeddings */}
+          {activeTab === 'embeddings' && (
+            <div className="tab-panel">
+              <h2 style={{ fontSize: '1.4rem', marginBottom: '0.3rem' }}>Embeddings</h2>
+              <p style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', marginBottom: '1.5rem' }}>
+                Generate embedding vectors from a loaded text model.
+              </p>
+              <div className="card" style={{ maxWidth: '680px' }}>
+                <div className="form-group">
+                  <label>Model</label>
+                  <select
+                    className="control-select"
+                    value={embedModelId}
+                    onChange={e => setEmbedModelId(e.target.value)}
+                  >
+                    <option value="">First loaded text model</option>
+                    {loadedModels.filter(model => categoryForTags(model.task_tags) === 'chat').map(model => (
+                      <option key={model.model_id} value={model.model_id}>
+                        {model.model_path?.split('\\').pop() ?? model.model_id}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="form-group">
+                  <label>Input Text <span style={{ fontWeight: 400, color: 'var(--text-secondary)' }}>(one entry per line)</span></label>
+                  <textarea
+                    className="control-input"
+                    rows={5}
+                    value={embedInput}
+                    onChange={e => setEmbedInput(e.target.value)}
+                  />
+                </div>
+                <div className="gen-btn-row">
+                  <button className="btn-primary" onClick={handleGenerateEmbeddings} disabled={isEmbedding || !embedInput.trim()}>
+                    <Search size={16} /> {isEmbedding ? 'Embedding...' : 'Generate Embeddings'}
+                  </button>
+                </div>
+                {embedResults && (
+                  <div style={{ marginTop: '1rem' }}>
+                    <div className="slider-hint" style={{ marginBottom: '0.5rem' }}>
+                      {embedResults.data?.length ?? 0} vector(s) · model: {embedResults.model}
+                    </div>
+                    {(embedResults.data || []).map(item => (
+                      <div key={item.index} style={{ padding: '0.5rem 0', borderTop: '1px solid var(--border-color)', fontSize: '0.8rem', fontFamily: 'monospace' }}>
+                        <div>[{item.index}] dim={item.embedding.length}</div>
+                        <div style={{ color: 'var(--text-secondary)', wordBreak: 'break-all' }}>
+                          [{item.embedding.slice(0, 8).map(v => v.toFixed(4)).join(', ')}{item.embedding.length > 8 ? ', ...' : ''}]
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
           {/* 2. Image Studio */}
           {activeTab === 'image' && (
             <div className="tab-panel">
               <h2 style={{ fontSize: '1.4rem', marginBottom: '0.3rem' }}>Stable Diffusion Image Studio</h2>
               <p style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', marginBottom: '1.5rem' }}>
-                Local text-to-image synthesis using stable-diffusion.cpp
+                {imageStudioSupportsImg2Img
+                  ? 'Local text-to-image and image-to-image synthesis using stable-diffusion.cpp'
+                  : 'Local text-to-image synthesis using stable-diffusion.cpp'}
               </p>
 
               <div className="grid-2">
                 <div className="card">
+                  {(!activeImageStudio || imageStudioSupportsImg2Img) && (
+                    <div className="form-group">
+                      <label>Reference Image <span style={{ fontWeight: 400, color: 'var(--text-secondary)' }}>(optional)</span></label>
+                      <input
+                        ref={imgInitImageInputRef}
+                        type="file"
+                        accept="image/*"
+                        style={{ display: 'none' }}
+                        onChange={e => { handleImgInitImage(e.target.files); e.target.value = ''; }}
+                      />
+                      {imgInitImage ? (
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+                          <div className="mesh3d-dropzone-thumb" style={{ width: 80, height: 80 }}>
+                            <img src={imgInitImage} alt={imgInitImageName} />
+                            <button type="button" className="mesh3d-thumb-remove" onClick={() => { setImgInitImage(null); setImgInitImageName(null); }} title="Remove"><X size={12} /></button>
+                          </div>
+                          <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', wordBreak: 'break-all' }}>{imgInitImageName}</span>
+                        </div>
+                      ) : (
+                        <div className="mesh3d-dropzone" onClick={() => imgInitImageInputRef.current?.click()}>
+                          <Paperclip size={20} />
+                          <span>Click to upload an image</span>
+                        </div>
+                      )}
+                      {imgInitImage && (
+                        <div style={{ marginTop: '0.75rem' }}>
+                          <label>Strength ({Number(imgStrength).toFixed(2)})</label>
+                          <input
+                            type="range"
+                            min="0"
+                            max="1"
+                            step="0.05"
+                            value={imgStrength}
+                            onChange={e => setImgStrength(e.target.value)}
+                          />
+                        </div>
+                      )}
+                    </div>
+                  )}
+
                   <div className="form-group">
                     <label>Prompt</label>
                     <input
@@ -2995,7 +3378,7 @@ function AppInner() {
                         Missing model components
                       </div>
                       {imgMissingComponents.map((comp, idx) => {
-                        const download = comp.source ? hfDownloads[comp.source.filename] : null;
+                        const download = comp.source ? hfDownloads[`${comp.source.repo}::${comp.source.filename}`] : null;
                         const progressPct = download && download.total_bytes > 0
                           ? Math.min(100, (download.downloaded_bytes / download.total_bytes) * 100)
                           : 0;
@@ -3076,9 +3459,9 @@ function AppInner() {
           {/* 3. Voice Studio */}
           {activeTab === 'audio' && (
             <div className="tab-panel">
-              <h2 style={{ fontSize: '1.4rem', marginBottom: '0.3rem' }}>Voice & Audio Studio</h2>
+              <h2 style={{ fontSize: '1.4rem', marginBottom: '0.3rem' }}>Voice Studio</h2>
               <p style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', marginBottom: '1.5rem' }}>
-                Kokoro Text-to-Speech & Whisper Speech-to-Text ASR
+                Kokoro Text-to-Speech
               </p>
 
               <div className="grid-2">
@@ -3091,6 +3474,18 @@ function AppInner() {
                       type="text"
                       value={ttsInput}
                       onChange={e => setTtsInput(e.target.value)}
+                    />
+                  </div>
+
+                  <div className="form-group">
+                    <label>Speed ({Number(ttsSpeed).toFixed(2)}x)</label>
+                    <input
+                      type="range"
+                      min="0.5"
+                      max="2"
+                      step="0.05"
+                      value={ttsSpeed}
+                      onChange={e => setTtsSpeed(Number(e.target.value))}
                     />
                   </div>
 
@@ -3108,14 +3503,53 @@ function AppInner() {
 
                   {audioSrc && <audio controls autoPlay src={audioSrc} style={{ width: '100%', marginTop: '1rem' }} />}
                 </div>
+              </div>
+            </div>
+          )}
 
+          {/* Transcribe Studio */}
+          {activeTab === 'transcribe' && (
+            <div className="tab-panel">
+              <h2 style={{ fontSize: '1.4rem', marginBottom: '0.3rem' }}>Transcribe Studio</h2>
+              <p style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', marginBottom: '1.5rem' }}>
+                Whisper Speech-to-Text ASR
+              </p>
+
+              <div className="grid-2">
                 <div className="card">
                   <h3>Speech-to-Text ASR (Whisper)</h3>
                   <br />
-                  <div className="preview-box" style={{ height: '180px' }}>
+                  <input
+                    ref={asrFileInputRef}
+                    type="file"
+                    accept="audio/*"
+                    style={{ display: 'none' }}
+                    onChange={e => { handleTranscribeAudio(e.target.files); e.target.value = ''; }}
+                  />
+                  <div className="preview-box" style={{ height: '180px' }} onClick={() => asrFileInputRef.current?.click()}>
                     <FileAudio size={40} />
-                    <span>Drop audio file for transcription</span>
+                    <span>{asrFileName || 'Drop audio file for transcription'}</span>
                   </div>
+
+                  <div className="form-group" style={{ marginTop: '1rem' }}>
+                    <label>Language <span style={{ fontWeight: 400, color: 'var(--text-secondary)' }}>(optional)</span></label>
+                    <input
+                      type="text"
+                      placeholder="e.g. en"
+                      value={asrLanguage}
+                      onChange={e => setAsrLanguage(e.target.value)}
+                    />
+                  </div>
+                </div>
+
+                <div className="card">
+                  <label>Transcription Result</label>
+                  <textarea
+                    readOnly
+                    value={isTranscribing ? 'Transcribing...' : asrText}
+                    placeholder="Transcribed text will appear here."
+                    style={{ width: '100%', minHeight: '180px', marginTop: '0.75rem', resize: 'vertical' }}
+                  />
                 </div>
               </div>
             </div>
@@ -3129,17 +3563,95 @@ function AppInner() {
                 Text-to-Video generation engine
               </p>
 
-              <div className="card" style={{ maxWidth: '650px' }}>
-                <div className="form-group">
-                  <label>Video Prompt</label>
-                  <input type="text" defaultValue="A serene waterfall in a mystical forest, cinematic motion" />
+              <div className="grid-2">
+                <div className="card">
+                  {videoSchemaSupportsImage && (
+                    <div className="form-group">
+                      <label>Conditioning Image <span style={{ fontWeight: 400, color: 'var(--text-secondary)' }}>(optional, image-to-video)</span></label>
+                      <input
+                        ref={videoInitImageInputRef}
+                        type="file"
+                        accept="image/*"
+                        style={{ display: 'none' }}
+                        onChange={e => { handleVideoInitImage(e.target.files); e.target.value = ''; }}
+                      />
+                      {videoInitImage ? (
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+                          <div className="mesh3d-dropzone-thumb" style={{ width: 80, height: 80 }}>
+                            <img src={videoInitImage} alt={videoInitImageName} />
+                            <button type="button" className="mesh3d-thumb-remove" onClick={() => { setVideoInitImage(null); setVideoInitImageName(null); }} title="Remove"><X size={12} /></button>
+                          </div>
+                          <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', wordBreak: 'break-all' }}>{videoInitImageName}</span>
+                        </div>
+                      ) : (
+                        <div className="mesh3d-dropzone" onClick={() => videoInitImageInputRef.current?.click()}>
+                          <Paperclip size={20} />
+                          <span>Click to upload an image</span>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  <div className="form-group">
+                    <label>Video Prompt</label>
+                    <input
+                      type="text"
+                      value={videoPrompt}
+                      onChange={e => setVideoPrompt(e.target.value)}
+                    />
+                  </div>
+
+                  {/* Every field but the prompt above is rendered generically
+                      from GET /v1/videos/schema, which reflects what the
+                      loaded pipeline's __call__ signature actually accepts
+                      (e.g. height/width/negative_prompt only show up when
+                      the loaded architecture supports them). */}
+                  {videoSchemaParams.map(p => (
+                    <SchemaParamField
+                      key={p.name}
+                      param={p}
+                      value={videoParamValues[p.name]}
+                      onChange={val => setVideoParam(p.name, val)}
+                    />
+                  ))}
+                  {!videoSchema && (
+                    <p className="slider-hint" style={{ marginBottom: '1rem' }}>
+                      Generation parameters are unavailable (could not reach the daemon's schema endpoint — load a video model first).
+                    </p>
+                  )}
+
+                  <div className="gen-btn-row">
+                    <button className="btn-primary" onClick={handleGenerateVideo} disabled={isGeneratingVideo}>
+                      <Video size={16} /> {isGeneratingVideo ? 'Rendering...' : 'Render Video'}
+                    </button>
+                    {isGeneratingVideo && (
+                      <button className="btn-cancel-gen" onClick={() => cancelGenerationJob(activeVideoJobId)}>
+                        <X size={16} /> Cancel
+                      </button>
+                    )}
+                  </div>
+                  {isGeneratingVideo && <GenProgressBar progress={videoProgress} />}
                 </div>
-                <button className="btn-primary">
-                  <Video size={16} /> Render Video
-                </button>
-                <div className="preview-box" style={{ marginTop: '1rem' }}>
-                  <Play size={45} />
-                  <span>Video player output preview</span>
+
+                <div className="card">
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <label>Generated Video Output</label>
+                    {videoSrc && (
+                      <button type="button" className="image-download-btn" onClick={() => handleDownloadMedia(videoSrc, 'video/mp4')} title="Download video">
+                        <Download size={14} /> Download
+                      </button>
+                    )}
+                  </div>
+                  <div className="preview-box" style={{ marginTop: '1rem' }}>
+                    {videoSrc ? (
+                      <video controls autoPlay src={videoSrc} style={{ width: '100%', borderRadius: '8px' }} />
+                    ) : (
+                      <>
+                        <Play size={45} />
+                        <span>Video player output preview</span>
+                      </>
+                    )}
+                  </div>
                 </div>
               </div>
             </div>
@@ -3235,43 +3747,14 @@ function AppInner() {
 
                   {/* Per-adapter tunable params, rendered generically from
                       GET /v1/models3d/schema — see mesh3dAdapterParams. */}
-                  {mesh3dAdapterParams.map(p => {
-                    const value = mesh3dParamValues[p.name];
-                    if (p.type === 'bool') {
-                      return (
-                        <div className="slider-header" style={{ marginBottom: '1rem' }} key={p.name}>
-                          <div><strong>{p.name}</strong></div>
-                          <input
-                            type="checkbox"
-                            checked={Boolean(value)}
-                            onChange={e => setMesh3dParam(p.name, e.target.checked)}
-                          />
-                        </div>
-                      );
-                    }
-                    let control;
-                    if (p.type === 'enum') {
-                      control = (
-                        <select value={value ?? ''} onChange={e => setMesh3dParam(p.name, e.target.value)}>
-                          {(p.choices || []).map(choice => <option key={choice} value={choice}>{choice}</option>)}
-                        </select>
-                      );
-                    } else if (p.type === 'int' || p.type === 'float') {
-                      control = (
-                        <input
-                          type="number"
-                          step={p.type === 'float' ? '0.1' : '1'}
-                          min={p.min ?? undefined}
-                          max={p.max ?? undefined}
-                          value={value ?? ''}
-                          onChange={e => setMesh3dParam(p.name, e.target.value === '' ? null : Number(e.target.value))}
-                        />
-                      );
-                    } else {
-                      control = <input type="text" value={value ?? ''} onChange={e => setMesh3dParam(p.name, e.target.value)} />;
-                    }
-                    return <div className="form-group" key={p.name}><label>{p.name}</label>{control}</div>;
-                  })}
+                  {mesh3dAdapterParams.map(p => (
+                    <SchemaParamField
+                      key={p.name}
+                      param={p}
+                      value={mesh3dParamValues[p.name]}
+                      onChange={val => setMesh3dParam(p.name, val)}
+                    />
+                  ))}
                   {!mesh3dSchema && (
                     <p className="slider-hint" style={{ marginBottom: '1rem' }}>
                       Model-specific parameters are unavailable (could not reach the daemon's schema endpoint). Generation will use each backend's own defaults.
@@ -3348,7 +3831,7 @@ function AppInner() {
                 <label className="section-label">Model path</label>
                 <input className="control-input" value={configTarget?.model_path || ''} onChange={e => setConfigTarget(current => ({ ...current, model_path: e.target.value }))} />
               </div>
-              {(cfgModality === 'text' || cfgModality === 'vision') && (
+              {cfgCategory === 'chat' && (
                 <div className="sidebar-section">
                   <label className="section-label">Vision projector (mmproj)</label>
                   <div className="mmproj-row">
@@ -3369,7 +3852,7 @@ function AppInner() {
                   <div className="slider-hint">Auto-detected from the model directory. Leave empty if this is not a vision model.</div>
                 </div>
               )}
-              {(cfgModality === 'text' || cfgModality === 'vision') && (
+              {cfgCategory === 'chat' && (
                 <>
                   <div className="sidebar-section">
                     <div className="slider-header"><label className="section-label">GPU layers</label><span className="badge-value">{configTarget?.gpu_layers ?? 99}</span></div>
@@ -3392,7 +3875,7 @@ function AppInner() {
                   </div>
                 </>
               )}
-              {cfgModality === 'image' && (
+              {cfgCategory === 'image' && (
                 <>
                   <div className="sidebar-section">
                     <div className="slider-header"><label className="section-label">Sampling steps</label><span className="badge-value">{configTarget?.steps ?? 25}</span></div>
@@ -3417,16 +3900,74 @@ function AppInner() {
                     <input className="control-input" type="number" value={configTarget?.seed ?? -1} onChange={e => setConfigTarget(current => ({ ...current, seed: Number(e.target.value) }))} />
                     <div className="slider-hint">-1 draws a random seed each generation.</div>
                   </div>
+                  {configTarget?.image_components?.length ? (
+                    <div className="sidebar-section">
+                      <label className="section-label">Sibling components</label>
+                      {configTarget.image_components.map((comp, idx) => {
+                        const download = comp.source ? hfDownloads[`${comp.source.repo}::${comp.source.filename}`] : null;
+                        const progressPct = download && download.total_bytes > 0
+                          ? Math.min(100, (download.downloaded_bytes / download.total_bytes) * 100)
+                          : 0;
+                        return (
+                          <div key={idx} className="hf-file-row" style={{ paddingLeft: 0 }}>
+                            <div className="hf-file-info">
+                              <div className="hf-file-name-row">
+                                <span className="hf-file-name">{comp.kind_name}</span>
+                              </div>
+                              {comp.resolved_path ? (
+                                <span className="modal-list-item-meta">Found: {comp.resolved_path.split('\\').pop()}</span>
+                              ) : comp.source ? (
+                                <>
+                                  {(!download || download.status === 'error') && (
+                                    <button
+                                      className="hf-download-btn"
+                                      onClick={() => startHfDownload(comp.source.repo, comp.source.filename, comp.target_path, comp.source.target_filename)}
+                                    >
+                                      Download {comp.source.filename} ({comp.source.repo})
+                                    </button>
+                                  )}
+                                  {download && download.status === 'downloading' && (
+                                    <>
+                                      <div className="hf-progress-bar">
+                                        <div className="hf-progress-fill" style={{ width: `${progressPct}%` }} />
+                                      </div>
+                                      <div className="hf-progress-row">
+                                        <span className="hf-progress-text">
+                                          {formatFileSize(download.downloaded_bytes)} / {formatFileSize(download.total_bytes)}
+                                        </span>
+                                      </div>
+                                    </>
+                                  )}
+                                  {download && download.status === 'complete' && (
+                                    <span className="modal-list-item-meta">Downloaded</span>
+                                  )}
+                                  {download && download.status === 'error' && (
+                                    <span className="modal-list-item-meta" style={{ color: '#ef4444' }}>
+                                      Download failed{download.error ? `: ${download.error}` : ''}
+                                    </span>
+                                  )}
+                                </>
+                              ) : (
+                                <span className="modal-list-item-meta">
+                                  Missing — place a file manually at: {comp.target_path}
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ) : null}
                 </>
               )}
-              {cfgModality === 'tts' && (
+              {cfgCategory === 'tts' && (
                 <div className="sidebar-section">
                   <div className="slider-header"><label className="section-label">Speech speed</label><span className="badge-value">{(configTarget?.speed ?? 1).toFixed(2)}×</span></div>
                   <input className="control-slider" type="range" min="0.5" max="2" step="0.05" value={configTarget?.speed ?? 1} onChange={e => setConfigTarget(current => ({ ...current, speed: Number(e.target.value) }))} />
                   <div className="slider-hint">Playback rate for synthesized speech. Voice is chosen per request in the studio.</div>
                 </div>
               )}
-              {cfgModality === 'mesh3d' && (
+              {cfgCategory === 'mesh3d' && (
                 <>
                   <div className="sidebar-section">
                     <label className="section-label">VAE model</label>
@@ -3465,12 +4006,12 @@ function AppInner() {
                   </div>
                 </>
               )}
-              {cfgModality === 'audio' && (
+              {cfgCategory === 'audio' && (
                 <div className="sidebar-section">
                   <div className="slider-hint">Speech-to-text model. Transcription options are chosen per request in the studio.</div>
                 </div>
               )}
-              {cfgModality === 'video' && (
+              {cfgCategory === 'video' && (
                 <div className="sidebar-section">
                   <div className="slider-hint">Video model. Generation parameters are chosen per request in the studio.</div>
                 </div>

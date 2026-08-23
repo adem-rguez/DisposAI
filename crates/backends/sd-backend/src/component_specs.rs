@@ -6,16 +6,23 @@
 //! only (e.g. "flux2", "z-image") — never on a specific HF repo name. New
 //! families are added here, not as special cases elsewhere.
 
-/// A required split-checkpoint component. The `&'static str` on `Llm` is a
-/// fuzzy filename hint (e.g. `"mistral"`, `"qwen3"`) used only to find a
-/// plausible candidate file — not an exact filename to match.
+/// A required split-checkpoint component. The `&'static str` on `Llm`/`Vae`
+/// is a fuzzy filename hint (e.g. `"mistral"`, `"qwen3"`, `"flux2-vae"`) used
+/// only to find a plausible candidate file — not an exact filename to match.
+/// `Vae` is hinted (rather than a bare `"vae"` substring) because VAEs are
+/// NOT interchangeable across incompatible architectures sharing the same
+/// shared/vae folder — e.g. FLUX.2's VAE has 32 latent channels vs FLUX.1's
+/// 16, so a generic "vae" match would silently pick the wrong file and fail
+/// at sd.exe's tensor-shape validation instead of prompting a download.
+/// Families that really do share one VAE (flux1/z-image/chroma) use the same
+/// hint so they keep resolving to that one shared file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComponentKind {
     ClipL,
     ClipG,
     T5xxl,
     Llm(&'static str),
-    Vae,
+    Vae(&'static str),
 }
 
 impl ComponentKind {
@@ -26,7 +33,7 @@ impl ComponentKind {
             ComponentKind::ClipG => "clip_g text encoder",
             ComponentKind::T5xxl => "t5xxl text encoder",
             ComponentKind::Llm(_) => "llm text encoder",
-            ComponentKind::Vae => "vae",
+            ComponentKind::Vae(_) => "vae",
         }
     }
 
@@ -38,7 +45,7 @@ impl ComponentKind {
             ComponentKind::ClipG => vec!["clip_g", "clip-g"],
             ComponentKind::T5xxl => vec!["t5xxl", "t5-xxl"],
             ComponentKind::Llm(hint) => vec![hint],
-            ComponentKind::Vae => vec!["vae"],
+            ComponentKind::Vae(hint) => vec![hint],
         }
     }
 
@@ -46,7 +53,7 @@ impl ComponentKind {
     /// should be looked for in when it isn't next to the diffusion model.
     pub fn shared_subdir(&self) -> &'static str {
         match self {
-            ComponentKind::Vae => "shared/vae",
+            ComponentKind::Vae(_) => "shared/vae",
             _ => "shared/text_encoders",
         }
     }
@@ -105,17 +112,73 @@ struct FamilyEntry {
 }
 
 static FAMILIES: &[FamilyEntry] = &[
-    // Flux.2 — must come before the Flux1 fallback below.
+    // Flux.2-klein — a distilled variant with its own (much smaller) Qwen3
+    // text encoder (4B for klein-4B, 8B for klein-9B), NOT the dev/pro/flex
+    // Mistral-24B encoder. Must come before both the flux2 and flux1
+    // fallbacks below, since klein filenames also contain "flux2"/"flux-2".
+    // See leejet/stable-diffusion.cpp docs/flux2.md and diffusers'
+    // Flux2KleinPipeline (text_encoder: Qwen3ForCausalLM).
     FamilyEntry {
-        patterns: &["flux-2", "flux2", "flux.2"],
+        patterns: &["klein"],
         spec: ComponentSpec {
-            family: "flux2",
-            components: &[ComponentKind::ClipL, ComponentKind::T5xxl, ComponentKind::Llm("mistral"), ComponentKind::Vae],
+            family: "flux2-klein",
+            components: &[ComponentKind::Llm("qwen3"), ComponentKind::Vae("flux2-vae")],
             vae_format: Some("flux2"),
             model_args: None,
             default_cfg_scale: None,
             default_steps: None,
-            default_source: None,
+            default_source: Some(&[
+                (
+                    ComponentKind::Llm("qwen3"),
+                    DefaultSource {
+                        repo: "unsloth/Qwen3-4B-Instruct-2507-GGUF",
+                        filename: "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+                        target_filename: "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+                    },
+                ),
+                (
+                    ComponentKind::Vae("flux2-vae"),
+                    DefaultSource {
+                        repo: "black-forest-labs/FLUX.2-dev",
+                        filename: "ae.safetensors",
+                        target_filename: "flux2-vae.safetensors",
+                    },
+                ),
+            ]),
+        },
+    },
+    // Flux.2 (dev/pro/flex) — must come after flux2-klein and before the
+    // Flux1 fallback below.
+    FamilyEntry {
+        patterns: &["flux-2", "flux2", "flux.2"],
+        spec: ComponentSpec {
+            family: "flux2",
+            // FLUX.2 [dev/pro/flex] replaces FLUX.1's clip_l/t5xxl pair with
+            // a single Mistral text encoder (Mistral-Small-3.2-24B-Instruct-
+            // 2506) — see black-forest-labs/flux2 on GitHub.
+            components: &[ComponentKind::Llm("mistral"), ComponentKind::Vae("flux2-vae")],
+            vae_format: Some("flux2"),
+            model_args: None,
+            default_cfg_scale: None,
+            default_steps: None,
+            default_source: Some(&[
+                (
+                    ComponentKind::Llm("mistral"),
+                    DefaultSource {
+                        repo: "unsloth/Mistral-Small-3.2-24B-Instruct-2506-GGUF",
+                        filename: "Mistral-Small-3.2-24B-Instruct-2506-Q4_K_M.gguf",
+                        target_filename: "Mistral-Small-3.2-24B-Instruct-2506-Q4_K_M.gguf",
+                    },
+                ),
+                (
+                    ComponentKind::Vae("flux2-vae"),
+                    DefaultSource {
+                        repo: "black-forest-labs/FLUX.2-dev",
+                        filename: "ae.safetensors",
+                        target_filename: "flux2-vae.safetensors",
+                    },
+                ),
+            ]),
         },
     },
     // Z-Image (reuses Flux1's VAE format).
@@ -123,7 +186,7 @@ static FAMILIES: &[FamilyEntry] = &[
         patterns: &["z-image", "z_image"],
         spec: ComponentSpec {
             family: "z-image",
-            components: &[ComponentKind::Llm("qwen3"), ComponentKind::Vae],
+            components: &[ComponentKind::Llm("qwen3"), ComponentKind::Vae("flux-vae")],
             vae_format: Some("flux"),
             model_args: None,
             default_cfg_scale: Some(1.0),
@@ -138,7 +201,7 @@ static FAMILIES: &[FamilyEntry] = &[
                     },
                 ),
                 (
-                    ComponentKind::Vae,
+                    ComponentKind::Vae("flux-vae"),
                     DefaultSource {
                         repo: "black-forest-labs/FLUX.1-schnell",
                         filename: "ae.safetensors",
@@ -153,7 +216,7 @@ static FAMILIES: &[FamilyEntry] = &[
         patterns: &["qwen-image"],
         spec: ComponentSpec {
             family: "qwen-image",
-            components: &[ComponentKind::Llm("qwen"), ComponentKind::Vae],
+            components: &[ComponentKind::Llm("qwen"), ComponentKind::Vae("vae")],
             vae_format: None,
             model_args: None,
             default_cfg_scale: None,
@@ -166,7 +229,7 @@ static FAMILIES: &[FamilyEntry] = &[
         patterns: &["sd3"],
         spec: ComponentSpec {
             family: "sd3",
-            components: &[ComponentKind::ClipL, ComponentKind::ClipG, ComponentKind::T5xxl, ComponentKind::Vae],
+            components: &[ComponentKind::ClipL, ComponentKind::ClipG, ComponentKind::T5xxl, ComponentKind::Vae("vae")],
             vae_format: Some("sd3"),
             model_args: None,
             default_cfg_scale: None,
@@ -179,13 +242,13 @@ static FAMILIES: &[FamilyEntry] = &[
         patterns: &["chroma"],
         spec: ComponentSpec {
             family: "chroma",
-            components: &[ComponentKind::T5xxl, ComponentKind::Vae],
+            components: &[ComponentKind::T5xxl, ComponentKind::Vae("flux-vae")],
             vae_format: Some("flux"),
             model_args: None,
             default_cfg_scale: None,
             default_steps: None,
             default_source: Some(&[(
-                ComponentKind::Vae,
+                ComponentKind::Vae("flux-vae"),
                 DefaultSource {
                     repo: "black-forest-labs/FLUX.1-schnell",
                     filename: "ae.safetensors",
@@ -199,13 +262,13 @@ static FAMILIES: &[FamilyEntry] = &[
         patterns: &["flux"],
         spec: ComponentSpec {
             family: "flux1",
-            components: &[ComponentKind::ClipL, ComponentKind::T5xxl, ComponentKind::Vae],
+            components: &[ComponentKind::ClipL, ComponentKind::T5xxl, ComponentKind::Vae("flux-vae")],
             vae_format: Some("flux"),
             model_args: None,
             default_cfg_scale: None,
             default_steps: None,
             default_source: Some(&[(
-                ComponentKind::Vae,
+                ComponentKind::Vae("flux-vae"),
                 DefaultSource {
                     repo: "black-forest-labs/FLUX.1-schnell",
                     filename: "ae.safetensors",
