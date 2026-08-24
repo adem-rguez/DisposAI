@@ -1,4 +1,4 @@
-const { app, BrowserWindow } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain } = require('electron');
 const path = require('path');
 
 process.on('uncaughtException', (err) => {
@@ -51,6 +51,12 @@ function createWindow() {
     win = null;
   });
 }
+
+ipcMain.handle('select-file', async (event, { defaultPath, filters, properties } = {}) => {
+  const result = await dialog.showOpenDialog({ defaultPath, filters, properties: properties || ['openFile'] });
+  if (result.canceled || !result.filePaths.length) return null;
+  return result.filePaths[0];
+});
 
 app.whenReady().then(createWindow);
 

@@ -53,8 +53,15 @@ pub struct LoadedModelStatus {
 pub type ModelRegistry = Arc<tokio::sync::Mutex<HashMap<String, LoadedModelEntry>>>;
 
 /// How many generate -> tool -> generate rounds one user turn may take before
-/// we stop and return whatever the model has produced.
-const MAX_TOOL_HOPS: usize = 4;
+/// we stop and return whatever the model has produced. run_model blocks until
+/// its own generation finishes (or times out), so most turns only need a
+/// handful of hops; the extra headroom covers list_models/inspect_model
+/// look-ups plus multiple run_model calls chained in one turn. If all hops are
+/// exhausted while the model was still mid-task (i.e. it still wanted to call
+/// a tool on the final hop), a backstop forced final generation (tools
+/// disabled) runs so the user always gets a text response instead of a stream
+/// that just ends.
+const MAX_TOOL_HOPS: usize = 20;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -1565,8 +1572,11 @@ async fn stream_chat_completions(
         format!(
             "You are a helpful, knowledgeable AI assistant that also orchestrates the other models \
              installed on this machine. You can discover what is available and run any of it — \
-             image generation, speech, transcription, video — when the user's request calls for it. \
-             Use tools proactively; don't just describe what you could do, actually do it.{}",
+             image generation, speech, transcription, video — when the user's request actually \
+             calls for it; when it does, don't just describe what you could do, actually do it. \
+             run_model waits for generation to finish and hands you the result directly, so you \
+             don't need to poll for it. For everything else — questions, conversation, requests \
+             you can just answer — reply normally without calling any tool.{}",
             fallback_prompt
         )
     } else {
@@ -1659,6 +1669,9 @@ async fn stream_chat_completions(
         // hand the result back, generate again. Ends on a turn that asks for none.
         let mut messages = chat_messages;
         let mut pending = Some(upstream);
+        // Set when the loop exhausts MAX_TOOL_HOPS while the model still wanted
+        // to call a tool on the final hop (as opposed to naturally finishing).
+        let mut hop_exhausted_with_tool = false;
 
         for hop in 0..MAX_TOOL_HOPS {
             let response = match pending.take() {
@@ -1818,34 +1831,18 @@ async fn stream_chat_completions(
                 return;
             }
 
-            // The model was browsing available models. If more than one is compatible
-            // with what the user asked for, pause and let the user pick rather than
-            // letting the small orchestrator choose (unless autopilot is on).
-            if tool_call.name == "list_models" && !autopilot {
-                if let Ok(mut rows) = serde_json::from_str::<Vec<serde_json::Value>>(&result.content) {
-                    if let Some(target) = infer_modality(&last_user_prompt) {
-                        let filtered: Vec<serde_json::Value> = rows.iter()
-                            .filter(|row| {
-                                let tags: Vec<String> = row["task_tags"].as_array()
-                                    .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
-                                    .unwrap_or_default();
-                                crate::task_tags::backend_category_for_tags(&tags) == Some(target)
-                            })
-                            .cloned()
-                            .collect();
-                        if !filtered.is_empty() {
-                            rows = filtered;
-                        }
-                    }
-                    if rows.len() > 1 {
-                        let choice_event = serde_json::json!({
-                            "type": "model_choice",
-                            "options": rows,
-                        });
-                        let _ = tx.send(Ok(Event::default().data(choice_event.to_string()))).await;
-                        let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
-                        return;
-                    }
+            // The orchestrator explicitly decided to hand model selection to the user.
+            // If autopilot is on, skip the picker and let the orchestrator choose for
+            // itself instead - the result just gets fed back below like any other tool.
+            if tool_call.name == "present_model_choice" && !autopilot && !result.is_error {
+                if let Ok(rows) = serde_json::from_str::<Vec<serde_json::Value>>(&result.content) {
+                    let choice_event = serde_json::json!({
+                        "type": "model_choice",
+                        "options": rows,
+                    });
+                    let _ = tx.send(Ok(Event::default().data(choice_event.to_string()))).await;
+                    let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
+                    return;
                 }
             }
 
@@ -1875,6 +1872,48 @@ async fn stream_chat_completions(
                 "name": tool_call.name,
                 "content": feedback,
             }));
+
+            if hop == MAX_TOOL_HOPS - 1 {
+                hop_exhausted_with_tool = true;
+            }
+        }
+
+        if hop_exhausted_with_tool {
+            messages.push(serde_json::json!({
+                "role": "system",
+                "content": "You have used all available tool calls for this turn. Do not call \
+                    any more tools. Respond directly to the user now, briefly explaining the \
+                    current status (e.g. if a generation job is still running in the background, \
+                    say so and that it will appear once complete)."
+            }));
+            let body = stream_request_body(&messages, &[], max_tokens, temperature, top_p, thinking);
+            match client.post(&url).json(&body).send().await {
+                Ok(response) => {
+                    let mut byte_stream = response.bytes_stream();
+                    while let Some(chunk) = byte_stream.next().await {
+                        let buf = match chunk {
+                            Ok(buf) => buf,
+                            Err(_) => break,
+                        };
+                        let text = String::from_utf8_lossy(&buf).to_string();
+                        for line in text.lines() {
+                            if !line.starts_with("data:") {
+                                continue;
+                            }
+                            let data = line.trim_start_matches("data:").trim();
+                            if data.is_empty() || data == "[DONE]" {
+                                continue;
+                            }
+                            if tx.send(Ok(Event::default().data(data.to_string()))).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("forced final generation after tool-hop exhaustion failed: {}", e);
+                }
+            }
         }
 
         let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
@@ -1882,24 +1921,6 @@ async fn stream_chat_completions(
 
     let sse_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     Ok(Sse::new(sse_stream).keep_alive(KeepAlive::default()))
-}
-
-/// Best-effort guess of the output modality the user is asking for, so the
-/// model picker only offers compatible models. Returns None when unsure.
-fn infer_modality(prompt: &str) -> Option<Modality> {
-    let p = prompt.to_lowercase();
-    let has = |words: &[&str]| words.iter().any(|w| p.contains(w));
-    if has(&["image", "picture", "photo", "draw", "render", "paint", "logo", "wallpaper", "illustration"]) {
-        Some(Modality::Image)
-    } else if has(&["video", "animate", "animation", "movie", " clip"]) {
-        Some(Modality::Video)
-    } else if has(&["transcribe", "transcription", "transcript"]) {
-        Some(Modality::AudioAsr)
-    } else if has(&["speak", "voice", "narrate", "read aloud", "speech", "pronounce", "text to speech", "tts"]) {
-        Some(Modality::AudioTts)
-    } else {
-        None
-    }
 }
 
 /// One upstream request body for a single generation turn.
@@ -1919,10 +1940,11 @@ fn stream_request_body(
         "top_p": top_p,
         "repeat_penalty": 1.15,
         "stream": true,
-        "thinking": thinking,
+        "chat_template_kwargs": { "enable_thinking": thinking },
     });
     if !tools.is_empty() {
         body["tools"] = serde_json::Value::Array(tools.to_vec());
+        body["tool_choice"] = serde_json::Value::String("auto".to_string());
     }
     body
 }
@@ -1995,8 +2017,11 @@ async fn chat_completions(
         format!(
             "You are a helpful, knowledgeable AI assistant that also orchestrates the other models \
              installed on this machine. You can discover what is available and run any of it — \
-             image generation, speech, transcription, video — when the user's request calls for it. \
-             Use tools proactively; don't just describe what you could do, actually do it.{}",
+             image generation, speech, transcription, video — when the user's request actually \
+             calls for it; when it does, don't just describe what you could do, actually do it. \
+             run_model waits for generation to finish and hands you the result directly, so you \
+             don't need to poll for it. For everything else — questions, conversation, requests \
+             you can just answer — reply normally without calling any tool.{}",
             fallback_prompt
         )
     } else {
@@ -2039,7 +2064,7 @@ async fn chat_completions(
         "temperature": payload.temperature.unwrap_or(0.7),
         "top_p": payload.top_p.unwrap_or(0.9),
         "repeat_penalty": 1.15,
-        "thinking": payload.enable_thinking.unwrap_or(true),
+        "chat_template_kwargs": { "enable_thinking": payload.enable_thinking.unwrap_or(true) },
     });
 
     // Try native tool calling first
@@ -2152,7 +2177,7 @@ async fn chat_completions(
                 "temperature": payload.temperature.unwrap_or(0.7),
                 "top_p": payload.top_p.unwrap_or(0.9),
                 "repeat_penalty": 1.15,
-                "thinking": payload.enable_thinking.unwrap_or(true),
+                "chat_template_kwargs": { "enable_thinking": payload.enable_thinking.unwrap_or(true) },
             });
 
             let followup_res = client.post(&url).json(&followup_body).send().await
@@ -2234,7 +2259,7 @@ async fn chat_completions(
                 "temperature": payload.temperature.unwrap_or(0.7),
                 "top_p": payload.top_p.unwrap_or(0.9),
                 "repeat_penalty": 1.15,
-                "thinking": payload.enable_thinking.unwrap_or(true),
+                "chat_template_kwargs": { "enable_thinking": payload.enable_thinking.unwrap_or(true) },
             });
 
             let followup_res = client.post(&url).json(&followup_body).send().await
@@ -2295,6 +2320,8 @@ pub(crate) async fn init_job_progress(state: &AppState, job_id: &str, modality: 
             percent: -1.0,
             status: "running".to_string(),
             message: None,
+            media_handle: None,
+            media_type: None,
             updated_at: now_millis(),
         },
     );
@@ -2350,9 +2377,23 @@ pub(crate) async fn finalize_job_progress(state: &AppState, job_id: &str, modali
             percent: if error.is_some() { -1.0 } else { 100.0 },
             status: status.to_string(),
             message: error.map(|e| e.to_string()),
+            media_handle: None,
+            media_type: None,
             updated_at: now_millis(),
         },
     );
+}
+
+/// Set the completed media handle/type on a job's progress record, after
+/// `finalize_job_progress` has already marked it done. Used by `run_model` so
+/// `get_generation_progress` can hand the media back to the orchestrator once
+/// the background generation task finishes.
+pub(crate) async fn set_job_media(state: &AppState, job_id: &str, media_handle: String, media_type: String) {
+    let mut jobs = state.job_progress.lock().await;
+    if let Some(progress) = jobs.get_mut(job_id) {
+        progress.media_handle = Some(media_handle);
+        progress.media_type = Some(media_type);
+    }
 }
 
 /// Error type for `generate_images`, so a `BackendError::MissingComponents`
@@ -3071,6 +3112,11 @@ pub struct DetectedModelEntry {
     pub mesh_vae_path: Option<String>,
     /// Path to the texture/paint component subfolder.
     pub mesh_texgen_path: Option<String>,
+    /// Generic list of detected sibling components for multi-component mesh3d
+    /// repos (covers both subfolder layouts like Hunyuan3D and flat
+    /// multi-file layouts like TRELLIS). `mesh_vae_path`/`mesh_texgen_path`
+    /// above are kept for back-compat and are derived from the same scan.
+    pub mesh_components: Option<Vec<MeshComponentEntry>>,
     /// For split-checkpoint image models (e.g. FLUX.2 GGUF, Z-Image): the
     /// resolved (or missing, with a download source if known) sibling
     /// text-encoder/VAE components. `None` for models that aren't
@@ -3094,25 +3140,57 @@ fn has_image_projector(path: &std::path::Path) -> bool {
     find_sibling_mmproj(path).is_some()
 }
 
-/// For multi-component mesh3d repos (e.g. Hunyuan3D-2.x), detect sibling
-/// subfolders that contain the VAE and paint/texture pipeline components.
-fn find_mesh3d_siblings(path: &std::path::Path) -> (Option<String>, Option<String>) {
+/// A single named sibling-component path for a multi-component mesh3d repo
+/// (e.g. TRELLIS's `ss_flow_img_dit`, Hunyuan3D's `vae` subfolder).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshComponentEntry {
+    pub label: String,
+    pub path: String,
+}
+
+/// For multi-component mesh3d repos, detect sibling components. Handles two
+/// repo layouts:
+/// - Hunyuan3D-2.x style: `vae`/`paint`/`texgen`/`texture` subfolders.
+/// - TRELLIS style: a flat repo with named `.safetensors` files at the root
+///   (`ss_flow_*`, `slat_flow_*`, `shape_enc`/`shape_dec`, `tex_enc`/`tex_dec`).
+///   Each matching file becomes its own component entry (e.g. the 512 and
+///   1024 `slat_flow_img2shape` variants both show up separately) rather than
+///   trying to collapse variants into one slot.
+///
+/// Returns `(vae_path, texgen_path, components)`: the first two are kept for
+/// back-compat with the existing Hunyuan3D-only UI fields, `components` is
+/// the generic list covering both layouts.
+fn find_mesh3d_siblings(path: &std::path::Path) -> (Option<String>, Option<String>, Vec<MeshComponentEntry>) {
     // path is the repo root directory for mesh3d models
-    let dir = if path.is_dir() { path } else { return (None, None); };
+    let dir = if path.is_dir() { path } else { return (None, None, Vec::new()); };
     let mut vae_path = None;
     let mut texgen_path = None;
+    let mut components = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-            if !entry.path().is_dir() { continue; }
-            if name.contains("vae") {
-                vae_path = Some(entry.path().to_string_lossy().to_string());
-            } else if name.contains("paint") || name.contains("texgen") || name.contains("texture") {
-                texgen_path = Some(entry.path().to_string_lossy().to_string());
+            let entry_path = entry.path();
+            if entry_path.is_dir() {
+                if name.contains("vae") {
+                    let value = entry_path.to_string_lossy().to_string();
+                    vae_path = Some(value.clone());
+                    components.push(MeshComponentEntry { label: "VAE".to_string(), path: value });
+                } else if name.contains("paint") || name.contains("texgen") || name.contains("texture") {
+                    let value = entry_path.to_string_lossy().to_string();
+                    texgen_path = Some(value.clone());
+                    components.push(MeshComponentEntry { label: "Texture/Paint".to_string(), path: value });
+                }
+            } else if name.ends_with(".safetensors")
+                && (name.contains("ss_flow") || name.contains("slat_flow")
+                    || name.contains("shape_enc") || name.contains("shape_dec")
+                    || name.contains("tex_enc") || name.contains("tex_dec"))
+            {
+                let label = entry_path.file_stem().and_then(|s| s.to_str()).unwrap_or(&name).to_string();
+                components.push(MeshComponentEntry { label, path: entry_path.to_string_lossy().to_string() });
             }
         }
     }
-    (vae_path, texgen_path)
+    (vae_path, texgen_path, components)
 }
 
 /// A `.safetensors` model is a text LLM if the sibling `config.json` in the
@@ -3302,7 +3380,7 @@ fn hf_model_dir_entry(dir: &std::path::Path) -> Option<DetectedModelEntry> {
     };
     let is_mesh3d = is_mesh3d || task_tags.iter().any(|t| t == "text-to-3d" || t == "image-to-3d");
     let mesh_input_kinds = if is_mesh3d { detect_mesh_input_kinds(dir) } else { None };
-    let (mesh_vae_path, mesh_texgen_path) = if is_mesh3d { find_mesh3d_siblings(dir) } else { (None, None) };
+    let (mesh_vae_path, mesh_texgen_path, mesh_components) = if is_mesh3d { find_mesh3d_siblings(dir) } else { (None, None, Vec::new()) };
 
     Some(DetectedModelEntry {
         name: dir.file_name().and_then(|name| name.to_str()).unwrap_or("Unknown model").to_string(),
@@ -3314,6 +3392,7 @@ fn hf_model_dir_entry(dir: &std::path::Path) -> Option<DetectedModelEntry> {
         mesh_input_kinds,
         mesh_vae_path,
         mesh_texgen_path,
+        mesh_components: is_mesh3d.then_some(mesh_components),
         image_components: None,
         task_tags,
     })
@@ -3337,7 +3416,7 @@ fn collect_model_files(directory: &std::path::Path, entries: &mut Vec<DetectedMo
                 continue;
             }
             if is_mesh3d_name(&dir_name) {
-                let (mesh_vae_path, mesh_texgen_path) = find_mesh3d_siblings(&path);
+                let (mesh_vae_path, mesh_texgen_path, mesh_components) = find_mesh3d_siblings(&path);
                 let mesh_input_kinds = detect_mesh_input_kinds(&path);
                 entries.push(DetectedModelEntry {
                     name: path.file_name().and_then(|name| name.to_str()).unwrap_or("Unknown model").to_string(),
@@ -3350,6 +3429,7 @@ fn collect_model_files(directory: &std::path::Path, entries: &mut Vec<DetectedMo
                     mesh_input_kinds,
                     mesh_vae_path,
                     mesh_texgen_path,
+                    mesh_components: Some(mesh_components),
                     image_components: None,
                 });
                 continue;
@@ -3387,6 +3467,7 @@ fn collect_model_files(directory: &std::path::Path, entries: &mut Vec<DetectedMo
                 mesh_input_kinds,
                 mesh_vae_path: None,
                 mesh_texgen_path: None,
+                mesh_components: None,
                 image_components,
                 task_tags,
             });
@@ -4986,7 +5067,7 @@ pub(crate) async fn load_model(
 }
 
 /// Unload a model by model_id. Kills its llama-server process.
-async fn unload_model(
+pub(crate) async fn unload_model(
     State(state): State<AppState>,
     Json(payload): Json<ModelUnloadRequest>,
 ) -> Result<Json<Vec<LoadedModelEntry>>, (axum::http::StatusCode, String)> {

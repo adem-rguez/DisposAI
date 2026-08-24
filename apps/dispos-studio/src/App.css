@@ -698,6 +698,62 @@ main {
 
 .tool-media-download-btn:hover { color: var(--text-primary); border-color: var(--accent-blue); }
 
+.video-player {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  background-color: var(--bg-dark);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.video-player-el {
+  width: 100%;
+  flex: 1;
+  min-height: 0;
+  object-fit: contain;
+  display: block;
+  cursor: pointer;
+  background-color: #000;
+}
+
+.video-player-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.4rem 0.6rem;
+  background-color: var(--card-bg);
+}
+
+.video-player-playbtn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  color: var(--text-primary);
+  cursor: pointer;
+  padding: 0.15rem;
+  flex-shrink: 0;
+}
+
+.video-player-playbtn:hover { color: var(--accent-blue); }
+
+.video-player-seek {
+  flex: 1;
+  height: 4px;
+  accent-color: var(--accent-blue);
+  cursor: pointer;
+}
+
+.video-player-time {
+  color: var(--text-secondary);
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
 /* Chat Input Controls */
 .input-card {
   background-color: var(--panel-bg);

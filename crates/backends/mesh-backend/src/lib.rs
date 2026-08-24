@@ -260,6 +260,8 @@ impl MeshBackend {
             percent: body.get("percent").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
             status: body.get("status").and_then(|v| v.as_str()).unwrap_or("running").to_string(),
             message: body.get("message").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            media_handle: None,
+            media_type: None,
             updated_at,
         })
     }

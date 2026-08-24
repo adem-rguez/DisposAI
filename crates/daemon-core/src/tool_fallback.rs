@@ -9,10 +9,13 @@ pub fn build_tool_prompt(tools: &[ToolSchema]) -> String {
 
     let mut prompt = String::from(
         "\n\nYou orchestrate the other models on this machine through the following tools. \
-         Use them proactively when the user's request would benefit from them — if you are asked \
-         for speech, an image, a transcription or a video, run the model that produces it rather \
-         than describing what you would do. When you are unsure what is available, call \
-         list_models first and pick from what it reports.\n\n"
+         Most messages — greetings, general knowledge questions, chit-chat, anything you can \
+         just answer directly — need NO tool call at all. Only reach for a tool when the user's \
+         request actually requires generating media (speech, an image, a transcription, a video) \
+         or otherwise needs information about what is installed. Never call list_models 'just in \
+         case' or as a default first step — only call it when you specifically need to check what \
+         models are available to fulfill the current request. run_model waits for generation to \
+         finish and returns the result directly, so you don't need to poll for it.\n\n"
     );
     for tool in tools {
         prompt.push_str(&format!(

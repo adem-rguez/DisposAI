@@ -4,13 +4,18 @@ import {
   Cpu, HardDrive, Zap, Send, Play, Image, FileAudio, RefreshCw,
   Brain, ChevronDown, ChevronRight, Sliders, Folder, Power, Layers, Settings,
   CheckCircle2, XCircle, PackagePlus, Box, Boxes, Paperclip, X, Pencil,
-  Search, Download, Globe, Loader, Check, Heart, Wand2, ArrowUpRight, Trash2, Square
+  Search, Download, Globe, Loader, Check, Heart, Wand2, ArrowUpRight, Trash2, Square, Pause
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import Mesh3DViewer, { isMeshResource, guessMeshFormat } from './Mesh3DViewer';
 import { ErrorLogProvider, ErrorToasts, useErrorLog } from './ErrorLog';
 import './App.css';
+
+async function browseForFile(defaultPath, filters, properties) {
+  const { ipcRenderer } = window.require('electron');
+  return ipcRenderer.invoke('select-file', { defaultPath, filters, properties });
+}
 
 function findResponseStart(text) {
   const patterns = [
@@ -100,7 +105,7 @@ function ThinkingBlock({ thinkText, hadThinkTag }) {
 // A single "Used tool: X" chip. Expands (same accordion pattern as
 // ThinkingBlock) to show the request details for that specific call —
 // model name and full arguments, when the backend has sent them.
-function ToolCallChip({ event, onCancel }) {
+function ToolCallChip({ event, onCancel, onExpand }) {
   const [isOpen, setIsOpen] = useState(false);
   const modelName = event.arguments?.model;
   const label = event.status === 'executing' ? `Calling ${event.name}...`
@@ -119,6 +124,11 @@ function ToolCallChip({ event, onCancel }) {
           </div>
           {isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
         </button>
+        {event.name === 'run_model' && event.jobId && (
+          <button className="tool-status-cancel-btn" onClick={onExpand} title="Open in Studio">
+            <ArrowUpRight size={14} /> Expand to Studio
+          </button>
+        )}
         {event.status === 'executing' && event.jobId && (
           <button className="tool-status-cancel-btn" onClick={onCancel}>
             Cancel
@@ -253,6 +263,76 @@ function SchemaParamField({ param: p, value, onChange }) {
     control = <input type="text" value={value ?? ''} onChange={e => onChange(e.target.value)} />;
   }
   return <div className="form-group"><label>{p.name}</label>{control}</div>;
+}
+
+function formatVideoTime(seconds) {
+  if (!isFinite(seconds) || seconds < 0) return '0:00';
+  const total = Math.floor(seconds);
+  const mins = Math.floor(total / 60);
+  const secs = total % 60;
+  return `${mins}:${secs.toString().padStart(2, '0')}`;
+}
+
+function VideoPlayer({ src, autoPlay, style, className }) {
+  const videoRef = useRef(null);
+  const [playing, setPlaying] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+
+  useEffect(() => {
+    setPlaying(false);
+    setCurrentTime(0);
+    setDuration(0);
+  }, [src]);
+
+  const togglePlay = () => {
+    const video = videoRef.current;
+    if (!video) return;
+    if (video.paused) {
+      video.play();
+    } else {
+      video.pause();
+    }
+  };
+
+  const handleSeek = (e) => {
+    const video = videoRef.current;
+    if (!video || !duration) return;
+    video.currentTime = Number(e.target.value);
+    setCurrentTime(Number(e.target.value));
+  };
+
+  return (
+    <div className={`video-player${className ? ` ${className}` : ''}`} style={style}>
+      <video
+        ref={videoRef}
+        src={src}
+        autoPlay={autoPlay}
+        className="video-player-el"
+        onClick={togglePlay}
+        onPlay={() => setPlaying(true)}
+        onPause={() => setPlaying(false)}
+        onLoadedMetadata={(e) => setDuration(e.currentTarget.duration || 0)}
+        onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
+        onEnded={() => setPlaying(false)}
+      />
+      <div className="video-player-controls">
+        <button type="button" className="video-player-playbtn" onClick={togglePlay}>
+          {playing ? <Pause size={16} /> : <Play size={16} />}
+        </button>
+        <input
+          type="range"
+          className="video-player-seek"
+          min={0}
+          max={duration || 0}
+          step={0.01}
+          value={currentTime}
+          onChange={handleSeek}
+        />
+        <span className="video-player-time">{formatVideoTime(currentTime)} / {formatVideoTime(duration)}</span>
+      </div>
+    </div>
+  );
 }
 
 function AttachmentPreview({ attachment }) {
@@ -429,7 +509,15 @@ function AppInner() {
   const [modelPath, setModelPath] = useState(
     'models\\Qwen3.5-0.8B-Q8_0.gguf'
   );
-  const [messages, setMessages] = useState([
+  // The orchestrator (activeChatId === null) is a fixed, standalone
+  // conversation — never a chatSessions entry, never the target of
+  // startStudio/expandToolCallToStudio. Its transcript lives here, separate
+  // from the per-session transcripts in chatSessions. Without this split, any
+  // studio whose category resolves to 'chat' (or falls back to 'chat' when a
+  // model's task_tags don't match a known category) rendered through the exact
+  // same panel as the orchestrator, so opening it clobbered the orchestrator's
+  // own view immediately — not just after leaving and coming back.
+  const [orchestratorMessages, setOrchestratorMessages] = useState([
     {
       id: 'welcome',
       role: 'assistant',
@@ -441,7 +529,6 @@ function AppInner() {
   const [attachments, setAttachments] = useState([]);
   const [pendingModelChoice, setPendingModelChoice] = useState(null);
   const attachmentInputRef = useRef(null);
-  const mmprojInputRef = useRef(null);
   const [isGenerating, setIsGenerating] = useState(false);
   const defaultAppSettings = {
     autoSelectNewest: true,
@@ -587,6 +674,19 @@ function AppInner() {
     } catch { return []; }
   });
   const [activeChatId, setActiveChatId] = useState(null);
+  // The model the orchestrator's own chat requests use — set once by the
+  // same auto-select logic as `selectedModelId` (see fetchLoadedModels) but
+  // never reassigned by startStudio/expandToolCallToStudio/sidebar clicks,
+  // which only ever touch `selectedModelId` for the currently open studio.
+  const [orchestratorModelId, setOrchestratorModelId] = useState(null);
+  // What the chat panel actually shows: the open studio's transcript, or the
+  // orchestrator's own when no studio is open. Derived straight from
+  // chatSessions — there is no separate "currently open studio" message
+  // buffer, so switching studios can never write one transcript into
+  // another's slot.
+  const displayedMessages = activeChatId
+    ? (chatSessions.find(session => session.id === activeChatId)?.messages ?? [])
+    : orchestratorMessages;
   const [collapsedStudios, setCollapsedStudios] = useState(() => {
     try { return JSON.parse(localStorage.getItem('dispos.studio-collapsed')) ?? {}; } catch { return {}; }
   });
@@ -1075,6 +1175,13 @@ function AppInner() {
       mmproj_path: s.mmproj_path || card.mmproj_path || detectedModels.find(m => m.path === card.modelPath)?.mmproj_path || '',
       mesh_vae_path: s.mesh_vae_path || card.mesh_vae_path || detectedModels.find(m => m.path === card.modelPath)?.mesh_vae_path || '',
       mesh_texgen_path: s.mesh_texgen_path || card.mesh_texgen_path || detectedModels.find(m => m.path === card.modelPath)?.mesh_texgen_path || '',
+      // Generic sibling-component list (covers Hunyuan3D subfolders and flat
+      // multi-file repos like TRELLIS). Falls back to the legacy VAE/texgen
+      // fields above for older cached cards that predate this field.
+      mesh_components: s.mesh_components || card.mesh_components || detectedModels.find(m => m.path === card.modelPath)?.mesh_components || [
+        ...(s.mesh_vae_path || card.mesh_vae_path ? [{ label: 'VAE', path: s.mesh_vae_path || card.mesh_vae_path }] : []),
+        ...(s.mesh_texgen_path || card.mesh_texgen_path ? [{ label: 'Texture/Paint', path: s.mesh_texgen_path || card.mesh_texgen_path }] : []),
+      ],
       image_components: detectedModels.find(m => m.path === card.modelPath)?.image_components || null,
     });
   };
@@ -1090,9 +1197,16 @@ function AppInner() {
           setSelectedModelId(data[0].model_id);
         }
         if (data.length === 0) setSelectedModelId(null);
+        // Same auto-select, kept independent of selectedModelId so opening a
+        // studio (which claims selectedModelId for that model) never leaves
+        // the orchestrator's own chat requests pointed at the wrong model.
+        if (data.length > 0 && !orchestratorModelId) {
+          setOrchestratorModelId(data[0].model_id);
+        }
+        if (data.length === 0) setOrchestratorModelId(null);
       }
     } catch {}
-  }, [selectedModelId]);
+  }, [selectedModelId, orchestratorModelId]);
 
   const handleLoadModel = async (configuration = configTarget) => {
     if (!configuration?.model_path?.trim() || isLoadingModel) return;
@@ -1364,14 +1478,124 @@ function AppInner() {
     const session = { id: chatId, title: 'New chat', modelId: loadedEntry.model_id, modelPath: loadedEntry.model_path, modelName, task_tags, studioKey: canonicalStudioKey(loadedEntry.model_path, modelName), messages: initialMessages, createdAt: Date.now() };
     setChatSessions(current => [...current, session]);
     setActiveChatId(chatId);
-    setMessages(initialMessages);
     openModelStudio({ task_tags });
   };
-  const syncMessages = (updater) => setMessages(previous => {
-    const next = typeof updater === 'function' ? updater(previous) : updater;
-    if (activeChatId) setChatSessions(current => current.map(session => session.id === activeChatId ? { ...session, messages: next } : session));
-    return next;
-  });
+  // Lets a run_model tool-call chip in the orchestrator chat jump the user
+  // to the matching studio tab and mirror that job's own live progress /
+  // result there, without disturbing anything about how the chip itself
+  // renders. Purely additive: reads from the toolEvent already in scope,
+  // observes the existing job via polling (does not start a new one).
+  const expandToolCallToStudio = (event) => {
+    const modelName = event.arguments?.model;
+    if (!event.jobId || !modelName) { console.warn('expandToolCallToStudio: missing jobId or model name', event); return; }
+    const catalogModel = detectedModels.find(m => m.name === modelName);
+    const loadedModel = (catalogModel && loadedModels.find(m => m.model_path === catalogModel.path))
+      ?? loadedModels.find(m => m.model_path?.endsWith(modelName));
+    const task_tags = catalogModel?.task_tags ?? loadedModel?.task_tags;
+    if (!task_tags) { console.warn('expandToolCallToStudio: could not resolve model', modelName); return; }
+    const category = categoryForTags(task_tags);
+    const sync = {
+      image: { setJobId: setActiveImageJobId, setProgress: setImgProgress, setGenerating: setIsGeneratingImg, setSrc: setImgSrc, setPrompt: setImgPrompt },
+      video: { setJobId: setActiveVideoJobId, setProgress: setVideoProgress, setGenerating: setIsGeneratingVideo, setSrc: setVideoSrc, setPrompt: setVideoPrompt },
+      mesh3d: { setJobId: setActiveMeshJobId, setProgress: setMeshProgress, setGenerating: setIsGeneratingMesh, setSrc: (url) => setMesh3dResult(url ? { url, format: guessMeshFormat(url) } : null), setPrompt: setMesh3dPrompt },
+      tts: { setJobId: setActiveTtsJobId, setProgress: setTtsProgress, setGenerating: setIsGeneratingTts, setSrc: setAudioSrc, setPrompt: setTtsInput },
+    }[category];
+
+    const tab = category === 'tts' ? 'audio' : category === 'audio' ? 'transcribe' : category;
+    const resolvedModelPath = loadedModel?.model_path ?? catalogModel?.path;
+    if (loadedModel) {
+      setOpenStudios(current => current.some(s => s.modelId === loadedModel.model_id)
+        ? current
+        : [...current, { modelId: loadedModel.model_id, name: catalogModel?.name ?? modelName, task_tags }]);
+    }
+    // Mirror startStudio's session-creation pattern so the model shows up in
+    // the sidebar STUDIOS list, even if loadedModels hasn't caught up yet
+    // (run_model may load the model server-side before the frontend polls).
+    // Also switch activeChatId to that session, same as clicking it in the
+    // sidebar would — otherwise the sidebar highlight (keyed off activeChatId)
+    // stays stuck on the orchestrator while the visible tab has moved on.
+    if (resolvedModelPath) {
+      const studioKey = canonicalStudioKey(resolvedModelPath, catalogModel?.name ?? modelName);
+      const existingSession = chatSessions.find(s => s.studioKey === studioKey);
+      if (existingSession) {
+        setActiveChatId(existingSession.id);
+      } else {
+        const newSession = {
+          id: `chat-${Date.now()}`,
+          title: catalogModel?.name ?? modelName,
+          modelId: loadedModel?.model_id,
+          modelPath: resolvedModelPath,
+          modelName: catalogModel?.name ?? modelName,
+          task_tags,
+          studioKey,
+          messages: [{ id: 'welcome', role: 'assistant', content: `Expanded from the orchestrator (prompt: "${event.arguments?.prompt ?? ''}").`, telemetry: null }],
+          createdAt: Date.now(),
+        };
+        setChatSessions(current => [...current, newSession]);
+        setActiveChatId(newSession.id);
+      }
+      if (loadedModel?.model_id) setSelectedModelId(loadedModel.model_id);
+    }
+    setActiveTab(['chat', 'image', 'audio', 'transcribe', 'video', 'mesh3d', 'embeddings'].includes(tab) ? tab : 'chat');
+
+    // Only image/video/mesh3d/tts have a per-job progress+result shape to
+    // mirror; chat/transcribe/embeddings run_model calls just switch tabs.
+    if (!sync) return;
+
+    sync.setJobId(event.jobId);
+    const running = event.status === 'executing';
+    sync.setGenerating(running);
+    sync.setProgress(running ? event.progress : null);
+    if (event.media?.url) sync.setSrc(event.media.url);
+    sync.setPrompt(event.arguments?.prompt ?? '');
+
+    const params = event.arguments?.params || {};
+    if (category === 'video') setVideoParamValues(current => ({ ...current, ...params }));
+    if (category === 'mesh3d') setMesh3dParamValues(current => ({ ...current, ...params }));
+    if (category === 'image') {
+      if ('steps' in params) setImgSteps(params.steps);
+      if ('seed' in params) setImgSeed(params.seed);
+      if ('cfg_scale' in params) setImgCfgScale(params.cfg_scale);
+      else if ('guidance_scale' in params) setImgCfgScale(params.guidance_scale);
+      if ('width' in params) setImgWidth(params.width);
+      if ('height' in params) setImgHeight(params.height);
+      if ('negative_prompt' in params) setImgNegativePrompt(params.negative_prompt);
+    }
+    if (category === 'tts' && 'speed' in params) setTtsSpeed(params.speed);
+
+    if (!running) return;
+    const interval = setInterval(() => {
+      fetch(`http://127.0.0.1:8080/v1/jobs/${event.jobId}/progress`)
+        .then(res => (res.ok ? res.json() : null))
+        .then(record => {
+          if (!record) return;
+          const terminal = record.status === 'done' || record.status === 'error' || record.status === 'cancelled';
+          sync.setProgress(terminal ? null : record);
+          sync.setGenerating(!terminal);
+          if (terminal) {
+            if (record.media_handle) sync.setSrc(`http://127.0.0.1:8080${record.media_handle}`);
+            clearInterval(interval);
+          }
+        })
+        .catch(() => {});
+    }, 200);
+  };
+  // Writes go to the orchestrator's own transcript (targetId === null) or to
+  // one specific chatSessions entry. `targetId` is explicit because a stream
+  // and its run_model job pollers outlive the click that started them: if
+  // they resolved the destination lazily from activeChatId they'd follow the
+  // user into whatever studio they opened next (e.g. via the tool chip's
+  // Expand button) and overwrite that transcript — or, worse, write the newly
+  // opened studio's messages back into the session they started from.
+  const syncMessages = (updater, targetId = activeChatId) => {
+    const apply = (previous) => (typeof updater === 'function' ? updater(previous) : updater);
+    if (targetId) {
+      setChatSessions(current => current.map(session =>
+        session.id === targetId ? { ...session, messages: apply(session.messages ?? []) } : session));
+    } else {
+      setOrchestratorMessages(apply);
+    }
+  };
   const generateChatTitle = async (sessionId, prompt) => {
     try {
       const response = await fetch('http://127.0.0.1:8080/v1/chat/completions/stream', {
@@ -1414,13 +1638,27 @@ function AppInner() {
   }, [configTarget?.cardId, configTarget?.context_size, configTarget?.task_tags, modelCards]);
 
   const messagesEndRef = useRef(null);
+  const chatHistoryRef = useRef(null);
+  // Tracks whether the user is currently scrolled near the bottom of the
+  // chat history; used to avoid yanking the view back down while they're
+  // reading scrollback during rapid streaming updates (e.g. tool calls).
+  const isNearBottomRef = useRef(true);
   // Tracks the AbortController for the in-flight chat stream so a "Stop"
   // button can cancel it; cleared once the stream ends (success or abort).
   const streamAbortRef = useRef(null);
 
+  const handleChatHistoryScroll = () => {
+    const el = chatHistoryRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    isNearBottomRef.current = distanceFromBottom < 120;
+  };
+
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+    if (isNearBottomRef.current) {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [displayedMessages]);
 
   const sysInfoInFlight = useRef(false);
   const fetchSystemInfo = async () => {
@@ -1457,6 +1695,10 @@ function AppInner() {
   // Shared fetch+SSE-parsing core, reused by both a fresh user send and a
   // resumed request after the user picks a model from a model_choice prompt.
   const streamAssistantResponse = async (requestBody, aiId, titleText, priorContent = '') => {
+    // Pinned once: every write this request makes (including the job pollers
+    // below, which keep running after the user navigates away) belongs to the
+    // conversation that started it, not to whichever one is on screen later.
+    const targetChatId = activeChatId;
     // Accumulators for the two phases. When resuming into an existing
     // assistant message (e.g. after a model_choice pick), seed these from
     // that message's current content so the earlier reasoning/tool call
@@ -1470,7 +1712,14 @@ function AppInner() {
     let gotModelChoice = false;
     const startTime = Date.now();
     // Polling intervals for delegated tool jobs (run_model), keyed by job_id.
-    // Cleared on tool_result, terminal progress status, and stream end/error.
+    // A job's real lifecycle (running/done/error/cancelled) is only known via
+    // this poll of /v1/jobs/:id/progress — the tool_result SSE event for
+    // run_model fires almost instantly now (the daemon just started the
+    // background job) and must NOT be treated as job completion. Intervals
+    // are cleared solely by the poller itself reaching a terminal status;
+    // they intentionally outlive this streaming request so a still-running
+    // background job keeps updating its toolEvent after the LLM's own text
+    // response has finished streaming.
     const jobIntervals = new Map();
     const stopJobPolling = (jobId) => {
       const interval = jobIntervals.get(jobId);
@@ -1480,21 +1729,39 @@ function AppInner() {
       }
     };
 
-    const updateMsg = (done = false) => {
+    // textDelta is the piece of newly-arrived answer text (if any) for this
+    // update. It's appended to the last block in the message's ordered
+    // `blocks` list if that block is text, otherwise it starts a new text
+    // block — this is what keeps text and tool_call/tool_result blocks in
+    // the chronological order they actually streamed in, instead of the
+    // old approach of accumulating all text separately from all tool events.
+    const updateMsg = (done = false, textDelta = null) => {
       const elapsed = (Date.now() - startTime) / 1000;
       const speed = elapsed > 0.1 ? (tokenCount / elapsed).toFixed(1) : '0.0';
       const telemetry = `${speed} tok/s | CUDA GPU`;
 
       // Compose the combined content string that parseThinking() can parse
+      // (used only to recover the <think> block for display, and to seed
+      // the next hop's thinkingBuf/answerBuf on a model_choice resume).
       const combined = thinkingBuf
         ? `<think>\n${thinkingBuf}\n</think>\n\n${answerBuf}`
         : answerBuf;
       syncMessages(prev =>
-        prev.map(m =>
-          m.id === aiId
-            ? { ...m, content: combined, loading: !done, telemetry: telemetry, truncated: done && finishReason === 'length', toolEvents: done ? (m.toolEvents || []).filter(e => e.status !== 'executing') : m.toolEvents }
-            : m
-        )
+        prev.map(m => {
+          if (m.id !== aiId) return m;
+          let blocks = m.blocks || [];
+          if (textDelta) {
+            const last = blocks[blocks.length - 1];
+            blocks = last && last.type === 'text'
+              ? [...blocks.slice(0, -1), { ...last, text: last.text + textDelta }]
+              : [...blocks, { type: 'text', text: textDelta }];
+          }
+          if (done) {
+            blocks = blocks.filter(b => b.type !== 'tool' || b.status !== 'executing' || jobIntervals.has(b.jobId));
+          }
+          return { ...m, content: combined, loading: !done, telemetry: telemetry, truncated: done && finishReason === 'length', blocks };
+        }),
+        targetChatId
       );
     };
 
@@ -1536,7 +1803,7 @@ function AppInner() {
               // list_models tool call. Just stop its spinner and remember
               // which message to continue into once the user picks a model.
               gotModelChoice = true;
-              syncMessages(prev => prev.map(m => m.id === aiId ? { ...m, loading: false } : m));
+              syncMessages(prev => prev.map(m => m.id === aiId ? { ...m, loading: false } : m), targetChatId);
               setPendingModelChoice({ options: chunk.options, requestBody, aiId });
               continue;
             }
@@ -1545,23 +1812,36 @@ function AppInner() {
               const jobId = chunk.job_id || null;
               syncMessages(prev => prev.map(m =>
                 m.id === aiId
-                  ? { ...m, toolEvents: [...(m.toolEvents || []), { name: chunk.tool_name, status: 'executing', jobId, progress: null, arguments: chunk.arguments || null }] }
+                  ? { ...m, blocks: [...(m.blocks || []), { type: 'tool', name: chunk.tool_name, status: 'executing', jobId, progress: null, arguments: chunk.arguments || null }] }
                   : m
-              ));
+              ), targetChatId);
               if (jobId) {
                 const interval = setInterval(() => {
                   fetch(`http://127.0.0.1:8080/v1/jobs/${jobId}/progress`)
                     .then(res => (res.ok ? res.json() : null))
                     .then(record => {
                       if (!record) return;
+                      const terminal = record.status === 'done' || record.status === 'error' || record.status === 'cancelled';
                       syncMessages(prev => prev.map(m => {
                         if (m.id !== aiId) return m;
-                        const events = (m.toolEvents || []).map(e => (e.jobId === jobId
-                          ? { ...e, progress: record, status: record.status === 'cancelled' ? 'cancelled' : e.status }
-                          : e));
-                        return { ...m, toolEvents: events };
-                      }));
-                      if (record.status === 'done' || record.status === 'error' || record.status === 'cancelled') stopJobPolling(jobId);
+                        const blocks = (m.blocks || []).map(b => {
+                          if (b.type !== 'tool' || b.jobId !== jobId) return b;
+                          const media = record.media_handle ? {
+                            url: `http://127.0.0.1:8080${record.media_handle}`,
+                            type: record.media_type || 'application/octet-stream',
+                            content: '',
+                          } : b.media || null;
+                          return {
+                            ...b,
+                            progress: terminal ? null : record,
+                            status: terminal ? record.status : b.status,
+                            detail: record.status === 'error' ? (record.message || b.detail) : b.detail,
+                            media,
+                          };
+                        });
+                        return { ...m, blocks };
+                      }), targetChatId);
+                      if (terminal) stopJobPolling(jobId);
                     })
                     .catch(() => {});
                 }, 200);
@@ -1571,7 +1851,40 @@ function AppInner() {
             }
 
             if (chunk.type === 'tool_result') {
-              if (chunk.job_id) stopJobPolling(chunk.job_id);
+              const jobId = chunk.job_id || null;
+
+              // job_id is stamped on every tool call's SSE events, not just
+              // run_model's — but only run_model's media-generation jobs
+              // actually register a progress record (job_id ties into the
+              // shared job_progress map only there; text-model run_model
+              // calls, list_models, get_generation_progress, cancel_job etc.
+              // resolve synchronously with no such record). Check the
+              // record's existence rather than trusting job_id/tool_name
+              // alone: if it exists, this is a real background job — leave
+              // its toolEvent driven by the polling interval already started
+              // from tool_status and do not resolve it here.
+              let hasActiveJob = false;
+              if (jobId) {
+                try {
+                  const progRes = await fetch(`http://127.0.0.1:8080/v1/jobs/${jobId}/progress`);
+                  hasActiveJob = progRes.ok;
+                } catch {
+                  hasActiveJob = false;
+                }
+              }
+
+              if (hasActiveJob) {
+                syncMessages(prev => prev.map(m => {
+                  if (m.id !== aiId) return m;
+                  const blocks = (m.blocks || []).map(b => (b.type === 'tool' && b.jobId === jobId && b.status === 'executing'
+                    ? { ...b, arguments: chunk.arguments || b.arguments }
+                    : b));
+                  return { ...m, blocks };
+                }), targetChatId);
+                continue;
+              }
+
+              if (jobId) stopJobPolling(jobId);
 
               const mediaResult = chunk.media_url ? {
                 url: `http://127.0.0.1:8080${chunk.media_url}`,
@@ -1583,21 +1896,22 @@ function AppInner() {
                 if (m.id !== aiId) return m;
                 // Close out the matching in-flight call rather than appending a
                 // second entry — one tool_status pairs with one tool_result.
-                const events = [...(m.toolEvents || [])];
-                const idx = events.map(e => e.status).lastIndexOf('executing');
+                const blocks = [...(m.blocks || [])];
+                const idx = blocks.map(b => (b.type === 'tool' ? b.status : null)).lastIndexOf('executing');
                 const resolved = {
+                  type: 'tool',
                   name: chunk.tool_name,
                   status: chunk.is_error ? 'error' : 'done',
                   detail: chunk.is_error ? chunk.content : null,
-                  jobId: chunk.job_id || null,
+                  jobId: jobId,
                   progress: null,
                   media: mediaResult,
-                  arguments: chunk.arguments || (idx >= 0 ? events[idx].arguments : null) || null,
+                  arguments: chunk.arguments || (idx >= 0 ? blocks[idx].arguments : null) || null,
                 };
-                if (idx >= 0) events[idx] = resolved; else events.push(resolved);
+                if (idx >= 0) blocks[idx] = resolved; else blocks.push(resolved);
 
-                return { ...m, toolEvents: events };
-              }));
+                return { ...m, blocks };
+              }), targetChatId);
               continue;
             }
 
@@ -1606,6 +1920,7 @@ function AppInner() {
             if (choice.finish_reason) finishReason = choice.finish_reason;
 
             let chunkAdded = false;
+            let textDelta = null;
             if (delta.reasoning_content != null) {
               thinkingBuf += delta.reasoning_content;
               inThinkingPhase = true;
@@ -1615,11 +1930,12 @@ function AppInner() {
             if (delta.content != null && delta.content !== '') {
               if (inThinkingPhase) inThinkingPhase = false;
               answerBuf += delta.content;
+              textDelta = delta.content;
               tokenCount++;
               chunkAdded = true;
             }
             if (chunkAdded) {
-              updateMsg(false);
+              updateMsg(false, textDelta);
             }
           } catch {
             // partial JSON chunk, skip
@@ -1631,8 +1947,8 @@ function AppInner() {
 
       // Stream finished — mark done
       updateMsg(true);
-      if (titleText && activeChatId && chatSessions.find(item => item.id === activeChatId)?.title === 'New chat') {
-        generateChatTitle(activeChatId, titleText);
+      if (titleText && targetChatId && chatSessions.find(item => item.id === targetChatId)?.title === 'New chat') {
+        generateChatTitle(targetChatId, titleText);
       }
     } catch (err) {
       if (err.name === 'AbortError') {
@@ -1645,12 +1961,17 @@ function AppInner() {
             m.id === aiId
               ? { ...m, content: 'Error: ' + err.message, loading: false }
               : m
-          )
+          ),
+          targetChatId
         );
       }
     } finally {
-      jobIntervals.forEach(interval => clearInterval(interval));
-      jobIntervals.clear();
+      // Deliberately do NOT clear jobIntervals here: run_model's background
+      // jobs (image/video/mesh/tts) keep running on the daemon after this
+      // hop's text stream ends, and the progress poller is the only thing
+      // that will ever mark those tool blocks done/error and attach their
+      // media. Each interval stops itself once its job reaches a terminal
+      // status (see the tool_status handler above).
       setIsGenerating(false);
       if (streamAbortRef.current === controller) streamAbortRef.current = null;
     }
@@ -1665,7 +1986,7 @@ function AppInner() {
     const aiId = 'ai-' + Date.now();
     const imageAttachments = attachments.filter(a => a.type?.startsWith('image/'));
     const userMsg = { id: 'u-' + Date.now(), role: 'user', content: userText, attachments };
-    const tempAiMsg = { id: aiId, role: 'assistant', content: '', loading: true };
+    const tempAiMsg = { id: aiId, role: 'assistant', content: '', loading: true, blocks: [] };
 
     syncMessages(prev => [...prev, userMsg, tempAiMsg]);
     setIsGenerating(true);
@@ -1673,7 +1994,7 @@ function AppInner() {
 
     const requestBody = {
       model: modelPath,
-      model_id: selectedModelId,
+      model_id: activeChatId ? selectedModelId : orchestratorModelId,
       conversation_id: activeChatId,
       messages: [{ role: 'user', content: imageAttachments.length ? [
         { type: 'text', text: userText },
@@ -1704,7 +2025,7 @@ function AppInner() {
 
     // Continue streaming the chosen model's result INTO the same assistant
     // message so the earlier reasoning and tool call stay visible.
-    const priorContent = messages.find(m => m.id === aiId)?.content || '';
+    const priorContent = displayedMessages.find(m => m.id === aiId)?.content || '';
     syncMessages(prev => prev.map(m => m.id === aiId ? { ...m, loading: true } : m));
     setIsGenerating(true);
 
@@ -2189,7 +2510,6 @@ function AppInner() {
                     setPendingRemoveIds(ids => ids.filter(id => !modelSessionIds.includes(id)));
                     if (activeChatId && modelSessionIds.includes(activeChatId)) {
                       setActiveChatId(null);
-                      setMessages([]);
                     }
                     setPendingDeleteModelKey(null);
                   }, 350);
@@ -2239,7 +2559,6 @@ function AppInner() {
                         setPendingRemoveIds(ids => ids.filter(id => id !== chat.id));
                         if (activeChatId === chat.id) {
                           setActiveChatId(null);
-                          setMessages([]);
                         }
                         setPendingDeleteId(null);
                       }, 350);
@@ -2263,7 +2582,6 @@ function AppInner() {
                         ?? null;
                       setSelectedModelId(liveMatch?.model_id ?? chat.modelId);
                       setActiveChatId(chat.id);
-                      setMessages(chat.messages ?? []);
                       openModelStudio(chat);
                     }} title={chat.title}>
                       <MessageSquare size={14} />
@@ -2462,30 +2780,80 @@ function AppInner() {
 
               {/* Full-width chat workspace */}
               <div className="chat-workspace">
-                <div className="chat-history">
-                  {messages.map(msg => (
+                <div className="chat-history" ref={chatHistoryRef} onScroll={handleChatHistoryScroll}>
+                  {displayedMessages.map(msg => (
                     <div key={msg.id} className={`msg-row ${msg.role}`}>
                       {msg.role === 'assistant' && <div className="avatar ai">AI</div>}
                       <div className="bubble">
                         {msg.role === 'assistant' ? (
                           (() => {
+                            // `thinking` is still recovered from the combined
+                            // content string, but the visible turn body is
+                            // rendered from `blocks` — a single ordered list of
+                            // text/tool_call/tool_result segments in the exact
+                            // order they streamed in, so a tool call that
+                            // happened between two paragraphs renders between
+                            // them (both live and after reload) instead of all
+                            // tool calls being dumped after all text.
                             const { thinking, answer, hadThinkTag } = parseThinking(msg.content);
+                            const blocks = msg.blocks || [];
                             return (
                               <>
                                 {appSettings.showThoughtProcess && <ThinkingBlock thinkText={thinking} hadThinkTag={hadThinkTag} />}
-                                <div className="answer-content">
-                                  {answer ? (
-                                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{answer}</ReactMarkdown>
-                                  ) : msg.loading ? (
-                                    <em style={{ opacity: 0.6, fontSize: '0.85rem', color: '#94a3b8' }}>
-                                      Thinking…
-                                    </em>
-                                  ) : msg.truncated ? (
-                                    <em style={{ opacity: 0.6, fontSize: '0.85rem', color: '#94a3b8' }}>
-                                      [Model reached output token limit during reasoning — try re-prompting]
-                                    </em>
-                                  ) : null}
-                                </div>
+                                {blocks.length > 0 ? blocks.map((block, idx) => (
+                                  <React.Fragment key={idx}>
+                                    {block.type === 'text' ? (
+                                      <div className="answer-content">
+                                        <ReactMarkdown remarkPlugins={[remarkGfm]}>{block.text}</ReactMarkdown>
+                                      </div>
+                                    ) : (
+                                      <>
+                                        <ToolCallChip event={block} onCancel={() => cancelGenerationJob(block.jobId)} onExpand={() => expandToolCallToStudio(block)} />
+                                        {block.media && (
+                                          isMeshResource(block.media.type, block.media.url) ? (
+                                            <div className="tool-media-result">
+                                              <Mesh3DViewer url={block.media.url} format={guessMeshFormat(block.media.url)} />
+                                            </div>
+                                          ) : (
+                                            <div className="tool-media-result">
+                                              {block.media.type?.startsWith('audio/') && (
+                                                <audio controls autoPlay src={block.media.url} style={{ width: '100%' }} />
+                                              )}
+                                              {block.media.type?.startsWith('image/') && (
+                                                <img src={block.media.url} alt="Generated" className="tool-media-image" />
+                                              )}
+                                              {block.media.type?.startsWith('video/') && (
+                                                <VideoPlayer src={block.media.url} style={{ width: '100%' }} />
+                                              )}
+                                              <button type="button" className="tool-media-download-btn" onClick={() => handleDownloadMedia(block.media.url, block.media.type)} title="Download">
+                                                <Download size={12} /> Download
+                                              </button>
+                                            </div>
+                                          )
+                                        )}
+                                      </>
+                                    )}
+                                  </React.Fragment>
+                                )) : (
+                                  <div className="answer-content">
+                                    {answer ? (
+                                      // No `blocks` on this message — either it predates the
+                                      // blocks refactor (persisted session) or it's a plain
+                                      // content-only message like a studio "welcome" line.
+                                      // Fall back to rendering msg.content directly so those
+                                      // don't silently disappear.
+                                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{answer}</ReactMarkdown>
+                                    ) : msg.loading ? (
+                                      <em style={{ opacity: 0.6, fontSize: '0.85rem', color: '#94a3b8' }}>
+                                        {hadThinkTag ? 'Thinking…' : 'Generating…'}
+                                      </em>
+                                    ) : msg.truncated ? (
+                                      <em style={{ opacity: 0.6, fontSize: '0.85rem', color: '#94a3b8' }}>
+                                        [Model reached output token limit during reasoning — try re-prompting]
+                                      </em>
+                                    ) : null}
+                                  </div>
+                                )}
                               </>
                             );
                           })()
@@ -2497,33 +2865,6 @@ function AppInner() {
                         {msg.attachments?.length > 0 && <div className="chat-attachments">
                           {msg.attachments.map(attachment => <AttachmentPreview key={attachment.dataUrl} attachment={attachment} />)}
                         </div>}
-                        {msg.toolEvents?.map((event, idx) => (
-                          <React.Fragment key={idx}>
-                            <ToolCallChip event={event} onCancel={() => cancelGenerationJob(event.jobId)} />
-                            {event.media && (
-                              isMeshResource(event.media.type, event.media.url) ? (
-                                <div className="tool-media-result">
-                                  <Mesh3DViewer url={event.media.url} format={guessMeshFormat(event.media.url)} />
-                                </div>
-                              ) : (
-                                <div className="tool-media-result">
-                                  {event.media.type?.startsWith('audio/') && (
-                                    <audio controls autoPlay src={event.media.url} style={{ width: '100%' }} />
-                                  )}
-                                  {event.media.type?.startsWith('image/') && (
-                                    <img src={event.media.url} alt="Generated" className="tool-media-image" />
-                                  )}
-                                  {event.media.type?.startsWith('video/') && (
-                                    <video controls src={event.media.url} style={{ width: '100%', borderRadius: '8px' }} />
-                                  )}
-                                  <button type="button" className="tool-media-download-btn" onClick={() => handleDownloadMedia(event.media.url, event.media.type)} title="Download">
-                                    <Download size={12} /> Download
-                                  </button>
-                                </div>
-                              )
-                            )}
-                          </React.Fragment>
-                        ))}
                         {msg.telemetry && (
                           <div className="meta-info">
                             <span className="tag-speed"><Zap size={11} /> {msg.telemetry}</span>
@@ -2563,10 +2904,10 @@ function AppInner() {
                       <Paperclip size={18} />
                     </button>
                     <button className={`btn-toggle-controls ${autopilot ? 'active' : ''}`} onClick={() => setAutopilot(v => !v)} title="Autopilot: let the model pick among compatible models automatically">
-                      <Wand2 size={16} /> Autopilot
+                      <Wand2 size={16} />
                     </button>
                     <button className={`btn-toggle-controls ${reasoningEnabled ? 'active' : ''}`} onClick={() => setReasoningEnabled(v => !v)} title="Reasoning: let the model think before answering">
-                      <Brain size={16} /> Reasoning
+                      <Brain size={16} />
                     </button>
                     <textarea
                       value={inputPrompt}
@@ -2608,7 +2949,14 @@ function AppInner() {
               <div className="card" style={{ background: 'none', border: 'none', padding: 0 }}>
                   <div className="model-cards-grid">
                   {modelCards.map(card => {
-                    const loadedEntry = loadedModels.find(loaded => loaded.model_id === card.loadedModelId);
+                    // Backend model_ids include a load timestamp (mdl-{ts}-{port}), so a
+                    // model reloaded server-side (e.g. the orchestrator stepping aside for
+                    // a run_model call and reloading afterward) gets a fresh id even though
+                    // it's the same file. Fall back to matching by the stable modelPath so
+                    // this card doesn't show "not loaded" for a model that is actually
+                    // loaded under its new id (same pattern as the chat-session resolver).
+                    const loadedEntry = loadedModels.find(loaded => loaded.model_id === card.loadedModelId)
+                      ?? (card.modelPath ? loadedModels.find(loaded => loaded.model_path === card.modelPath) : null);
                     const isLoaded = Boolean(loadedEntry);
                     return (
                       <div key={card.id} className="model-card-item">
@@ -2618,7 +2966,7 @@ function AppInner() {
                             className="btn-remove-card"
                             title="Remove model card"
                             onClick={async () => {
-                              if (isLoaded) await handleUnloadModel(card.loadedModelId);
+                              if (isLoaded) await handleUnloadModel(loadedEntry.model_id);
                               setModelCards(current => current.filter(item => item.id !== card.id));
                             }}
                           >
@@ -2631,9 +2979,9 @@ function AppInner() {
                             <Settings size={14} /> {isLoaded ? 'Settings' : 'Configure'}
                           </button>
                           {isLoaded ? <button className="btn-unload-model" onClick={async () => {
-                            await handleUnloadModel(card.loadedModelId);
+                            await handleUnloadModel(loadedEntry.model_id);
                             setModelCards(current => current.map(item => item.id === card.id ? { ...item, loadedModelId: null } : item));
-                          }} disabled={unloadingModelId === card.loadedModelId}><Power size={14} /> Eject</button>
+                          }} disabled={unloadingModelId === loadedEntry.model_id}><Power size={14} /> Eject</button>
                           : <button className="btn-load-model" onClick={() => loadCardModel(card)} disabled={isLoadingModel}><Zap size={14} /> Load</button>}
                           {isLoaded && <button className="btn-load-model" onClick={() => startStudio(loadedEntry, card)} title="Start studio"><Play size={14} /></button>}
                           <button className="btn-load-model" onClick={() => handleOpenModelFolder(card.modelPath)} title="Open containing folder"><Folder size={14} /> Open Folder</button>
@@ -2695,6 +3043,7 @@ function AppInner() {
                                     mmproj_path: model.mmproj_path || null,
                                     mesh_vae_path: model.mesh_vae_path || null,
                                     mesh_texgen_path: model.mesh_texgen_path || null,
+                                    mesh_components: model.mesh_components || null,
                                     settings: {},
                                   }]);
                                   closeModelPicker();
@@ -3644,7 +3993,7 @@ function AppInner() {
                   </div>
                   <div className="preview-box" style={{ marginTop: '1rem' }}>
                     {videoSrc ? (
-                      <video controls autoPlay src={videoSrc} style={{ width: '100%', borderRadius: '8px' }} />
+                      <VideoPlayer src={videoSrc} autoPlay style={{ width: '100%' }} />
                     ) : (
                       <>
                         <Play size={45} />
@@ -3798,7 +4147,7 @@ function AppInner() {
                 <div className="card">
                   <label>Generated Mesh Output</label>
                   {mesh3dResult ? (
-                    <Mesh3DViewer base64={mesh3dResult.base64} format={mesh3dResult.format} />
+                    <Mesh3DViewer base64={mesh3dResult.base64} url={mesh3dResult.url} format={mesh3dResult.format} />
                   ) : (
                     <div className="preview-box mesh3d-empty-preview">
                       <Boxes size={40} />
@@ -3836,18 +4185,11 @@ function AppInner() {
                   <label className="section-label">Vision projector (mmproj)</label>
                   <div className="mmproj-row">
                     <input className="control-input" value={configTarget?.mmproj_path || ''} onChange={e => setConfigTarget(current => ({ ...current, mmproj_path: e.target.value }))} />
-                    <button className="btn-browse" onClick={() => mmprojInputRef.current?.click()}>Browse</button>
-                    <input
-                      ref={mmprojInputRef}
-                      type="file"
-                      accept=".gguf"
-                      style={{ display: 'none' }}
-                      onChange={e => {
-                        const file = e.target.files[0];
-                        if (file) setConfigTarget(current => ({ ...current, mmproj_path: file.path || '' }));
-                        e.target.value = '';
-                      }}
-                    />
+                    <button className="btn-browse" onClick={async () => {
+                      const defaultPath = configTarget?.model_path ? window.require('path').dirname(configTarget.model_path) : undefined;
+                      const filePath = await browseForFile(defaultPath, [{ name: 'GGUF', extensions: ['gguf'] }]);
+                      if (filePath) setConfigTarget(current => ({ ...current, mmproj_path: filePath }));
+                    }}>Browse</button>
                   </div>
                   <div className="slider-hint">Auto-detected from the model directory. Leave empty if this is not a vision model.</div>
                 </div>
@@ -3969,16 +4311,37 @@ function AppInner() {
               )}
               {cfgCategory === 'mesh3d' && (
                 <>
-                  <div className="sidebar-section">
-                    <label className="section-label">VAE model</label>
-                    <input className="control-input" value={configTarget?.mesh_vae_path || ''} onChange={e => setConfigTarget(current => ({ ...current, mesh_vae_path: e.target.value }))} />
-                    <div className="slider-hint">Auto-detected from model directory. Override to use a different VAE.</div>
-                  </div>
-                  <div className="sidebar-section">
-                    <label className="section-label">Texture / paint model</label>
-                    <input className="control-input" value={configTarget?.mesh_texgen_path || ''} onChange={e => setConfigTarget(current => ({ ...current, mesh_texgen_path: e.target.value }))} />
-                    <div className="slider-hint">Auto-detected from model directory. Override to use a different texture model.</div>
-                  </div>
+                  {configTarget?.mesh_components?.length ? configTarget.mesh_components.map((component, index) => (
+                    <div className="sidebar-section" key={`${component.label}-${index}`}>
+                      <label className="section-label">{component.label}</label>
+                      <div className="mmproj-row">
+                        <input
+                          className="control-input"
+                          value={component.path || ''}
+                          onChange={e => setConfigTarget(current => {
+                            const next = [...current.mesh_components];
+                            next[index] = { ...next[index], path: e.target.value };
+                            return { ...current, mesh_components: next };
+                          })}
+                        />
+                        <button className="btn-browse" onClick={async () => {
+                          const defaultPath = configTarget?.model_path ? window.require('path').dirname(configTarget.model_path) : undefined;
+                          const filePath = await browseForFile(defaultPath, undefined, ['openDirectory']);
+                          if (!filePath) return;
+                          setConfigTarget(current => {
+                            const next = [...current.mesh_components];
+                            next[index] = { ...next[index], path: filePath };
+                            return { ...current, mesh_components: next };
+                          });
+                        }}>Browse</button>
+                      </div>
+                      <div className="slider-hint">Auto-detected from model directory. Override if needed.</div>
+                    </div>
+                  )) : (
+                    <div className="sidebar-section">
+                      <div className="slider-hint">No sibling components detected for this model.</div>
+                    </div>
+                  )}
                   {configTarget?.mesh_input_kinds?.length ? (
                     <div className="sidebar-section">
                       <label className="section-label">Accepted inputs</label>

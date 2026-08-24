@@ -246,6 +246,13 @@ pub struct GenerationProgress {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Handle to the completed media (e.g. `/v1/media/<id>`), set once a job
+    /// finishes successfully and produced output. Mirrors `ToolResult::media_handle`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_handle: Option<String>,
+    /// MIME type of the completed media, e.g. `image/png`. Mirrors `ToolResult::media_type`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
     pub updated_at: u64,
 }
 
