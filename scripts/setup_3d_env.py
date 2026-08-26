@@ -1,7 +1,7 @@
 """
 Builds the dedicated Python 3.11 environment (`.venv-3d/`) that
 `scripts/threed_server.py` runs under for the heavy 3D-generation
-architectures (TripoSR, Hunyuan3D-2, TRELLIS, Stable-Fast-3D). The app's
+architectures (TripoSR, Hunyuan3D-2, TRELLIS, Stable-Fast-3D, VGGT). The app's
 system Python is 3.14, which can't build these packages' native extensions —
 this script fixes that WITHOUT requiring a system-wide Python 3.11 install or
 any ComfyUI runtime: it uses `uv` to fetch a standalone CPython 3.11 and pip
@@ -30,14 +30,17 @@ by `crates/backends/mesh-backend/src/lib.rs`'s `resolve_3d_python()` at
 """
 
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from env_setup_common import ensure_uv, create_venv, uv_pip_install, stage, progress
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 VENV_DIR = PROJECT_ROOT / ".venv-3d"
 VENV_PYTHON = VENV_DIR / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+INSTALL_MARKER = VENV_DIR / ".install_complete"
 
 # torch >= 2.6 is required: diffusers refuses to load pickle (.bin) checkpoints
 # under older torch due to CVE-2025-32434 (torch.load RCE), and several 3D
@@ -68,72 +71,14 @@ def _print_header(title):
     print(f"\n{'=' * 70}\n{title}\n{'=' * 70}")
 
 
-def _run(cmd, cwd=None):
-    print(f"$ {' '.join(str(c) for c in cmd)}")
-    proc = subprocess.run(cmd, cwd=cwd or PROJECT_ROOT)
-    if proc.returncode != 0:
-        raise RuntimeError(f"command exited with status {proc.returncode}")
-
-
-def stage(label):
-    """Decorator-less helper: run `fn()`, record OK/FAILED, never raise."""
-    def _wrap(fn):
-        print(f"\n--- {label} ---")
-        try:
-            fn()
-            STAGE_RESULTS.append((label, True))
-        except Exception as e:
-            print(f"[FAILED] {label}: {e}", file=sys.stderr)
-            STAGE_RESULTS.append((label, False))
-    return _wrap
-
-
-def uv_pip_install(*packages, index_url=None, find_links=None, label=None):
-    cmd = ["uv", "pip", "install", "--python", str(VENV_PYTHON)]
-    if index_url:
-        cmd += ["--index-url", index_url]
-    if find_links:
-        cmd += ["--find-links", find_links]
-    cmd += list(packages)
-    _run(cmd)
-
-
-# ---------------------------------------------------------------------------
-# Stage 0: locate `uv`, create the venv
-# ---------------------------------------------------------------------------
-
-def ensure_uv():
-    uv_path = shutil.which("uv")
-    if uv_path:
-        return uv_path
-    _print_header("`uv` not found")
-    print(
-        "This script needs `uv` (https://github.com/astral-sh/uv) to fetch a\n"
-        "standalone Python 3.11 with no system install required.\n\n"
-        "Install it with:\n"
-        "    pip install uv\n\n"
-        "...then re-run this script. Alternatively, if you already have a\n"
-        "Python 3.11 environment with the needed packages available, point\n"
-        "the daemon at it directly by setting the DISPOS_3D_PYTHON env var to\n"
-        "its python.exe/python path, and skip this script entirely."
-    )
-    sys.exit(1)
-
-
-def create_venv():
-    _print_header(f"Creating {VENV_DIR} (Python 3.11)")
-    _run(["uv", "venv", str(VENV_DIR), "--python", "3.11"])
-    if not VENV_PYTHON.exists():
-        raise RuntimeError(f"venv python not found at expected path: {VENV_PYTHON}")
-
-
 # ---------------------------------------------------------------------------
 # Stage 1: CUDA torch
 # ---------------------------------------------------------------------------
 
 def install_torch():
     uv_pip_install(
-        f"torch=={TORCH_VERSION}", "torchvision", "torchaudio",
+        VENV_PYTHON,
+        [f"torch=={TORCH_VERSION}", "torchvision", "torchaudio"],
         index_url=TORCH_INDEX_URL,
     )
 
@@ -144,9 +89,12 @@ def install_torch():
 
 def install_core_deps():
     uv_pip_install(
-        "diffusers", "trimesh", "transformers", "accelerate", "rembg",
-        "onnxruntime", "numpy<2", "pillow", "scikit-image", "omegaconf",
-        "einops",
+        VENV_PYTHON,
+        [
+            "diffusers", "trimesh", "transformers", "accelerate", "rembg",
+            "onnxruntime", "numpy<2", "pillow", "scikit-image", "omegaconf",
+            "einops",
+        ],
     )
 
 
@@ -167,7 +115,7 @@ def install_native_extensions():
     for pkg in packages:
         print(f"\n  -- native extension: {pkg} --")
         try:
-            uv_pip_install(pkg, find_links=COMFY3D_WHEELS_INDEX)
+            uv_pip_install(VENV_PYTHON, [pkg], find_links=COMFY3D_WHEELS_INDEX)
             STAGE_RESULTS.append((f"native ext: {pkg}", True))
         except Exception as e:
             print(
@@ -185,7 +133,7 @@ def install_native_extensions():
 # ---------------------------------------------------------------------------
 
 def install_triposr():
-    uv_pip_install("git+https://github.com/VAST-AI-Research/TripoSR")
+    uv_pip_install(VENV_PYTHON, ["git+https://github.com/VAST-AI-Research/TripoSR"])
 
 
 def install_sf3d():
@@ -194,11 +142,11 @@ def install_sf3d():
         "GATED — you must `huggingface-cli login` and accept its license on\n"
         "huggingface.co before the model will download at runtime."
     )
-    uv_pip_install("git+https://github.com/Stability-AI/stable-fast-3d")
+    uv_pip_install(VENV_PYTHON, ["git+https://github.com/Stability-AI/stable-fast-3d"])
 
 
 def install_hunyuan3d():
-    uv_pip_install("git+https://github.com/Tencent/Hunyuan3D-2")
+    uv_pip_install(VENV_PYTHON, ["git+https://github.com/Tencent/Hunyuan3D-2"])
 
 
 def install_trellis():
@@ -207,7 +155,15 @@ def install_trellis():
         "prebuilt wheels for its native deps (spconv/nvdiffrast/diffoctreerast) —\n"
         "expect this stage to be the most likely to fail here."
     )
-    uv_pip_install("git+https://github.com/microsoft/TRELLIS")
+    uv_pip_install(VENV_PYTHON, ["git+https://github.com/microsoft/TRELLIS"])
+
+
+def install_vggt():
+    # facebook/vggt-1b's `vggt` package isn't published on PyPI; install from
+    # source. `open3d` provides the Poisson surface reconstruction used to
+    # turn VGGT's predicted point maps into a mesh.
+    uv_pip_install(VENV_PYTHON, ["git+https://github.com/facebookresearch/vggt.git"])
+    uv_pip_install(VENV_PYTHON, ["open3d"])
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +187,7 @@ def check_architectures():
         ("Stable-Fast-3D (SF3D)", "from sf3d.system import SF3D"),
         ("Hunyuan3D-2", "from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline"),
         ("TRELLIS", "from trellis.pipelines import TrellisImageTo3DPipeline"),
+        ("VGGT", "from vggt.models.vggt import VGGT; import open3d"),
     ]
     for label, expr in checks:
         ok = _import_check(expr)
@@ -254,22 +211,35 @@ def print_summary():
     )
 
 
+def _run_stage(label, fn):
+    progress(label, "running")
+    ok = stage(label, STAGE_RESULTS)(fn)
+    progress(label, "done" if ok else "error", message=None if ok else f"{label} failed")
+    return ok
+
+
 def main():
     ensure_uv()
 
     try:
-        create_venv()
+        create_venv(VENV_DIR, python_version="3.11")
     except Exception as e:
         print(f"[FAILED] Could not create {VENV_DIR}: {e}", file=sys.stderr)
         sys.exit(1)
 
-    stage("torch (CUDA)")(install_torch)
-    stage("core deps")(install_core_deps)
-    stage("native extensions (Comfy3D prebuilt wheels)")(install_native_extensions)
-    stage("TripoSR")(install_triposr)
-    stage("Stable-Fast-3D (SF3D)")(install_sf3d)
-    stage("Hunyuan3D-2")(install_hunyuan3d)
-    stage("TRELLIS")(install_trellis)
+    core_ok = True
+    core_ok &= _run_stage("torch (CUDA)", install_torch)
+    core_ok &= _run_stage("core deps", install_core_deps)
+
+    _run_stage("native extensions (Comfy3D prebuilt wheels)", install_native_extensions)
+    _run_stage("TripoSR", install_triposr)
+    _run_stage("Stable-Fast-3D (SF3D)", install_sf3d)
+    _run_stage("Hunyuan3D-2", install_hunyuan3d)
+    _run_stage("TRELLIS", install_trellis)
+    _run_stage("VGGT", install_vggt)
+
+    if core_ok:
+        INSTALL_MARKER.write_text("ok")
 
     check_architectures()
     print_summary()

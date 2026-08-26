@@ -42,6 +42,41 @@ fn next_free_video_port() -> u16 {
 /// download) can be slow to load.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// HF repo LTX-Video's missing pipeline components (for loose single-file
+/// transformer+VAE loading) are pulled from.
+const LTX_BASE_REPO: &str = "Lightricks/LTX-Video";
+
+/// Files needed under `<shared components dir>/text_encoder/`.
+const LTX_TEXT_ENCODER_FILES: &[&str] = &[
+    "config.json",
+    "model.safetensors.index.json",
+    "model-00001-of-00004.safetensors",
+    "model-00002-of-00004.safetensors",
+    "model-00003-of-00004.safetensors",
+    "model-00004-of-00004.safetensors",
+];
+/// Files needed under `<shared components dir>/tokenizer/`.
+const LTX_TOKENIZER_FILES: &[&str] = &["added_tokens.json", "special_tokens_map.json", "spiece.model", "tokenizer_config.json"];
+/// Files needed under `<shared components dir>/scheduler/`.
+const LTX_SCHEDULER_FILES: &[&str] = &["scheduler_config.json"];
+
+/// Resolution status of one LTX-Video pipeline component file (text encoder
+/// shard, tokenizer file, scheduler config), for preview in the model
+/// list/config UI (see `VideoBackend::detect_video_components`). Mirrors
+/// `sd_backend::ImageComponentStatus`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct VideoComponentStatus {
+    /// UI grouping label, e.g. "Text encoder" / "Tokenizer" / "Scheduler".
+    pub group: String,
+    pub kind_name: String,
+    /// Set when an existing file satisfying this component was found.
+    pub resolved_path: Option<String>,
+    /// Set when nothing was found: the directory it should be placed in.
+    pub target_path: Option<String>,
+    /// Set when nothing was found and a known download source exists.
+    pub source: Option<backend_trait::MissingComponentSource>,
+}
+
 pub struct VideoBackend {
     model_path: Option<PathBuf>,
     is_loaded: Arc<AtomicBool>,
@@ -63,6 +98,123 @@ impl VideoBackend {
         }
     }
 
+    /// Resolve the Python interpreter used to run `scripts/video_diffusers_server.py`,
+    /// preferring the project-local `.venv-video` environment (built by
+    /// `scripts/setup_video_env.py`) that houses the heavy video-model deps system
+    /// Python can't build. Resolution order:
+    ///   1. `DISPOS_VIDEO_PYTHON` env var, if it points at an existing file.
+    ///   2. `.venv-video/Scripts/python.exe` (Windows) / `.venv-video/bin/python`
+    ///      (unix), relative to the current working directory.
+    ///   3. Fallback to `"python"` on PATH.
+    fn resolve_video_python() -> PathBuf {
+        if let Ok(custom) = std::env::var("DISPOS_VIDEO_PYTHON") {
+            let path = PathBuf::from(custom);
+            if path.exists() {
+                return path;
+            }
+        }
+
+        let venv_python = if cfg!(windows) {
+            PathBuf::from(".venv-video").join("Scripts").join("python.exe")
+        } else {
+            PathBuf::from(".venv-video").join("bin").join("python")
+        };
+        if venv_python.exists() {
+            return venv_python;
+        }
+
+        PathBuf::from("python")
+    }
+
+    /// Locate DisposAI's `models` directory the same way `daemon-core` and
+    /// `sd-backend` do (`DISPOS_MODELS_DIR` override, then walking up from
+    /// the current/exe directory, then the workspace source tree for dev
+    /// builds).
+    fn resolve_models_root() -> Option<PathBuf> {
+        let mut candidates = Vec::new();
+
+        if let Ok(directory) = std::env::var("DISPOS_MODELS_DIR") {
+            candidates.push(PathBuf::from(directory));
+        }
+        if let Ok(current_dir) = std::env::current_dir() {
+            candidates.extend(current_dir.ancestors().map(|path| path.join("models")));
+        }
+        if let Ok(executable) = std::env::current_exe() {
+            if let Some(parent) = executable.parent() {
+                candidates.extend(parent.ancestors().map(|path| path.join("models")));
+            }
+        }
+        candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../models"));
+
+        candidates.into_iter().find(|directory| directory.is_dir())
+    }
+
+    /// Directory where downloaded LTX-Video pipeline components (text
+    /// encoder/tokenizer/scheduler) are cached, shared across all loose LTX
+    /// checkpoints.
+    fn ltx_shared_components_dir(models_root: &Path) -> PathBuf {
+        models_root.join("_shared_components").join("ltx-video")
+    }
+
+    /// Preview the LTX-Video pipeline components (text encoder, tokenizer,
+    /// scheduler) a loose single-file transformer+VAE checkpoint needs,
+    /// without erroring on anything missing — used by the model list/config
+    /// UI to surface resolved paths (and downloadable sources for anything
+    /// absent) before the user attempts generation. Returns `None` for
+    /// non-LTX models or full pipeline directories, which don't need this.
+    pub fn detect_video_components(model_path: &Path) -> Option<Vec<VideoComponentStatus>> {
+        if model_path.is_dir() {
+            return None;
+        }
+        let filename = model_path.file_name()?.to_str()?.to_ascii_lowercase();
+        if !filename.contains("ltx") {
+            return None;
+        }
+        let ext = model_path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+        if ext != "gguf" && ext != "safetensors" {
+            return None;
+        }
+
+        let models_root = Self::resolve_models_root()?;
+        let components_dir = Self::ltx_shared_components_dir(&models_root);
+
+        let groups: [(&str, &str, &[&str]); 3] = [
+            ("Text encoder", "text_encoder", LTX_TEXT_ENCODER_FILES),
+            ("Tokenizer", "tokenizer", LTX_TOKENIZER_FILES),
+            ("Scheduler", "scheduler", LTX_SCHEDULER_FILES),
+        ];
+
+        let mut statuses = Vec::new();
+        for (group, subdir, files) in groups {
+            let subdir_path = components_dir.join(subdir);
+            for file in files {
+                let local_path = subdir_path.join(file);
+                if local_path.is_file() {
+                    statuses.push(VideoComponentStatus {
+                        group: group.to_string(),
+                        kind_name: (*file).to_string(),
+                        resolved_path: Some(local_path.display().to_string()),
+                        target_path: None,
+                        source: None,
+                    });
+                } else {
+                    statuses.push(VideoComponentStatus {
+                        group: group.to_string(),
+                        kind_name: (*file).to_string(),
+                        resolved_path: None,
+                        target_path: Some(subdir_path.display().to_string()),
+                        source: Some(backend_trait::MissingComponentSource {
+                            repo: LTX_BASE_REPO.to_string(),
+                            filename: format!("{subdir}/{file}"),
+                            target_filename: (*file).to_string(),
+                        }),
+                    });
+                }
+            }
+        }
+        Some(statuses)
+    }
+
     /// Spawn `scripts/video_diffusers_server.py` and block (on a worker
     /// thread) until it prints "READY" on stdout or `STARTUP_TIMEOUT` elapses.
     fn spawn_video_server(model_path: &Path, port: u16) -> Result<Child, String> {
@@ -74,14 +226,20 @@ impl VideoBackend {
             ));
         }
 
-        let mut cmd = Command::new("python");
+        let mut cmd = Command::new(Self::resolve_video_python());
         cmd.arg(&script_path)
             .arg("--model-path")
             .arg(model_path)
             .arg("--port")
-            .arg(port.to_string())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .arg(port.to_string());
+        // Tell the script where to look for locally-downloaded LTX pipeline
+        // components before it falls back to auto-downloading them from HF.
+        // Harmless to pass for non-LTX models; the script only consults it
+        // when loading a loose LTX transformer file.
+        if let Some(models_root) = Self::resolve_models_root() {
+            cmd.arg("--ltx-components-dir").arg(Self::ltx_shared_components_dir(&models_root));
+        }
+        cmd.stdout(Stdio::piped()).stderr(Stdio::inherit());
 
         let mut child = cmd
             .spawn()
@@ -218,6 +376,57 @@ impl VideoBackend {
             updated_at,
         })
     }
+
+    /// Ensure `video_diffusers_server.py` has been spawned for the currently
+    /// loaded model. No-op if a process is already running. Returns
+    /// `BackendError::EnvNotInstalled` if the `.venv-video` environment
+    /// hasn't been set up yet (rather than attempting to spawn against a
+    /// missing interpreter/deps). Unlike the "model path doesn't exist" case
+    /// in `load_model` (an intentional dev-mode simulation fallback), a spawn
+    /// failure for a model that genuinely exists on disk is a hard error:
+    /// silently falling back to simulation mode here would leave
+    /// `is_loaded()` reporting success while `/v1/videos/generations`
+    /// quietly served the tiny placeholder `SIMULATION_MP4` and
+    /// `/v1/videos/schema` 503'd — indistinguishable, from the UI's
+    /// perspective, from a genuinely broken video panel.
+    async fn ensure_process_started(&mut self) -> Result<(), BackendError> {
+        if self.process.is_some() {
+            return Ok(());
+        }
+
+        let model_path = self
+            .model_path
+            .clone()
+            .ok_or(BackendError::ModelNotLoaded)?;
+
+        if !model_path.exists() {
+            // Simulation mode: no real model file to serve, nothing to spawn.
+            return Ok(());
+        }
+
+        let marker = PathBuf::from(".venv-video").join(".install_complete");
+        if !marker.exists() {
+            return Err(BackendError::EnvNotInstalled("video".to_string()));
+        }
+
+        info!("Starting video_diffusers_server.py for: {}", model_path.display());
+        let port = next_free_video_port();
+        let model_path_owned = model_path.clone();
+
+        let child = tokio::task::spawn_blocking(move || Self::spawn_video_server(&model_path_owned, port))
+            .await
+            .map_err(|e| BackendError::LoadError(format!("spawn_blocking join error: {}", e)))?
+            .map_err(|e| {
+                warn!("Could not start the video server for '{}': {}", model_path.display(), e);
+                BackendError::LoadError(format!("Failed to start video_diffusers_server.py: {}", e))
+            })?;
+
+        info!("video_diffusers_server.py ready on port {} (PID: {})", port, child.id());
+        self.process = Some(child);
+        self.port = port;
+
+        Ok(())
+    }
 }
 
 impl Default for VideoBackend {
@@ -287,30 +496,10 @@ impl InferenceBackend for VideoBackend {
             return Ok(());
         }
 
-        info!("Loading diffusers video model: {}", model_path.display());
-        let port = next_free_video_port();
-        let model_path_owned = model_path.to_path_buf();
-
-        // Unlike the "model path doesn't exist" branch above (an intentional
-        // dev-mode simulation fallback), a spawn failure for a model that
-        // genuinely exists on disk must be a hard error. Silently falling
-        // back to simulation mode here previously left `is_loaded()`
-        // reporting success while `/v1/videos/generations` quietly served
-        // the tiny placeholder `SIMULATION_MP4` and `/v1/videos/schema`
-        // 503'd — indistinguishable, from the UI's perspective, from a
-        // genuinely broken video panel.
-        let child = tokio::task::spawn_blocking(move || Self::spawn_video_server(&model_path_owned, port))
-            .await
-            .map_err(|e| BackendError::LoadError(format!("spawn_blocking join error: {}", e)))?
-            .map_err(|e| {
-                warn!("Could not start the video server for '{}': {}", model_path.display(), e);
-                BackendError::LoadError(format!("Failed to start video_diffusers_server.py: {}", e))
-            })?;
-
-        info!("video_diffusers_server.py ready on port {} (PID: {})", port, child.id());
-        self.process = Some(child);
-        self.port = port;
-
+        info!(
+            "Loading diffusers video model: {} (server spawn deferred to first generate)",
+            model_path.display()
+        );
         self.model_path = Some(model_path.to_path_buf());
         self.is_loaded.store(true, Ordering::SeqCst);
 
@@ -336,12 +525,14 @@ impl InferenceBackend for VideoBackend {
     }
 
     async fn generate(
-        &self,
+        &mut self,
         request: InferenceRequest,
     ) -> Result<InferenceResponse, BackendError> {
         if !self.is_loaded() {
             return Err(BackendError::ModelNotLoaded);
         }
+
+        self.ensure_process_started().await?;
 
         let start_time = std::time::Instant::now();
         let params = request.video_params.clone().unwrap_or_default();
@@ -398,7 +589,11 @@ impl InferenceBackend for VideoBackend {
         Self::poll_video_progress(self.port).await
     }
 
-    async fn get_param_schema(&self) -> Option<serde_json::Value> {
+    async fn get_param_schema(&mut self) -> Option<serde_json::Value> {
+        // Schema is static per-pipeline (no GPU load happens until an actual
+        // `generate()` call), so it's safe to spawn video_diffusers_server.py
+        // here rather than waiting for the user to trigger a generation first.
+        let _ = self.ensure_process_started().await;
         if self.process.is_none() {
             // No video_diffusers_server.py running (simulation mode) — no
             // schema source.

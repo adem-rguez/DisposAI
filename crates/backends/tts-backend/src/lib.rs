@@ -53,6 +53,34 @@ impl TtsBackend {
         }
     }
 
+    /// Resolve the Python interpreter used to run the TTS server scripts,
+    /// preferring the project-local `.venv-tts` environment (built by
+    /// `scripts/setup_tts_env.py`) that houses the heavy TTS-model deps system
+    /// Python can't build. Resolution order:
+    ///   1. `DISPOS_TTS_PYTHON` env var, if it points at an existing file.
+    ///   2. `.venv-tts/Scripts/python.exe` (Windows) / `.venv-tts/bin/python`
+    ///      (unix), relative to the current working directory.
+    ///   3. Fallback to `"python"` on PATH.
+    fn resolve_tts_python() -> PathBuf {
+        if let Ok(custom) = std::env::var("DISPOS_TTS_PYTHON") {
+            let path = PathBuf::from(custom);
+            if path.exists() {
+                return path;
+            }
+        }
+
+        let venv_python = if cfg!(windows) {
+            PathBuf::from(".venv-tts").join("Scripts").join("python.exe")
+        } else {
+            PathBuf::from(".venv-tts").join("bin").join("python")
+        };
+        if venv_python.exists() {
+            return venv_python;
+        }
+
+        PathBuf::from("python")
+    }
+
     /// Spawn `scripts/kokoro_tts_server.py` and block (on a worker thread) until
     /// it prints "READY" on stdout or `STARTUP_TIMEOUT` elapses.
     fn spawn_kokoro_server(model_path: &Path, port: u16) -> Result<Child, String> {
@@ -64,7 +92,7 @@ impl TtsBackend {
             ));
         }
 
-        let mut cmd = Command::new("python");
+        let mut cmd = Command::new(Self::resolve_tts_python());
         cmd.arg(&script_path)
             .arg("--model-path")
             .arg(model_path)
@@ -120,7 +148,7 @@ impl TtsBackend {
             ));
         }
 
-        let mut cmd = Command::new("python");
+        let mut cmd = Command::new(Self::resolve_tts_python());
         cmd.arg(&script_path)
             .arg("--model-path")
             .arg(model_path)
@@ -162,6 +190,70 @@ impl TtsBackend {
         }
 
         Ok(child)
+    }
+
+    /// Ensure the appropriate TTS server (`kokoro_tts_server.py` or
+    /// `tts_server.py`, selected via `is_kokoro_model`) has been spawned for
+    /// the currently loaded model. No-op if a process is already running.
+    /// Returns `BackendError::EnvNotInstalled` if the `.venv-tts` environment
+    /// hasn't been set up yet (rather than attempting to spawn against a
+    /// missing interpreter/deps).
+    async fn ensure_process_started(&mut self) -> Result<(), BackendError> {
+        if self.process.is_some() {
+            return Ok(());
+        }
+
+        let model_path = self
+            .model_path
+            .clone()
+            .ok_or(BackendError::ModelNotLoaded)?;
+
+        if !model_path.exists() {
+            // Simulation mode: no real model file to serve, nothing to spawn.
+            return Ok(());
+        }
+
+        let marker = PathBuf::from(".venv-tts").join(".install_complete");
+        if !marker.exists() {
+            return Err(BackendError::EnvNotInstalled("tts".to_string()));
+        }
+
+        let is_kokoro = is_kokoro_model(&model_path);
+        let port = next_free_tts_port();
+        let model_path_owned = model_path.clone();
+
+        let spawn_result = if is_kokoro {
+            tokio::task::spawn_blocking(move || Self::spawn_kokoro_server(&model_path_owned, port))
+                .await
+        } else {
+            tokio::task::spawn_blocking(move || Self::spawn_generic_tts_server(&model_path_owned, port))
+                .await
+        };
+
+        match spawn_result
+            .map_err(|e| BackendError::LoadError(format!("spawn_blocking join error: {}", e)))?
+        {
+            Ok(child) => {
+                let script_name = if is_kokoro { "kokoro_tts_server.py" } else { "tts_server.py" };
+                info!("{} ready on port {} (PID: {})", script_name, port, child.id());
+                self.process = Some(child);
+                self.port = port;
+            }
+            Err(e) => {
+                // The file exists but the server could not serve it (wrong format,
+                // missing dependency, …). Report that instead of quietly serving
+                // placeholder audio that looks like a success.
+                self.process = None;
+                self.is_loaded.store(false, Ordering::SeqCst);
+                return Err(BackendError::LoadError(format!(
+                    "Could not start the TTS server for '{}': {}",
+                    model_path.display(),
+                    e
+                )));
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -259,49 +351,19 @@ impl InferenceBackend for TtsBackend {
 
         let is_kokoro = is_kokoro_model(model_path);
         if is_kokoro {
-            info!("Loading Kokoro TTS model: {}", model_path.display());
+            info!("Loading Kokoro TTS model: {} (server spawn deferred to first generate)", model_path.display());
         } else {
-            info!("Loading generic (transformers) TTS model: {}", model_path.display());
+            info!(
+                "Loading generic (transformers) TTS model: {} (server spawn deferred to first generate)",
+                model_path.display()
+            );
         }
 
-        // Kill any previously running server before spawning a new one.
+        // Kill any previously running server before deciding on the new
+        // model's mode.
         if let Some(mut child) = self.process.take() {
             let _ = child.kill();
             let _ = child.wait();
-        }
-
-        let port = next_free_tts_port();
-        let model_path_owned = model_path.to_path_buf();
-
-        let spawn_result = if is_kokoro {
-            tokio::task::spawn_blocking(move || Self::spawn_kokoro_server(&model_path_owned, port))
-                .await
-        } else {
-            tokio::task::spawn_blocking(move || Self::spawn_generic_tts_server(&model_path_owned, port))
-                .await
-        };
-
-        match spawn_result
-            .map_err(|e| BackendError::LoadError(format!("spawn_blocking join error: {}", e)))?
-        {
-            Ok(child) => {
-                let script_name = if is_kokoro { "kokoro_tts_server.py" } else { "tts_server.py" };
-                info!("{} ready on port {} (PID: {})", script_name, port, child.id());
-                self.process = Some(child);
-                self.port = port;
-            }
-            Err(e) => {
-                // The file exists but the server could not serve it (wrong format,
-                // missing dependency, …). Report that instead of quietly serving
-                // placeholder audio that looks like a success.
-                self.process = None;
-                self.is_loaded.store(false, Ordering::SeqCst);
-                return Err(BackendError::LoadError(format!(
-                    "Could not start the TTS server for '{}': {}",
-                    model_path.display(),
-                    e
-                )));
-            }
         }
 
         self.model_path = Some(model_path.to_path_buf());
@@ -333,12 +395,14 @@ impl InferenceBackend for TtsBackend {
     }
 
     async fn generate(
-        &self,
+        &mut self,
         request: InferenceRequest,
     ) -> Result<InferenceResponse, BackendError> {
         if !self.is_loaded() {
             return Err(BackendError::ModelNotLoaded);
         }
+
+        self.ensure_process_started().await?;
 
         let start_time = std::time::Instant::now();
 

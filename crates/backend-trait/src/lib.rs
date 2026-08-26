@@ -299,6 +299,8 @@ pub enum BackendError {
     UnsupportedModality(Modality),
     #[error("Missing required components")]
     MissingComponents(Vec<MissingComponentInfo>),
+    #[error("Python environment not installed for backend: {0}")]
+    EnvNotInstalled(String),
     #[error("Generation cancelled")]
     Cancelled,
     #[error("Backend dynamic error: {0}")]
@@ -335,7 +337,7 @@ pub trait InferenceBackend: Send + Sync {
 
     /// Run full synchronous inference
     async fn generate(
-        &self,
+        &mut self,
         request: InferenceRequest,
     ) -> Result<InferenceResponse, BackendError>;
 
@@ -354,8 +356,10 @@ pub trait InferenceBackend: Send + Sync {
     /// Fetch adapter parameter schemas (Mesh3D backends only), used to serve
     /// `GET /v1/models3d/schema` so a future UI can build a dynamic parameter
     /// form. Backends without an underlying schema source keep the default
-    /// `None`.
-    async fn get_param_schema(&self) -> Option<serde_json::Value> {
+    /// `None`. `&mut self` because implementations lazily spawn their Python
+    /// subprocess here (schema is otherwise unavailable until the first
+    /// `generate()` call).
+    async fn get_param_schema(&mut self) -> Option<serde_json::Value> {
         None
     }
 }

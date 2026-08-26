@@ -151,7 +151,7 @@ Every modality implements a unified `InferenceBackend` Rust trait with standardi
 ## 📦 Repository Structure
 
 ```
-dispos-ai/
+DisposAI/
 ├── crates/
 │   ├── daemon-core/           # Resident Rust daemon, HTTP Axum router, gRPC, profiler & arbiter
 │   ├── backend-trait/         # Common InferenceBackend trait and modality definitions
@@ -187,28 +187,18 @@ dispos-ai/
 - **NVIDIA GPU** with CUDA drivers (for native hardware acceleration)
 - *(Optional)* Python 3.10+ (for extended 3D mesh generation adapters)
 
-### 1. Build and Run the Dispos Daemon
+### Build and Run
 
 ```bash
 # Clone the repository
 git clone https://github.com/adem-rguez/DisposAI.git
 cd DisposAI
 
-# Build and run the daemon in release mode
-cargo run --release --bin daemon-core
-```
-*The daemon will start listening on `http://0.0.0.0:8080` (HTTP REST & Web Dashboard) and `0.0.0.0:50051` (gRPC).*
-
-### 2. Launch Dispos Studio (Desktop App)
-
-In a separate terminal:
-
-```bash
-cd apps/dispos-studio
+# Install dependencies and launch
 npm install
-npm run start
+npm start
 ```
-*This compiles the React frontend and launches the Electron desktop studio with automatic file watching and hot reloading.*
+*`npm start` builds the Rust daemon and launches Dispos Studio (Electron + React) in one step — no separate `cargo run` required. The daemon listens on `http://0.0.0.0:8080` (HTTP REST & Web Dashboard) and `0.0.0.0:50051` (gRPC).*
 
 ---
 
@@ -340,6 +330,9 @@ main();
 - [x] Kokoro-82M ONNX local Text-to-Speech synthesis
 - [x] Integrated Hugging Face Hub search, smart quantizer recommendation, and download manager
 - [x] Python and TypeScript Client SDKs
+- [x] Whisper.cpp offline speech recognition (ASR)
+- [x] Local text-to-video diffusion pipeline
+- [ ] Embeddings modality & API route
 - [ ] MoE dynamic predictive expert cache CUDA stream prefetching
 - [ ] Speculative decoding automatic draft model pairing
 - [ ] Multi-device LAN heterogeneous VRAM pooling

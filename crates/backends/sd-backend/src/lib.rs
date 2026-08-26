@@ -177,6 +177,34 @@ impl SdBackend {
         None
     }
 
+    /// Resolve the Python interpreter used to run `scripts/diffusers_server.py`,
+    /// preferring the project-local `.venv-sd` environment (built by
+    /// `scripts/setup_sd_env.py`) that houses the heavy image-model deps system
+    /// Python can't build. Resolution order:
+    ///   1. `DISPOS_SD_PYTHON` env var, if it points at an existing file.
+    ///   2. `.venv-sd/Scripts/python.exe` (Windows) / `.venv-sd/bin/python`
+    ///      (unix), relative to the current working directory.
+    ///   3. Fallback to `"python"` on PATH.
+    fn resolve_sd_python() -> PathBuf {
+        if let Ok(custom) = std::env::var("DISPOS_SD_PYTHON") {
+            let path = PathBuf::from(custom);
+            if path.exists() {
+                return path;
+            }
+        }
+
+        let venv_python = if cfg!(windows) {
+            PathBuf::from(".venv-sd").join("Scripts").join("python.exe")
+        } else {
+            PathBuf::from(".venv-sd").join("bin").join("python")
+        };
+        if venv_python.exists() {
+            return venv_python;
+        }
+
+        PathBuf::from("python")
+    }
+
     /// Spawn `scripts/diffusers_server.py` and block (on a worker thread)
     /// until it prints "READY" on stdout or `STARTUP_TIMEOUT` elapses.
     fn spawn_diffusers_server(model_path: &Path, port: u16) -> Result<Child, String> {
@@ -188,7 +216,7 @@ impl SdBackend {
             ));
         }
 
-        let mut cmd = Command::new("python");
+        let mut cmd = Command::new(Self::resolve_sd_python());
         cmd.arg(&script_path)
             .arg("--model-path")
             .arg(model_path)
@@ -869,6 +897,67 @@ impl SdBackend {
             updated_at,
         })
     }
+
+    /// Ensure `diffusers_server.py` has been spawned for the currently loaded
+    /// safetensors/HF-repo model. No-op if a process is already running, if
+    /// the loaded model uses the `sd.exe` (GGUF) path instead, or if the
+    /// backend is in simulation mode. Returns `BackendError::EnvNotInstalled`
+    /// if the `.venv-sd` environment hasn't been set up yet (rather than
+    /// attempting to spawn against a missing interpreter/deps).
+    async fn ensure_process_started(&mut self) -> Result<(), BackendError> {
+        if self.sd_binary.is_some() || self.process.is_some() {
+            return Ok(());
+        }
+
+        let model_path = self
+            .model_path
+            .clone()
+            .ok_or(BackendError::ModelNotLoaded)?;
+
+        if !model_path.exists() {
+            // Simulation mode: no real model file to serve, nothing to spawn.
+            return Ok(());
+        }
+
+        let is_gguf = model_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("gguf"))
+            .unwrap_or(false);
+        if is_gguf {
+            // sd.exe binary wasn't found at load time; stays in simulation mode.
+            return Ok(());
+        }
+
+        let marker = PathBuf::from(".venv-sd").join(".install_complete");
+        if !marker.exists() {
+            return Err(BackendError::EnvNotInstalled("sd".to_string()));
+        }
+
+        info!("Starting diffusers_server.py for: {}", model_path.display());
+        let port = next_free_sd_port();
+        let model_path_owned = model_path.clone();
+
+        match tokio::task::spawn_blocking(move || Self::spawn_diffusers_server(&model_path_owned, port))
+            .await
+            .map_err(|e| BackendError::LoadError(format!("spawn_blocking join error: {}", e)))?
+        {
+            Ok(child) => {
+                info!("diffusers_server.py ready on port {} (PID: {})", port, child.id());
+                self.process = Some(child);
+                self.port = port;
+            }
+            Err(e) => {
+                warn!(
+                    "Could not start the diffusers server for '{}': {}. Falling back to simulation mode.",
+                    model_path.display(),
+                    e
+                );
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl Default for SdBackend {
@@ -961,27 +1050,10 @@ impl InferenceBackend for SdBackend {
                 }
             }
         } else {
-            info!("Loading safetensors/HF-repo Stable Diffusion model: {}", model_path.display());
-            let port = next_free_sd_port();
-            let model_path_owned = model_path.to_path_buf();
-
-            match tokio::task::spawn_blocking(move || Self::spawn_diffusers_server(&model_path_owned, port))
-                .await
-                .map_err(|e| BackendError::LoadError(format!("spawn_blocking join error: {}", e)))?
-            {
-                Ok(child) => {
-                    info!("diffusers_server.py ready on port {} (PID: {})", port, child.id());
-                    self.process = Some(child);
-                    self.port = port;
-                }
-                Err(e) => {
-                    warn!(
-                        "Could not start the diffusers server for '{}': {}. Falling back to simulation mode.",
-                        model_path.display(),
-                        e
-                    );
-                }
-            }
+            info!(
+                "Loading safetensors/HF-repo Stable Diffusion model: {} (server spawn deferred to first generate)",
+                model_path.display()
+            );
         }
 
         self.model_path = Some(model_path.to_path_buf());
@@ -1010,12 +1082,14 @@ impl InferenceBackend for SdBackend {
     }
 
     async fn generate(
-        &self,
+        &mut self,
         request: InferenceRequest,
     ) -> Result<InferenceResponse, BackendError> {
         if !self.is_loaded() {
             return Err(BackendError::ModelNotLoaded);
         }
+
+        self.ensure_process_started().await?;
 
         let start_time = std::time::Instant::now();
         let params = request.image_params.clone().unwrap_or_default();

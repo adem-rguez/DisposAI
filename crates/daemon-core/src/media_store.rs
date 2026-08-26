@@ -54,6 +54,14 @@ pub async fn latest_asset_of_modality(
         .cloned()
 }
 
+/// Drop all tracked assets for a conversation. Used when a user edits and
+/// resends an earlier message: assets aren't tracked per-turn, so we can't
+/// selectively discard only the ones generated after the edit point — clear
+/// the whole bucket instead.
+pub async fn clear_conversation_assets(registry: &GeneratedAssetRegistry, conversation_id: &str) {
+    registry.lock().await.remove(conversation_id);
+}
+
 /// Remove assets past their TTL and drop conversations left with none. Mirrors
 /// `MediaStore::cleanup_expired`'s sweep pattern.
 pub async fn cleanup_expired_assets(registry: &GeneratedAssetRegistry) {

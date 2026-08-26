@@ -210,7 +210,7 @@ impl InferenceBackend for LlamaBackend {
     }
 
     async fn generate(
-        &self,
+        &mut self,
         request: InferenceRequest,
     ) -> Result<InferenceResponse, BackendError> {
         if !self.is_loaded() {

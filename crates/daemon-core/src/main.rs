@@ -143,6 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         studio_models: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         hf_token: Arc::new(tokio::sync::Mutex::new(None)),
         generated_assets: generated_assets.clone(),
+        install_progress: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
     };
     let app = http::create_router(http_state);
     let http_addr: SocketAddr = "0.0.0.0:8080".parse()?;

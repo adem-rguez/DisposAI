@@ -2,14 +2,15 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   MessageSquare, Sparkles, Volume2, Video,
   Cpu, HardDrive, Zap, Send, Play, Image, FileAudio, RefreshCw,
-  Brain, ChevronDown, ChevronRight, Sliders, Folder, Power, Layers, Settings,
+  Brain, ChevronDown, ChevronRight, ChevronLeft, Sliders, Folder, Power, Layers, Settings,
   CheckCircle2, XCircle, PackagePlus, Box, Boxes, Paperclip, X, Pencil,
-  Search, Download, Globe, Loader, Check, Heart, Wand2, ArrowUpRight, Trash2, Square, Pause
+  Search, Download, Globe, Loader, Check, Heart, Wand2, ArrowUpRight, Trash2, Square, Pause, Plus, Copy
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import Mesh3DViewer, { isMeshResource, guessMeshFormat } from './Mesh3DViewer';
 import { ErrorLogProvider, ErrorToasts, useErrorLog } from './ErrorLog';
+import disposLogo from './assets/dispos_logo.png';
 import './App.css';
 
 async function browseForFile(defaultPath, filters, properties) {
@@ -188,6 +189,13 @@ function canonicalStudioKey(modelPath, modelName) {
   return cleaned || raw;
 }
 
+// A chat session's "last modified" time: bumped on every message write
+// (see syncMessages), falling back to createdAt for sessions that haven't
+// had one yet.
+function chatLastModified(chat) {
+  return chat.updatedAt ?? chat.createdAt ?? 0;
+}
+
 // Mirrors `select_adapter()` / `ADAPTER_REGISTRY` in scripts/threed_server.py:
 // same match-token precedence (first match wins, "cube-placeholder" is the
 // fallback), kept in sync manually since the Python side is the source of
@@ -199,6 +207,7 @@ const MESH3D_ADAPTER_MATCH_ORDER = [
   { id: 'shap-e', tokens: ['shap-e', 'shap_e', 'shape'] },
   { id: 'triposr', tokens: ['triposr', 'tripo'] },
   { id: 'stable-fast-3d', tokens: ['sf3d', 'stable-fast-3d', 'stable_fast_3d'] },
+  { id: 'vggt', tokens: ['vggt', 'vggt-1b', 'vggt_1b'] },
   { id: 'cube-placeholder', tokens: ['instantmesh', 'instant-mesh', 'instant_mesh'] },
   { id: 'trellis', tokens: ['trellis'] },
   { id: 'hunyuan3d', tokens: ['hunyuan3d', 'hunyuan-3d', 'hunyuan_3d'] },
@@ -349,6 +358,60 @@ function AttachmentPreview({ attachment }) {
     return <Mesh3DViewer base64={attachment.dataUrl} format={guessMeshFormat(attachment.name)} />;
   }
   return <a className="chat-attachment-file" href={attachment.dataUrl} download={attachment.name}>{attachment.name}</a>;
+}
+
+function CopyMessageButton({ text }) {
+  const [copied, setCopied] = useState(false);
+  const handleCopy = () => {
+    navigator.clipboard.writeText(text || '');
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  };
+  return (
+    <button type="button" className="copy-msg-btn" onClick={handleCopy} title={copied ? 'Copied!' : 'Copy message'}>
+      {copied ? <Check size={13} /> : <Copy size={13} />}
+    </button>
+  );
+}
+
+// Icon shown for a studio row when the sidebar is folded. Reuses the same
+// per-author avatar endpoint/cache as the HF catalog (see hf-author-avatar
+// usage in the Discover tab below); the author is guessed from the model
+// path. Local downloads are NOT stored under a nested author/repo tree —
+// sanitize_repo_id() in http.rs flattens "org/repo" into a single folder
+// named "<author>_<repo>" (e.g. models/cstr_kokoro-82m-GGUF/file.gguf, or
+// models/VAST-AI_TripoSG/ for a collapsed HF model directory per
+// hf_model_dir_entry). So the author is the part of that one folder name
+// before the first underscore, not a separate path segment.
+// Falls back to a plain Box icon when there's no plausible author segment
+// or the avatar fails to load (unknown author, no network, etc).
+function StudioAvatarIcon({ modelPath, size = 26 }) {
+  const [failed, setFailed] = useState(false);
+  const parts = (modelPath || '').replace(/\\/g, '/').split('/').filter(Boolean);
+  const isFile = /\.[A-Za-z0-9]+$/.test(parts[parts.length - 1] || '');
+  const folderName = isFile ? parts[parts.length - 2] : parts[parts.length - 1];
+  const author = folderName ? folderName.split('_')[0] : null;
+  if (!author || failed) return <Box size={size} />;
+  return (
+    <img
+      className="hf-author-avatar sidebar-fold-avatar"
+      style={{ width: size, height: size }}
+      src={`http://127.0.0.1:8080/v1/model/hf-avatar?author=${encodeURIComponent(author)}&v=2`}
+      alt=""
+      onError={() => setFailed(true)}
+    />
+  );
+}
+
+// Renders the model-status-strip indicator for one of 4 states: 'online'
+// (green, loaded & running), 'loading' (amber, load request in-flight),
+// 'idle' (red dot, selected for this studio but not loaded), or 'missing'
+// (red X, the selected model no longer exists in the catalog). A null state
+// (no model associated at all) uses the neutral base dot — amber is reserved
+// for 'loading' so the two can't be confused.
+function StatusDot({ state }) {
+  if (state === 'missing') return <div className="status-dot-lg missing"><XCircle size={12} /></div>;
+  return <div className={state ? `status-dot-lg ${state}` : 'status-dot-lg'}></div>;
 }
 
 // Mirrors crates/daemon-core/src/task_tags.rs::backend_category_for_tags priority
@@ -528,7 +591,9 @@ function AppInner() {
   const [inputPrompt, setInputPrompt] = useState('');
   const [attachments, setAttachments] = useState([]);
   const [pendingModelChoice, setPendingModelChoice] = useState(null);
+  const [editingMsgId, setEditingMsgId] = useState(null);
   const attachmentInputRef = useRef(null);
+  const composerTextareaRef = useRef(null);
   const [isGenerating, setIsGenerating] = useState(false);
   const defaultAppSettings = {
     autoSelectNewest: true,
@@ -645,10 +710,11 @@ function AppInner() {
   const [contextSize, setContextSize] = useState(4096);
   const [temperature, setTemperature] = useState(0.7);
   const [topP, setTopP] = useState(0.9);
+  const [systemPrompt, setSystemPrompt] = useState('');
   // Multi-model state
   const [loadedModels, setLoadedModels] = useState([]); // array of LoadedModelEntry from backend
   const [selectedModelId, setSelectedModelId] = useState(null); // which model chat uses
-  const [openStudios, setOpenStudios] = useState([]); // { modelId, name, task_tags }
+  const [openStudios, setOpenStudios] = useState([]); // { modelId, name, task_tags, modelPath }
   const [chatSessions, setChatSessions] = useState(() => {
     try {
       const stored = JSON.parse(localStorage.getItem('dispos.chat-sessions'));
@@ -690,6 +756,13 @@ function AppInner() {
   const [collapsedStudios, setCollapsedStudios] = useState(() => {
     try { return JSON.parse(localStorage.getItem('dispos.studio-collapsed')) ?? {}; } catch { return {}; }
   });
+  // Whole-sidebar fold state (icon-only rail vs full labeled view).
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('dispos.sidebar-collapsed')) ?? false; } catch { return false; }
+  });
+  useEffect(() => {
+    localStorage.setItem('dispos.sidebar-collapsed', JSON.stringify(sidebarCollapsed));
+  }, [sidebarCollapsed]);
   const [editingSessionId, setEditingSessionId] = useState(null);
   const [editValue, setEditValue] = useState('');
   const [pendingDeleteId, setPendingDeleteId] = useState(null);
@@ -793,6 +866,8 @@ function AppInner() {
 
   const [configTarget, setConfigTarget] = useState(null);
   const [isLoadingModel, setIsLoadingModel] = useState(false);
+  const [loadingModelPath, setLoadingModelPath] = useState(null); // model_path currently in-flight for /v1/model/load, drives the "loading" status dot
+  const [installProgress, setInstallProgress] = useState(null); // active backend Python env install (auto-triggered by envNotInstalled), or null when idle; only one install runs at a time
   const [unloadingModelId, setUnloadingModelId] = useState(null);
   const [modelFitPreview, setModelFitPreview] = useState(null);
   const [detectedModels, setDetectedModels] = useState([]);
@@ -1164,6 +1239,7 @@ function AppInner() {
       max_context_size: maxContextSize,
       temperature: s.temperature ?? 0.7,
       top_p: s.top_p ?? 0.9,
+      system_prompt: s.system_prompt ?? '',
       steps: s.steps,
       cfg_scale: s.cfg_scale,
       width: s.width,
@@ -1183,6 +1259,8 @@ function AppInner() {
         ...(s.mesh_texgen_path || card.mesh_texgen_path ? [{ label: 'Texture/Paint', path: s.mesh_texgen_path || card.mesh_texgen_path }] : []),
       ],
       image_components: detectedModels.find(m => m.path === card.modelPath)?.image_components || null,
+      video_components: detectedModels.find(m => m.path === card.modelPath)?.video_components || null,
+      vae_path: s.vae_path || card.vae_path || detectedModels.find(m => m.path === card.modelPath)?.vae_path || '',
     });
   };
 
@@ -1200,10 +1278,32 @@ function AppInner() {
         // Same auto-select, kept independent of selectedModelId so opening a
         // studio (which claims selectedModelId for that model) never leaves
         // the orchestrator's own chat requests pointed at the wrong model.
-        if (data.length > 0 && !orchestratorModelId) {
-          setOrchestratorModelId(data[0].model_id);
+        // Scoped to category "chat" — previously this grabbed data[0]
+        // unconditionally, so if a non-chat model (image/video/etc.) happened
+        // to be first in the daemon's list, the orchestrator (and the Chat
+        // Studio status strip's no-session fallback, which reads
+        // orchestratorModelId) would silently point at the wrong modality's
+        // model instead of showing "No Model Loaded".
+        // Re-point whenever the currently-tracked model has fallen out of
+        // loadedModels (unloaded, or replaced by a reload that issued a new
+        // timestamped model_id) — not just when orchestratorModelId was never
+        // set. Previously this only assigned on the very first successful
+        // fetch (`!orchestratorModelId`), so once set it never updated again:
+        // if a second chat model was loaded, then the *tracked* one got
+        // unloaded (a common flow once the orchestrator itself starts
+        // swapping models via run_model), orchestratorModelId kept pointing
+        // at the now-gone model_id forever — data.find() always finding some
+        // *other* chat model doesn't help since the id it looks up by no
+        // longer exists in loadedModels, so activeChatLoaded/activeChatStudio
+        // permanently read null and the orchestrator's own status strip blanked
+        // out until every last chat model happened to be unloaded at once.
+        const firstChatModel = data.find(model => categoryForTags(model.task_tags) === 'chat');
+        const trackedStillLoaded = orchestratorModelId && data.some(model => model.model_id === orchestratorModelId);
+        if (firstChatModel && !trackedStillLoaded) {
+          setOrchestratorModelId(firstChatModel.model_id);
+        } else if (!firstChatModel) {
+          setOrchestratorModelId(null);
         }
-        if (data.length === 0) setOrchestratorModelId(null);
       }
     } catch {}
   }, [selectedModelId, orchestratorModelId]);
@@ -1211,6 +1311,7 @@ function AppInner() {
   const handleLoadModel = async (configuration = configTarget) => {
     if (!configuration?.model_path?.trim() || isLoadingModel) return;
     setIsLoadingModel(true);
+    setLoadingModelPath(configuration.model_path);
     try {
       const res = await fetch('http://127.0.0.1:8080/v1/model/load', {
         method: 'POST',
@@ -1239,7 +1340,47 @@ function AppInner() {
       return null;
     } finally {
       setIsLoadingModel(false);
+      setLoadingModelPath(null);
     }
+  };
+
+  // Auto-triggered when a generation call fails with envNotInstalled (the
+  // backend's lazily-spawned Python subprocess is missing deps). Kicks off
+  // the backend's Python env install, polls its status every 200ms (same
+  // convention as runGenerationJob) while it's running, and stops polling
+  // once it lands on complete/error. On complete, calls `onInstalled` (if
+  // given) to retry the original operation exactly once; on error, surfaces
+  // the failure via pushError instead of retrying.
+  const installEnvAndRetry = async (backend, onInstalled) => {
+    try {
+      const res = await fetch(`http://127.0.0.1:8080/v1/env/install/${backend}`, { method: 'POST' });
+      setInstallProgress(res.ok ? await res.json() : { backend, status: 'running', phase: 'Starting install...', step: 0, total: 0, percent: -1 });
+    } catch (err) {
+      pushError('Failed to start environment install: ' + err.message);
+      return null;
+    }
+    return new Promise((resolve) => {
+      const interval = setInterval(() => {
+        fetch(`http://127.0.0.1:8080/v1/env/install/${backend}/status`)
+          .then(res => (res.ok ? res.json() : null))
+          .then(async record => {
+            if (!record) return;
+            if (record.status !== 'complete' && record.status !== 'error') {
+              setInstallProgress(record);
+              return;
+            }
+            clearInterval(interval);
+            setInstallProgress(null);
+            if (record.status === 'complete') {
+              resolve(onInstalled ? await onInstalled() : null);
+            } else {
+              pushError('Environment install failed: ' + (record.message || 'unknown error'));
+              resolve(null);
+            }
+          })
+          .catch(() => {});
+      }, 200);
+    });
   };
 
   // Seed the relevant studio's live controls from the model's configured
@@ -1251,6 +1392,7 @@ function AppInner() {
       case 'chat':
         setTemperature(cfg.temperature ?? 0.7);
         setTopP(cfg.top_p ?? 0.9);
+        setSystemPrompt(cfg.system_prompt ?? '');
         break;
       case 'image':
         setImgSteps(cfg.steps ?? 25);
@@ -1309,7 +1451,9 @@ function AppInner() {
       });
       if (res.ok) {
         await fetchLoadedModels();
-        setOpenStudios(current => current.filter(studio => studio.modelId !== modelId));
+        // Keep the openStudios entry after unload (don't drop it) — the
+        // status strip needs to keep showing this studio's associated model
+        // name with an "idle" dot rather than reverting to "no model".
         if (selectedModelId === modelId) {
           setSelectedModelId(null);
         }
@@ -1382,10 +1526,71 @@ function AppInner() {
     const studio = category === 'tts' ? 'audio' : category === 'audio' ? 'transcribe' : category;
     setActiveTab(['chat', 'image', 'audio', 'transcribe', 'video', 'mesh3d', 'embeddings'].includes(studio) ? studio : 'chat');
   };
+  // Resolves the 4-state status-strip dot for a studio: 'online' (loaded &
+  // running), 'loading' (a /v1/model/load request is in-flight for this exact
+  // model path), 'idle' (selected for this studio but not currently loaded),
+  // or 'missing' (the selected model no longer exists in the catalog).
+  const modelDotState = (studio, loaded) => {
+    if (loaded) return 'online';
+    if (!studio) return null;
+    if (studio.modelPath && isLoadingModel && loadingModelPath === studio.modelPath) return 'loading';
+    return detectedModels.some(model => model.path === studio.modelPath) ? 'idle' : 'missing';
+  };
+
+  // The Chat Studio status strip must track whatever transcript is actually
+  // on screen — the active chat session if one is selected, or the
+  // orchestrator's own model when no session is (activeChatId === null),
+  // exactly mirroring the `displayedMessages` logic above. Previously this
+  // was derived from `openStudios` (the most recently *opened* studio),
+  // which went stale/blank the moment the user switched to a different
+  // session or back to the orchestrator via the sidebar — openChatSession
+  // only ever calls setActiveChatId/openModelStudio, it never touches
+  // openStudios, so the strip kept showing whatever studio was opened last
+  // instead of the session currently being viewed.
+  const activeChatSession = activeChatId ? (chatSessions.find(session => session.id === activeChatId) ?? null) : null;
+
+  // Which model a studio "belongs to", for its status strip. The sidebar
+  // STUDIOS list is built from `chatSessions`, which is persisted to
+  // localStorage and holds an entry for every modality (startStudio creates
+  // one whatever the category) — so that, not `openStudios` (a plain
+  // useState that starts empty again on every launch), is what survives an
+  // app restart. Resolving only against openStudios/loadedModels meant a
+  // studio whose model isn't currently loaded read "No Model Loaded" until
+  // the user loaded it by hand, even though the sidebar was still listing
+  // it. Priority: the session actually on screen, then a studio opened this
+  // run, then anything of that category currently running, then the most
+  // recently used remembered session — so a cold start still names its model
+  // and shows an idle dot instead of blanking out.
+  const studioForCategory = (category) => {
+    const matches = (tags) => categoryForTags(tags) === category;
+    const source = (activeChatSession && matches(activeChatSession.task_tags) ? activeChatSession : null)
+      ?? [...openStudios].reverse().find(studio => matches(studio.task_tags))
+      ?? loadedModels.find(model => matches(model.task_tags))
+      ?? [...chatSessions].sort((a, b) => chatLastModified(b) - chatLastModified(a)).find(session => matches(session.task_tags));
+    if (!source) return undefined;
+    return {
+      modelId: source.modelId ?? source.model_id,
+      name: source.modelName ?? source.name ?? source.model_path?.split('\\').pop() ?? 'Local model',
+      task_tags: source.task_tags,
+      modelPath: source.modelPath ?? source.model_path,
+    };
+  };
+
+  const activeChatLoaded = activeChatSession
+    ? (loadedModels.find(model => model.model_id === activeChatSession.modelId) ?? loadedModels.find(model => model.model_path === activeChatSession.modelPath))
+    : (orchestratorModelId ? loadedModels.find(model => model.model_id === orchestratorModelId) : null);
+  const activeChatStudio = activeChatSession
+    ? { modelId: activeChatSession.modelId, name: activeChatSession.modelName, task_tags: activeChatSession.task_tags, modelPath: activeChatSession.modelPath }
+    : (activeChatLoaded
+        ? { modelId: activeChatLoaded.model_id, name: activeChatLoaded.model_path?.split('\\').pop(), task_tags: activeChatLoaded.task_tags, modelPath: activeChatLoaded.model_path }
+        : studioForCategory('chat'));
+
   // Most recently opened loaded model with category "mesh3d" drives which
   // input kinds the 3D Model Studio panel adapts to.
-  const activeMesh3dStudio = openStudios.filter(studio => categoryForTags(studio.task_tags) === 'mesh3d').slice(-1)[0];
-  const activeMesh3dLoaded = activeMesh3dStudio ? loadedModels.find(model => model.model_id === activeMesh3dStudio.modelId) : null;
+  const activeMesh3dStudio = studioForCategory('mesh3d');
+  const activeMesh3dLoaded = activeMesh3dStudio
+    ? (loadedModels.find(model => model.model_id === activeMesh3dStudio.modelId) ?? loadedModels.find(model => model.model_path === activeMesh3dStudio.modelPath))
+    : null;
   const activeMesh3dCatalog = activeMesh3dLoaded ? detectedModels.find(model => model.path === activeMesh3dLoaded.model_path) : null;
   const mesh3dAvailableKinds = activeMesh3dLoaded?.mesh_input_kinds?.length
     ? activeMesh3dLoaded.mesh_input_kinds
@@ -1421,13 +1626,42 @@ function AppInner() {
 
   // Most recently opened loaded model with category "image" drives whether
   // the Image Studio panel exposes the optional reference-image (img2img) UI.
-  const activeImageStudio = openStudios.filter(studio => categoryForTags(studio.task_tags) === 'image').slice(-1)[0];
+  const activeImageStudio = studioForCategory('image');
+  const activeImageLoaded = activeImageStudio
+    ? (loadedModels.find(model => model.model_id === activeImageStudio.modelId) ?? loadedModels.find(model => model.model_path === activeImageStudio.modelPath))
+    : null;
   const imageStudioSupportsImg2Img = !!activeImageStudio?.task_tags?.includes('image-to-image');
 
   // Most recently opened loaded model with category "video" drives the
   // Video Studio panel's dynamic param schema.
-  const activeVideoStudio = openStudios.filter(studio => categoryForTags(studio.task_tags) === 'video').slice(-1)[0];
-  const activeVideoLoaded = activeVideoStudio ? loadedModels.find(model => model.model_id === activeVideoStudio.modelId) : null;
+  const activeVideoStudio = studioForCategory('video');
+  const activeVideoLoaded = activeVideoStudio
+    ? (loadedModels.find(model => model.model_id === activeVideoStudio.modelId) ?? loadedModels.find(model => model.model_path === activeVideoStudio.modelPath))
+    : null;
+
+  // Most recently opened loaded model with category "tts"/"audio" (ASR) —
+  // same openStudios + categoryForTags mechanism as image/video/mesh3d above.
+  const activeTtsStudio = studioForCategory('tts');
+  const activeTtsLoaded = activeTtsStudio
+    ? (loadedModels.find(model => model.model_id === activeTtsStudio.modelId) ?? loadedModels.find(model => model.model_path === activeTtsStudio.modelPath))
+    : null;
+  const activeAsrStudio = studioForCategory('audio');
+  const activeAsrLoaded = activeAsrStudio
+    ? (loadedModels.find(model => model.model_id === activeAsrStudio.modelId) ?? loadedModels.find(model => model.model_path === activeAsrStudio.modelPath))
+    : null;
+
+  // Embeddings has no "opened studio" of its own — it uses the explicit
+  // model picker below, defaulting to the first loaded chat model. Both
+  // branches are already scoped to category "chat" so this never leaks a
+  // model from another modality.
+  const activeEmbedLoaded = embedModelId
+    ? loadedModels.find(model => model.model_id === embedModelId)
+    : loadedModels.find(model => categoryForTags(model.task_tags) === 'chat');
+  // embedModelId can go stale (its model was unloaded elsewhere) without a
+  // matching loadedModels entry to recover a path/name from — fall back to
+  // showing the raw id so the strip still names a model instead of going
+  // blank, with an "idle" dot since we can't verify catalog presence by id.
+  const activeEmbedDotState = activeEmbedLoaded ? 'online' : (embedModelId ? 'idle' : null);
 
   // Param schema reflecting what the loaded video pipeline's `__call__`
   // actually accepts, so the panel renders fields like height/width/
@@ -1468,14 +1702,20 @@ function AppInner() {
     const chatId = `chat-${Date.now()}`;
     const initialMessages = [{ id: 'welcome', role: 'assistant', content: `Ready to use ${modelName}.`, telemetry: null }];
     setSelectedModelId(loadedEntry.model_id);
-    setOpenStudios(current => current.some(studio => studio.modelId === loadedEntry.model_id)
-      ? current
-      : [...current, {
-          modelId: loadedEntry.model_id,
-          name: modelName,
-          task_tags,
-        }]);
-    const session = { id: chatId, title: 'New chat', modelId: loadedEntry.model_id, modelPath: loadedEntry.model_path, modelName, task_tags, studioKey: canonicalStudioKey(loadedEntry.model_path, modelName), messages: initialMessages, createdAt: Date.now() };
+    setOpenStudios(current => {
+      // Dedupe by model_path (not model_id) — backend model_ids carry a load
+      // timestamp, so a re-loaded model gets a fresh id and would otherwise
+      // create a duplicate status-strip entry for the same physical model.
+      const idx = current.findIndex(studio => studio.modelPath && studio.modelPath === loadedEntry.model_path);
+      const entry = { modelId: loadedEntry.model_id, name: modelName, task_tags, modelPath: loadedEntry.model_path };
+      if (idx >= 0) {
+        const next = [...current];
+        next[idx] = entry;
+        return next;
+      }
+      return [...current, entry];
+    });
+    const session = { id: chatId, title: 'New chat', modelId: loadedEntry.model_id, modelPath: loadedEntry.model_path, modelName, task_tags, studioKey: canonicalStudioKey(loadedEntry.model_path, modelName), messages: initialMessages, createdAt: Date.now(), updatedAt: Date.now() };
     setChatSessions(current => [...current, session]);
     setActiveChatId(chatId);
     openModelStudio({ task_tags });
@@ -1504,9 +1744,16 @@ function AppInner() {
     const tab = category === 'tts' ? 'audio' : category === 'audio' ? 'transcribe' : category;
     const resolvedModelPath = loadedModel?.model_path ?? catalogModel?.path;
     if (loadedModel) {
-      setOpenStudios(current => current.some(s => s.modelId === loadedModel.model_id)
-        ? current
-        : [...current, { modelId: loadedModel.model_id, name: catalogModel?.name ?? modelName, task_tags }]);
+      setOpenStudios(current => {
+        const idx = current.findIndex(s => s.modelPath && s.modelPath === loadedModel.model_path);
+        const entry = { modelId: loadedModel.model_id, name: catalogModel?.name ?? modelName, task_tags, modelPath: loadedModel.model_path };
+        if (idx >= 0) {
+          const next = [...current];
+          next[idx] = entry;
+          return next;
+        }
+        return [...current, entry];
+      });
     }
     // Mirror startStudio's session-creation pattern so the model shows up in
     // the sidebar STUDIOS list, even if loadedModels hasn't caught up yet
@@ -1530,6 +1777,7 @@ function AppInner() {
           studioKey,
           messages: [{ id: 'welcome', role: 'assistant', content: `Expanded from the orchestrator (prompt: "${event.arguments?.prompt ?? ''}").`, telemetry: null }],
           createdAt: Date.now(),
+          updatedAt: Date.now(),
         };
         setChatSessions(current => [...current, newSession]);
         setActiveChatId(newSession.id);
@@ -1591,30 +1839,47 @@ function AppInner() {
     const apply = (previous) => (typeof updater === 'function' ? updater(previous) : updater);
     if (targetId) {
       setChatSessions(current => current.map(session =>
-        session.id === targetId ? { ...session, messages: apply(session.messages ?? []) } : session));
+        session.id === targetId ? { ...session, messages: apply(session.messages ?? []), updatedAt: Date.now() } : session));
     } else {
       setOrchestratorMessages(apply);
     }
   };
-  const generateChatTitle = async (sessionId, prompt) => {
+  const generateChatTitle = async (sessionId, prompt, sessionModelPath, sessionModelId) => {
     try {
       const response = await fetch('http://127.0.0.1:8080/v1/chat/completions/stream', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: modelPath, model_id: selectedModelId, max_tokens: 16, temperature: 0.2, messages: [{ role: 'user', content: `Give this chat a concise 3-6 word title. Return only the title. Topic: ${prompt}` }] }),
+        // enable_thinking: false is required here — otherwise the backend
+        // defaults to reasoning mode on, and max_tokens is too small to get
+        // past the <think> phase into any delta.content, leaving title empty.
+        body: JSON.stringify({ model: sessionModelPath, model_id: sessionModelId, max_tokens: 16, temperature: 0.2, enable_thinking: false, enable_tools: false, messages: [{ role: 'user', content: `Summarize the message below as a short label of 3-6 words. No punctuation, no quotes, no explanation.\n\nMessage: hello\nLabel: Casual Greeting\n\nMessage: ${prompt}\nLabel:` }] }),
       });
       if (!response.body) return;
       const reader = response.body.getReader(); const decoder = new TextDecoder(); let title = '';
       while (true) { const { done, value } = await reader.read(); if (done) break; for (const line of decoder.decode(value, { stream: true }).split('\n')) { try { const raw = line.replace(/^data:\s*/, ''); if (raw && raw !== '[DONE]') title += JSON.parse(raw)?.choices?.[0]?.delta?.content ?? ''; } catch {} } }
-      title = title.replace(/[\n#*_`]/g, ' ').trim().slice(0, 64);
+      // Some small local models echo meta-words from the instruction (e.g.
+      // "chat"/"title"/"label") or restate a "Label:"-style prefix instead of
+      // just answering — strip those known leakage patterns.
+      title = title.replace(/[\n#*_`]/g, ' ').trim()
+        .replace(/^["'“”‘’]+|["'“”‘’]+$/g, '')
+        .replace(/^(chat\s+)?title\s*:\s*/i, '')
+        .replace(/^(topic|label)\s*:\s*/i, '')
+        .trim()
+        .replace(/^(chat|title|label)(\s+(chat|title|label))*\s+/i, '')
+        .replace(/\s+(chat|title|label)(\s+(chat|title|label))*$/i, '')
+        .trim()
+        .slice(0, 64);
       if (title) setChatSessions(current => current.map(session => session.id === sessionId ? { ...session, title } : session));
     } catch {}
   };
-  const activeLoadedModel = loadedModels[0] ?? null;
+  // Was `loadedModels[0] ?? null` — that leaked whichever model happened to
+  // load first regardless of modality. Scoped to activeChatLoaded (chat
+  // category only) so the Chat Studio strip never shows another modality's
+  // model.
   const modelStatus = {
-    is_loaded: Boolean(activeLoadedModel),
-    model_path: activeLoadedModel?.model_path,
-    gpu_layers: activeLoadedModel?.gpu_layers,
-    context_size: activeLoadedModel?.context_size,
+    is_loaded: Boolean(activeChatLoaded),
+    model_path: activeChatLoaded?.model_path,
+    gpu_layers: activeChatLoaded?.gpu_layers,
+    context_size: activeChatLoaded?.context_size,
   };
 
 
@@ -1776,7 +2041,10 @@ function AppInner() {
         signal: controller.signal,
       });
 
-      if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok || !res.body) {
+        const bodyText = await res.text().catch(() => '');
+        throw new Error(bodyText || `HTTP ${res.status}`);
+      }
 
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
@@ -1947,8 +2215,9 @@ function AppInner() {
 
       // Stream finished — mark done
       updateMsg(true);
-      if (titleText && targetChatId && chatSessions.find(item => item.id === targetChatId)?.title === 'New chat') {
-        generateChatTitle(targetChatId, titleText);
+      const targetSession = chatSessions.find(item => item.id === targetChatId);
+      if (titleText && targetChatId && targetSession?.title === 'New chat') {
+        generateChatTitle(targetChatId, titleText, targetSession.modelPath, targetSession.modelId);
       }
     } catch (err) {
       if (err.name === 'AbortError') {
@@ -1977,37 +2246,133 @@ function AppInner() {
     }
   };
 
-  const handleSendMessage = async () => {
-    if ((!inputPrompt.trim() && attachments.length === 0) || isGenerating) return;
+  // Polls GET /v1/model/list until the target model's backend process reports
+  // "ready" (or "error"/timeout). Model loading spawns the backend process
+  // asynchronously on the daemon, so a message sent right after loading a
+  // model can otherwise race ahead of llama-server actually being ready to
+  // serve requests and silently produce no reply. Entries without a `status`
+  // field (older daemon builds, or non-chat modalities) are treated as ready.
+  const waitForModelReady = async (modelId, onWaiting) => {
+    if (!modelId) return { ready: true };
+    const deadline = Date.now() + 120000;
+    while (Date.now() < deadline) {
+      try {
+        const res = await fetch('http://127.0.0.1:8080/v1/model/list');
+        const data = await res.json();
+        const entry = Array.isArray(data) ? data.find(m => m.model_id === modelId) : null;
+        if (!entry || !entry.status || entry.status === 'ready') return { ready: true };
+        if (entry.status === 'error') return { ready: false, error: entry.status_message || 'Model failed to load.' };
+        onWaiting?.();
+      } catch {
+        // network hiccup — keep polling until the deadline
+      }
+      await new Promise(resolve => setTimeout(resolve, 600));
+    }
+    return { ready: false, error: 'Timed out waiting for the model to finish loading.' };
+  };
 
-    const userText = inputPrompt.trim();
-    setInputPrompt('');
-
+  // Appends a fresh user message + placeholder assistant message and streams
+  // the response. Shared by the normal composer submit path and the
+  // edit-and-resend path — both just need to get a user turn onto the wire
+  // starting from whatever messages are already in the session.
+  const sendTurn = async (userText, msgAttachments) => {
     const aiId = 'ai-' + Date.now();
-    const imageAttachments = attachments.filter(a => a.type?.startsWith('image/'));
-    const userMsg = { id: 'u-' + Date.now(), role: 'user', content: userText, attachments };
+    const imageAttachments = msgAttachments.filter(a => a.type?.startsWith('image/'));
+    const userMsg = { id: 'u-' + Date.now(), role: 'user', content: userText, attachments: msgAttachments };
     const tempAiMsg = { id: aiId, role: 'assistant', content: '', loading: true, blocks: [] };
+
+    const priorMessages = chatSessions.find(s => s.id === activeChatId)?.messages ?? [];
+    const history = priorMessages
+      .filter(m => m.role === 'user' || m.role === 'assistant')
+      .map(m => ({
+        role: m.role,
+        content: m.role === 'assistant' ? (parseThinking(m.content).answer || m.content) : m.content,
+      }))
+      .filter(m => m.content && m.content.trim());
 
     syncMessages(prev => [...prev, userMsg, tempAiMsg]);
     setIsGenerating(true);
-    setAttachments([]);
+
+    const targetModelId = activeChatId ? selectedModelId : orchestratorModelId;
+    const { ready, error } = await waitForModelReady(targetModelId, () => {
+      syncMessages(prev => prev.map(m => m.id === aiId ? { ...m, content: 'Model is still loading…' } : m));
+    });
+    if (!ready) {
+      syncMessages(prev => prev.map(m => m.id === aiId ? { ...m, loading: false, content: error } : m));
+      setIsGenerating(false);
+      return;
+    }
 
     const requestBody = {
       model: modelPath,
-      model_id: activeChatId ? selectedModelId : orchestratorModelId,
+      model_id: targetModelId,
       conversation_id: activeChatId,
-      messages: [{ role: 'user', content: imageAttachments.length ? [
+      messages: [...history, { role: 'user', content: imageAttachments.length ? [
         { type: 'text', text: userText },
         ...imageAttachments.map(attachment => ({ type: 'image_url', image_url: { url: attachment.dataUrl } })),
       ] : userText }],
       max_tokens: 4096,
       temperature: parseFloat(temperature),
       top_p: parseFloat(topP),
+      system_prompt: systemPrompt || '',
       autopilot,
       enable_thinking: reasoningEnabled,
     };
 
     await streamAssistantResponse(requestBody, aiId, userText);
+  };
+
+  const handleSendMessage = async () => {
+    if ((!inputPrompt.trim() && attachments.length === 0) || isGenerating) return;
+
+    const userText = inputPrompt.trim();
+    const msgAttachments = attachments;
+    setInputPrompt('');
+    setAttachments([]);
+
+    await sendTurn(userText, msgAttachments);
+  };
+
+  // Truncates the active session's messages back to (not including) the
+  // edited message, clears the conversation's generated-assets bucket on the
+  // backend (assets aren't tracked per-turn, so we can't selectively keep
+  // pre-edit ones), and resends the edited text as a fresh turn — standard
+  // "edit and regenerate branch" behavior.
+  const handleEditAndResend = async (msgId, newText, msgAttachments) => {
+    if (!activeChatId || isGenerating || !newText.trim()) return;
+
+    setEditingMsgId(null);
+
+    const session = chatSessions.find(item => item.id === activeChatId);
+    const idx = (session?.messages ?? []).findIndex(m => m.id === msgId);
+    if (idx === -1) return;
+
+    syncMessages(prev => prev.slice(0, idx));
+    fetch(`http://127.0.0.1:8080/v1/conversations/${activeChatId}/reset-assets`, { method: 'POST' }).catch(() => {});
+
+    await sendTurn(newText.trim(), msgAttachments ?? []);
+  };
+
+  const cancelEditingMessage = () => {
+    setEditingMsgId(null);
+    setInputPrompt('');
+    setAttachments([]);
+  };
+
+  // Shared submit handler for the composer's Enter key and Send button —
+  // branches into the edit-and-resend flow when a message is being edited,
+  // otherwise behaves exactly like the normal send.
+  const handleComposerSubmit = async () => {
+    if (editingMsgId) {
+      const msgId = editingMsgId;
+      const newText = inputPrompt.trim();
+      const msgAttachments = attachments;
+      setInputPrompt('');
+      setAttachments([]);
+      await handleEditAndResend(msgId, newText, msgAttachments);
+      return;
+    }
+    await handleSendMessage();
   };
 
   // Aborts the in-flight chat stream fetch. This stops the UI from waiting
@@ -2083,18 +2448,21 @@ function AppInner() {
         const text = (await res.text()).trim();
         let message = text;
         let missingComponents = null;
+        let envNotInstalled = null;
         try {
           const parsed = JSON.parse(text);
           message = parsed?.error || parsed?.message || text;
           if (Array.isArray(parsed?.missing_components) && parsed.missing_components.length > 0) {
             missingComponents = parsed.missing_components;
           }
+          if (parsed?.envNotInstalled) envNotInstalled = parsed.envNotInstalled;
         } catch {
           // plain-text error body, use as-is
         }
         const err = new Error(cancelled ? 'Generation cancelled' : message);
         err.cancelled = cancelled;
         if (missingComponents) err.missingComponents = missingComponents;
+        if (envNotInstalled) err.envNotInstalled = envNotInstalled;
         throw err;
       }
       return await res.json();
@@ -2130,6 +2498,8 @@ function AppInner() {
     } catch (e) {
       if (e.cancelled) {
         pushError('Generation cancelled', 'info');
+      } else if (e.envNotInstalled) {
+        installEnvAndRetry(e.envNotInstalled, () => handleGenerateImage());
       } else {
         if (Array.isArray(e.missingComponents) && e.missingComponents.length > 0) {
           setImgMissingComponents(e.missingComponents);
@@ -2155,6 +2525,8 @@ function AppInner() {
     } catch (e) {
       if (e.cancelled) {
         pushError('Generation cancelled', 'info');
+      } else if (e.envNotInstalled) {
+        installEnvAndRetry(e.envNotInstalled, () => handleGenerateVideo());
       } else {
         pushError('Video generation error: ' + e);
       }
@@ -2245,6 +2617,8 @@ function AppInner() {
     } catch (e) {
       if (e.cancelled) {
         pushError('Generation cancelled', 'info');
+      } else if (e.envNotInstalled) {
+        installEnvAndRetry(e.envNotInstalled, () => handleGenerateMesh3d());
       } else {
         pushError('3D mesh generation error: ' + e);
       }
@@ -2265,6 +2639,8 @@ function AppInner() {
     } catch (e) {
       if (e.cancelled) {
         pushError('Generation cancelled', 'info');
+      } else if (e.envNotInstalled) {
+        installEnvAndRetry(e.envNotInstalled, () => handleSynthesizeSpeech());
       } else {
         pushError('TTS error: ' + e);
       }
@@ -2340,7 +2716,7 @@ function AppInner() {
       {/* Top Header Bar */}
       <header className="desktop-header">
         <div className="logo-group">
-          <div className="logo-icon">AI</div>
+          <img className="logo-icon" src={disposLogo} alt="Dispos Studio" />
           <div className="logo-title">Dispos Studio</div>
           <span className="version-tag">Standalone Native</span>
         </div>
@@ -2466,35 +2842,83 @@ function AppInner() {
       {/* Main Content Body */}
       <div className="app-container">
         {/* Left Sidebar */}
-        <div className="sidebar">
+        <div className={`sidebar ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
+          <button
+            type="button"
+            className="sidebar-fold-toggle"
+            onClick={() => setSidebarCollapsed(current => !current)}
+            title={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+          >
+            {sidebarCollapsed ? <ChevronRight size={16} /> : <ChevronLeft size={16} />}
+          </button>
+
           <div className="nav-section">MODEL CENTER</div>
 
           <button
             className={`nav-btn ${activeTab === 'models' ? 'active' : ''}`}
             onClick={() => setActiveTab('models')}
+            title="Models"
           >
-            <Box size={17} /> Models
+            <Box size={17} /> <span className="nav-label-text">Models</span>
           </button>
 
           <button
             className={`nav-btn ${activeTab === 'settings' ? 'active' : ''}`}
             onClick={() => setActiveTab('settings')}
+            title="General Settings"
           >
-            <Settings size={17} /> General Settings
+            <Settings size={17} /> <span className="nav-label-text">General Settings</span>
           </button>
 
           <div className="nav-section" style={{ marginTop: '1rem' }}>STUDIOS</div>
-          {chatSessions.length === 0 ? <div style={{ color: 'var(--text-secondary)', fontSize: '0.78rem', padding: '0.25rem 0.75rem 0.75rem' }}>Start a studio from a loaded model in Model Center.</div>
+          {chatSessions.length === 0 ? <div className="sidebar-empty-hint" style={{ color: 'var(--text-secondary)', fontSize: '0.78rem', padding: '0.25rem 0.75rem 0.75rem' }}>Start a studio from a loaded model in Model Center.</div>
           : Object.entries(chatSessions.reduce((groups, chat) => {
               const modelKey = chat.studioKey || canonicalStudioKey(chat.modelPath, chat.modelName);
               if (!modelKey) return groups;
-              groups[modelKey] ??= { name: chat.modelName, modelId: chat.modelId, chats: [] };
+              groups[modelKey] ??= { name: chat.modelName, modelId: chat.modelId, modelPath: chat.modelPath, chats: [] };
               groups[modelKey].chats.push(chat);
               return groups;
-            }, {})).map(([modelKey, model]) => {
+            }, {}))
+            .sort(([, a], [, b]) =>
+              Math.max(...b.chats.map(chatLastModified), 0) - Math.max(...a.chats.map(chatLastModified), 0))
+            .map(([modelKey, model]) => {
               const modelOpen = !(collapsedStudios[modelKey] ?? false);
               const isPendingDeleteModel = pendingDeleteModelKey === modelKey;
               const modelSessionIds = model.chats.map(c => c.id);
+              const openChatSession = (chat) => {
+                // Backend model_ids include a load timestamp (mdl-{ts}-{port}),
+                // so a re-loaded model has a fresh id even when the file
+                // is the same. Resolve chat.modelId against the current
+                // daemon registry (by id, then by stable modelPath) so
+                // the UI shows the actually-loaded model instead of "No
+                // Model Loaded" for studios created under a previous
+                // daemon instance. Falls back to the stored id so
+                // messages still route through the daemon's port-50052
+                // fallback when nothing matches.
+                const liveMatch = loadedModels.find(loaded => loaded.model_id === chat.modelId)
+                  ?? (chat.modelPath ? loadedModels.find(loaded => loaded.model_path === chat.modelPath) : null)
+                  ?? null;
+                setSelectedModelId(liveMatch?.model_id ?? chat.modelId);
+                setActiveChatId(chat.id);
+                openModelStudio(chat);
+              };
+              const handleStudioToggleClick = () => {
+                if (sidebarCollapsed) {
+                  const latestChat = model.chats.reduce((latest, chat) =>
+                    (!latest || chatLastModified(chat) >= chatLastModified(latest)) ? chat : latest, null);
+                  if (latestChat) openChatSession(latestChat);
+                  return;
+                }
+                setCollapsedStudios(current => ({ ...current, [modelKey]: !(current[modelKey] ?? false) }));
+              };
+              const loadedEntry = loadedModels.find(loaded => loaded.model_id === model.modelId)
+                ?? (model.modelPath ? loadedModels.find(loaded => loaded.model_path === model.modelPath) : null)
+                ?? null;
+              const handleNewStudioClick = (e) => {
+                e.stopPropagation();
+                if (!loadedEntry) return;
+                startStudio(loadedEntry, { name: model.name, task_tags: model.chats[0]?.task_tags });
+              };
               const handleDeleteModelClick = (e) => {
                 e.stopPropagation();
                 if (isPendingDeleteModel) {
@@ -2519,16 +2943,29 @@ function AppInner() {
               };
               return <div key={modelKey} style={{ paddingLeft: '0.55rem' }}>
                 <div className={`studio-group-row ${isPendingDeleteModel ? 'pending-delete' : ''}`}>
-                  <button className="nav-btn studio-group-toggle" onClick={() => setCollapsedStudios(current => ({ ...current, [modelKey]: !(current[modelKey] ?? false) }))}>
-                    {modelOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />} {model.name}
+                  <button
+                    className="nav-btn studio-group-toggle"
+                    onClick={handleStudioToggleClick}
+                    title={model.name}
+                  >
+                    {sidebarCollapsed ? (
+                      <StudioAvatarIcon modelPath={model.modelPath} />
+                    ) : (
+                      <>{modelOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />} <span className="nav-label-text">{model.name}</span></>
+                    )}
                   </button>
                   <div className="studio-group-actions">
+                    {loadedEntry && (
+                      <button type="button" className="chat-session-action" onClick={handleNewStudioClick} title="New studio with this model" aria-label="New studio with this model">
+                        <Plus size={13} />
+                      </button>
+                    )}
                     <button type="button" className={`chat-session-action delete ${isPendingDeleteModel ? 'confirm' : ''}`} onClick={handleDeleteModelClick} title={isPendingDeleteModel ? 'Click again to confirm delete all studios' : 'Delete all studios for this model'} aria-label="Delete all studios for this model">
                       {isPendingDeleteModel ? <span className="confirm-label">Delete?</span> : <X size={13} />}
                     </button>
                   </div>
                 </div>
-                {modelOpen && model.chats.map(chat => {
+                {modelOpen && !sidebarCollapsed && model.chats.map(chat => {
                   const isEditing = editingSessionId === chat.id;
                   const isPendingDelete = pendingDeleteId === chat.id;
                   const commitRename = () => {
@@ -2567,23 +3004,7 @@ function AppInner() {
                     }
                   };
                   return <div key={chat.id} className={`nav-btn chat-session-row ${activeChatId === chat.id ? 'active' : ''} ${isEditing ? 'editing' : ''} ${isPendingDelete ? 'pending-delete' : ''} ${pendingRemoveIds.includes(chat.id) ? 'fading-out' : ''}`} style={{ paddingLeft: '2.1rem', fontSize: '0.8rem' }}>
-                    <button type="button" className="chat-session-main" onClick={() => {
-                      // Backend model_ids include a load timestamp (mdl-{ts}-{port}),
-                      // so a re-loaded model has a fresh id even when the file
-                      // is the same. Resolve chat.modelId against the current
-                      // daemon registry (by id, then by stable modelPath) so
-                      // the UI shows the actually-loaded model instead of "No
-                      // Model Loaded" for studios created under a previous
-                      // daemon instance. Falls back to the stored id so
-                      // messages still route through the daemon's port-50052
-                      // fallback when nothing matches.
-                      const liveMatch = loadedModels.find(loaded => loaded.model_id === chat.modelId)
-                        ?? (chat.modelPath ? loadedModels.find(loaded => loaded.model_path === chat.modelPath) : null)
-                        ?? null;
-                      setSelectedModelId(liveMatch?.model_id ?? chat.modelId);
-                      setActiveChatId(chat.id);
-                      openModelStudio(chat);
-                    }} title={chat.title}>
+                    <button type="button" className="chat-session-main" onClick={() => openChatSession(chat)} title={chat.title}>
                       <MessageSquare size={14} />
                       {isEditing ? (
                         <input
@@ -2757,17 +3178,17 @@ function AppInner() {
               {/* Model Status Strip */}
               <div className="model-status-strip">
                 <div className="status-info">
-                  <div className={`status-dot-lg ${modelStatus.is_loaded ? 'online' : 'offline'}`}></div>
+                  <StatusDot state={modelDotState(activeChatStudio, activeChatLoaded)} />
                   <div className="status-text">
                     <span className="model-name">
                       {modelStatus.is_loaded
                         ? modelStatus.model_path?.split('\\').pop() || 'Model Loaded'
-                        : 'No Model Loaded'}
+                        : activeChatStudio?.name || 'No Model Loaded'}
                     </span>
                     <span className="model-meta">
                       {modelStatus.is_loaded
                         ? `CUDA • ${modelStatus.gpu_layers ?? gpuLayers} GPU layers • ${modelStatus.context_size ?? contextSize} ctx`
-                        : 'Use the sidebar to configure and load a model'}
+                        : activeChatStudio ? 'Not currently loaded — load it to use this studio' : 'Use the sidebar to configure and load a model'}
                     </span>
                   </div>
                 </div>
@@ -2784,7 +3205,21 @@ function AppInner() {
                   {displayedMessages.map(msg => (
                     <div key={msg.id} className={`msg-row ${msg.role}`}>
                       {msg.role === 'assistant' && <div className="avatar ai">AI</div>}
-                      <div className="bubble">
+                      <div className={`bubble${editingMsgId === msg.id ? ' editing' : ''}`}>
+                        <div className="bubble-actions">
+                          <CopyMessageButton text={msg.role === 'assistant' ? parseThinking(msg.content).answer : msg.content} />
+                          {msg.role === 'user' && activeChatId && !isGenerating && editingMsgId !== msg.id && (
+                            <button type="button" className="copy-msg-btn" onClick={() => {
+                              setEditingMsgId(msg.id);
+                              setInputPrompt(msg.content);
+                              setAttachments(msg.attachments || []);
+                              composerTextareaRef.current?.focus();
+                            }} title="Edit message">
+                              <Pencil size={13} />
+                            </button>
+                          )}
+                        </div>
+                        {editingMsgId === msg.id && <div className="bubble-editing-label">Editing…</div>}
                         {msg.role === 'assistant' ? (
                           (() => {
                             // `thinking` is still recovered from the combined
@@ -2898,6 +3333,10 @@ function AppInner() {
                       ))}
                     </div>
                   </div>}
+                  {editingMsgId && <div className="composer-editing-banner">
+                    <span>Editing message</span>
+                    <button className="btn-dismiss-choice" onClick={cancelEditingMessage} title="Cancel edit"><X size={13} /></button>
+                  </div>}
                   <div className="prompt-area">
                     <input ref={attachmentInputRef} type="file" accept="image/*,.glb,.gltf,.obj,.fbx,.ply,.stl" multiple hidden onChange={event => { addAttachments(event.target.files); event.target.value = ''; }} />
                     <button className="btn-attach" onClick={() => attachmentInputRef.current?.click()} title={acceptsImageInput ? 'Attach an image or 3D model' : 'Attach a 3D model (image input needs an image-capable model)'}>
@@ -2910,12 +3349,16 @@ function AppInner() {
                       <Brain size={16} />
                     </button>
                     <textarea
+                      ref={composerTextareaRef}
                       value={inputPrompt}
                       onChange={e => setInputPrompt(e.target.value)}
                       onKeyDown={e => {
                         if (e.key === 'Enter' && !e.shiftKey) {
                           e.preventDefault();
-                          handleSendMessage();
+                          handleComposerSubmit();
+                        } else if (e.key === 'Escape' && editingMsgId) {
+                          e.preventDefault();
+                          cancelEditingMessage();
                         }
                       }}
                       placeholder={acceptsImageInput ? 'Ask about an image or type a message...' : modelStatus.is_loaded ? 'Ask DisposAI anything...' : 'Load a model to start chatting...'}
@@ -2925,7 +3368,7 @@ function AppInner() {
                         <Square size={16} />
                       </button>
                     ) : (
-                      <button className="btn-send" onClick={handleSendMessage} disabled={isGenerating}>
+                      <button className="btn-send" onClick={handleComposerSubmit} disabled={isGenerating}>
                         <Send size={18} />
                       </button>
                     )}
@@ -2943,11 +3386,8 @@ function AppInner() {
                   <PackagePlus size={14} /> Add Model
                 </button>
               </div>
-              <p style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', marginBottom: '1.5rem' }}>
-                Load multiple local GGUF models and choose which one powers the chat.
-              </p>
               <div className="card" style={{ background: 'none', border: 'none', padding: 0 }}>
-                  <div className="model-cards-grid">
+                  <div className="model-cards-grid" style={{ marginTop: '10px' }}>
                   {modelCards.map(card => {
                     // Backend model_ids include a load timestamp (mdl-{ts}-{port}), so a
                     // model reloaded server-side (e.g. the orchestrator stepping aside for
@@ -2961,7 +3401,10 @@ function AppInner() {
                     return (
                       <div key={card.id} className="model-card-item">
                         <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between' }}>
-                          <strong>{card.name}</strong>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                            <StudioAvatarIcon modelPath={card.modelPath} size={32} />
+                            <strong>{card.name}</strong>
+                          </div>
                           <button
                             className="btn-remove-card"
                             title="Remove model card"
@@ -2973,7 +3416,10 @@ function AppInner() {
                             <X size={13} />
                           </button>
                         </div>
-                        <div style={{ color: 'var(--text-secondary)', fontSize: '0.8rem', margin: '0.25rem 0 0.65rem' }}>{card.task_tags?.map(t => t.toUpperCase()).join(', ')} · {(card.size_bytes / 1e9).toFixed(2)} GB</div>
+                        <div className="model-card-modality" style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '0.35rem', color: 'var(--text-secondary)', fontSize: '0.8rem', margin: '0.25rem 0 0.65rem' }}>
+                          {card.task_tags?.map(t => <span key={t} className="model-tag-badge">{t.toUpperCase()}</span>)}
+                          <span>· {(card.size_bytes / 1e9).toFixed(2)} GB</span>
+                        </div>
                         <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', alignItems: 'center', marginTop: '0.25rem' }}>
                           <button className="btn-load-model" onClick={() => openConfigPanel(card)}>
                             <Settings size={14} /> {isLoaded ? 'Settings' : 'Configure'}
@@ -3251,7 +3697,18 @@ function AppInner() {
                               <div className="hf-result-header" onClick={() => selectHfRepo(repoId)}>
                                 <div>
                                   <strong>{result.modelId || repoId}</strong>
-                                  <span className="modal-list-item-meta"> · {result.author}</span>
+                                  <span className="modal-list-item-meta">
+                                    {' · '}
+                                    {result.author && (
+                                      <img
+                                        className="hf-author-avatar"
+                                        src={`http://127.0.0.1:8080/v1/model/hf-avatar?author=${encodeURIComponent(result.author)}&v=2`}
+                                        alt=""
+                                        onError={(e) => { e.currentTarget.style.display = 'none'; }}
+                                      />
+                                    )}
+                                    {result.author}
+                                  </span>
                                   {formatParamCount(result.params) && (
                                     <span className="hf-param-badge">{formatParamCount(result.params)}</span>
                                   )}
@@ -3536,6 +3993,21 @@ function AppInner() {
           {/* Embeddings */}
           {activeTab === 'embeddings' && (
             <div className="tab-panel">
+              <div className="model-status-strip">
+                <div className="status-info">
+                  <StatusDot state={activeEmbedDotState} />
+                  <div className="status-text">
+                    <span className="model-name">
+                      {activeEmbedLoaded
+                        ? activeEmbedLoaded.model_path?.split('\\').pop() || 'Model Loaded'
+                        : embedModelId || 'No Model Loaded'}
+                    </span>
+                    <span className="model-meta">
+                      {activeEmbedLoaded ? 'Ready to generate embeddings' : embedModelId ? 'Not currently loaded — load it to use this studio' : 'Load a text model to generate embeddings'}
+                    </span>
+                  </div>
+                </div>
+              </div>
               <h2 style={{ fontSize: '1.4rem', marginBottom: '0.3rem' }}>Embeddings</h2>
               <p style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', marginBottom: '1.5rem' }}>
                 Generate embedding vectors from a loaded text model.
@@ -3592,6 +4064,22 @@ function AppInner() {
           {/* 2. Image Studio */}
           {activeTab === 'image' && (
             <div className="tab-panel">
+              <div className="model-status-strip">
+                <div className="status-info">
+                  <StatusDot state={modelDotState(activeImageStudio, activeImageLoaded)} />
+                  <div className="status-text">
+                    <span className="model-name">
+                      {activeImageLoaded
+                        ? activeImageLoaded.model_path?.split('\\').pop() || activeImageStudio?.name || 'Model Loaded'
+                        : activeImageStudio?.name || 'No Model Loaded'}
+                    </span>
+                    <span className="model-meta">
+                      {activeImageLoaded ? 'Ready for image generation' : activeImageStudio ? 'Not currently loaded — load it to use this studio' : 'Use the sidebar to configure and load a model'}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
               <h2 style={{ fontSize: '1.4rem', marginBottom: '0.3rem' }}>Stable Diffusion Image Studio</h2>
               <p style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', marginBottom: '1.5rem' }}>
                 {imageStudioSupportsImg2Img
@@ -3720,6 +4208,7 @@ function AppInner() {
                     )}
                   </div>
                   {isGeneratingImg && <GenProgressBar progress={imgProgress} />}
+                  {installProgress && <GenProgressBar progress={installProgress} />}
 
                   {imgMissingComponents && imgMissingComponents.length > 0 && (
                     <div className="hf-folder-group" style={{ marginTop: '1rem', border: '1px solid var(--border-color, #333)', borderRadius: 6, padding: '0.75rem' }}>
@@ -3808,6 +4297,22 @@ function AppInner() {
           {/* 3. Voice Studio */}
           {activeTab === 'audio' && (
             <div className="tab-panel">
+              <div className="model-status-strip">
+                <div className="status-info">
+                  <StatusDot state={modelDotState(activeTtsStudio, activeTtsLoaded)} />
+                  <div className="status-text">
+                    <span className="model-name">
+                      {activeTtsLoaded
+                        ? activeTtsLoaded.model_path?.split('\\').pop() || activeTtsStudio?.name || 'Model Loaded'
+                        : activeTtsStudio?.name || 'No Model Loaded'}
+                    </span>
+                    <span className="model-meta">
+                      {activeTtsLoaded ? 'Ready to synthesize speech' : activeTtsStudio ? 'Not currently loaded — load it to use this studio' : 'Use the sidebar to configure and load a model'}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
               <h2 style={{ fontSize: '1.4rem', marginBottom: '0.3rem' }}>Voice Studio</h2>
               <p style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', marginBottom: '1.5rem' }}>
                 Kokoro Text-to-Speech
@@ -3849,6 +4354,7 @@ function AppInner() {
                     )}
                   </div>
                   {isGeneratingTts && <GenProgressBar progress={ttsProgress} />}
+                  {installProgress && <GenProgressBar progress={installProgress} />}
 
                   {audioSrc && <audio controls autoPlay src={audioSrc} style={{ width: '100%', marginTop: '1rem' }} />}
                 </div>
@@ -3859,6 +4365,22 @@ function AppInner() {
           {/* Transcribe Studio */}
           {activeTab === 'transcribe' && (
             <div className="tab-panel">
+              <div className="model-status-strip">
+                <div className="status-info">
+                  <StatusDot state={modelDotState(activeAsrStudio, activeAsrLoaded)} />
+                  <div className="status-text">
+                    <span className="model-name">
+                      {activeAsrLoaded
+                        ? activeAsrLoaded.model_path?.split('\\').pop() || activeAsrStudio?.name || 'Model Loaded'
+                        : activeAsrStudio?.name || 'No Model Loaded'}
+                    </span>
+                    <span className="model-meta">
+                      {activeAsrLoaded ? 'Ready to transcribe audio' : activeAsrStudio ? 'Not currently loaded — load it to use this studio' : 'Use the sidebar to configure and load a model'}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
               <h2 style={{ fontSize: '1.4rem', marginBottom: '0.3rem' }}>Transcribe Studio</h2>
               <p style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', marginBottom: '1.5rem' }}>
                 Whisper Speech-to-Text ASR
@@ -3907,6 +4429,22 @@ function AppInner() {
           {/* 4. Video Studio */}
           {activeTab === 'video' && (
             <div className="tab-panel">
+              <div className="model-status-strip">
+                <div className="status-info">
+                  <StatusDot state={modelDotState(activeVideoStudio, activeVideoLoaded)} />
+                  <div className="status-text">
+                    <span className="model-name">
+                      {activeVideoLoaded
+                        ? activeVideoLoaded.model_path?.split('\\').pop() || activeVideoStudio?.name || 'Model Loaded'
+                        : activeVideoStudio?.name || 'No Model Loaded'}
+                    </span>
+                    <span className="model-meta">
+                      {activeVideoLoaded ? 'Ready for video generation' : activeVideoStudio ? 'Not currently loaded — load it to use this studio' : 'Use the sidebar to configure and load a model'}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
               <h2 style={{ fontSize: '1.4rem', marginBottom: '0.3rem' }}>Wan Video Runner Studio</h2>
               <p style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', marginBottom: '1.5rem' }}>
                 Text-to-Video generation engine
@@ -3980,6 +4518,7 @@ function AppInner() {
                     )}
                   </div>
                   {isGeneratingVideo && <GenProgressBar progress={videoProgress} />}
+                  {installProgress && <GenProgressBar progress={installProgress} />}
                 </div>
 
                 <div className="card">
@@ -4009,6 +4548,22 @@ function AppInner() {
           {/* 5. 3D Model Studio */}
           {activeTab === 'mesh3d' && (
             <div className="tab-panel">
+              <div className="model-status-strip">
+                <div className="status-info">
+                  <StatusDot state={modelDotState(activeMesh3dStudio, activeMesh3dLoaded)} />
+                  <div className="status-text">
+                    <span className="model-name">
+                      {activeMesh3dLoaded
+                        ? activeMesh3dLoaded.model_path?.split('\\').pop() || activeMesh3dStudio?.name || 'Model Loaded'
+                        : activeMesh3dStudio?.name || 'No Model Loaded'}
+                    </span>
+                    <span className="model-meta">
+                      {activeMesh3dLoaded ? 'Ready for 3D mesh generation' : activeMesh3dStudio ? 'Not currently loaded — load it to use this studio' : 'Use the sidebar to configure and load a model'}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
               <h2 style={{ fontSize: '1.4rem', marginBottom: '0.3rem' }}>3D Model Studio</h2>
               <p style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', marginBottom: '1.5rem' }}>
                 Local text / image / multi-image → 3D mesh generation
@@ -4142,6 +4697,7 @@ function AppInner() {
                     )}
                   </div>
                   {isGeneratingMesh && <GenProgressBar progress={meshProgress} />}
+                  {installProgress && <GenProgressBar progress={installProgress} />}
                 </div>
 
                 <div className="card">
@@ -4214,6 +4770,22 @@ function AppInner() {
                   <div className="sidebar-section">
                     <div className="slider-header"><label className="section-label">Top-P</label><span className="badge-value">{configTarget?.top_p ?? 0.9}</span></div>
                     <input className="control-slider" type="range" min="0.1" max="1" step="0.05" value={configTarget?.top_p ?? 0.9} onChange={e => setConfigTarget(current => ({ ...current, top_p: Number(e.target.value) }))} />
+                  </div>
+                  <div className="sidebar-section">
+                    <div className="slider-header">
+                      <label className="section-label">System Prompt</label>
+                      <div className="mmproj-row">
+                        <button className="btn-browse" onClick={() => setConfigTarget(current => ({ ...current, system_prompt: '' }))}>Reset</button>
+                      </div>
+                    </div>
+                    <textarea
+                      className="control-input"
+                      rows={4}
+                      value={configTarget?.system_prompt || ''}
+                      onChange={e => setConfigTarget(current => ({ ...current, system_prompt: e.target.value }))}
+                      placeholder="Leave empty to use the app's default system prompt."
+                    />
+                    <div className="slider-hint">Sent with every chat request to this model. Reset clears it back to the app default.</div>
                   </div>
                 </>
               )}
@@ -4377,8 +4949,58 @@ function AppInner() {
               {cfgCategory === 'video' && (
                 <div className="sidebar-section">
                   <div className="slider-hint">Video model. Generation parameters are chosen per request in the studio.</div>
+                  {configTarget?.vae_path ? (
+                    <div className="modal-list-item-meta" style={{ marginTop: '0.5rem' }}>
+                      Sibling VAE found: {configTarget.vae_path.split('\\').pop()}
+                    </div>
+                  ) : null}
                 </div>
               )}
+              {cfgCategory === 'video' && configTarget?.video_components?.length ? (
+                <div className="sidebar-section">
+                  <label className="section-label">Pipeline components</label>
+                  <div className="slider-hint">
+                    Needed to run this model. If missing, they would otherwise be downloaded silently the first time you generate.
+                  </div>
+                  {Object.entries(
+                    configTarget.video_components.reduce((groups, comp) => {
+                      (groups[comp.group] ||= []).push(comp);
+                      return groups;
+                    }, {})
+                  ).map(([group, comps]) => {
+                    const allResolved = comps.every(c => c.resolved_path);
+                    return (
+                      <div key={group} style={{ marginTop: '0.5rem' }}>
+                        <div className="hf-file-name-row">
+                          <span className="hf-file-name">{group}</span>
+                          <span className="modal-list-item-meta">{allResolved ? 'Ready' : `${comps.filter(c => c.resolved_path).length}/${comps.length} downloaded`}</span>
+                        </div>
+                        {!allResolved && (
+                          <button
+                            className="hf-download-btn"
+                            onClick={() => comps.forEach(c => {
+                              if (!c.resolved_path && c.source) startHfDownload(c.source.repo, c.source.filename, c.target_path, c.source.target_filename);
+                            })}
+                          >
+                            Download {group}
+                          </button>
+                        )}
+                        {comps.filter(c => !c.resolved_path && c.source).map((c, idx) => {
+                          const download = hfDownloads[`${c.source.repo}::${c.source.filename}`];
+                          const progressPct = download && download.total_bytes > 0
+                            ? Math.min(100, (download.downloaded_bytes / download.total_bytes) * 100)
+                            : 0;
+                          return download && download.status !== 'complete' ? (
+                            <div key={idx} className="modal-list-item-meta">
+                              {c.kind_name}: {download.status === 'error' ? 'Error' : `${progressPct.toFixed(0)}%`}
+                            </div>
+                          ) : null;
+                        })}
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : null}
               <div className="vram-preview-card">
                 <div className="preview-title"><Cpu size={13} /> Estimated VRAM</div>
                 <strong>{((modelFitPreview?.total_required_vram_bytes || 0) / 1e9).toFixed(2)} GB</strong>
@@ -4391,6 +5013,7 @@ function AppInner() {
                   mmproj_path: cfg?.mmproj_path || undefined,
                   temperature: cfg?.temperature,
                   top_p: cfg?.top_p,
+                  system_prompt: cfg?.system_prompt || '',
                   steps: cfg?.steps,
                   cfg_scale: cfg?.cfg_scale,
                   width: cfg?.width,

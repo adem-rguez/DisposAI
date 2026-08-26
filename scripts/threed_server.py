@@ -9,9 +9,9 @@ Supported adapters:
   - Shap-E (fully-supported baseline): `diffusers`' `ShapEPipeline` (text) /
     `ShapEImg2ImgPipeline` (image) + `trimesh`. Guaranteed to work if
     `diffusers` and `trimesh` are installed.
-  - TripoSR, Stable-Fast-3D (SF3D), TRELLIS, Hunyuan3D-2, Point-E: adapters
-    that follow their documented package APIs (`tsr`, `sf3d`, `trellis`,
-    `hy3dgen`, `point_e`). Guarded by try/except; if the extra package isn't
+  - TripoSR, Stable-Fast-3D (SF3D), TRELLIS, Hunyuan3D-2, Point-E, VGGT:
+    adapters that follow their documented package APIs (`tsr`, `sf3d`,
+    `trellis`, `hy3dgen`, `point_e`, `vggt`). Guarded by try/except; if the extra package isn't
     installed the server still serves a placeholder cube instead of failing
     to start. See `scripts/setup_3d_env.py` for how to install the heavy
     native deps these need into a dedicated Python 3.11 venv.
@@ -643,6 +643,161 @@ class SF3DAdapter(MeshAdapter):
         tmesh.apply_transform(trimesh.transformations.rotation_matrix(np.radians(90), [0, 1, 0]))
         tmesh.invert()
         return tmesh
+
+
+class VggtAdapter(MeshAdapter):
+    """Adapter for facebook/vggt-1b, following its documented `vggt` package
+    API (https://github.com/facebookresearch/vggt). VGGT is a feed-forward
+    multi-view reconstruction model: it predicts per-image depth maps (or
+    point maps) + camera poses but does NOT emit a mesh directly, so this
+    adapter fuses the predicted per-image point maps into a single point
+    cloud and runs Poisson surface reconstruction (via `open3d`) to obtain a
+    watertight mesh with faces. Text input isn't supported."""
+    name = "vggt"
+    input_kinds = ["image", "multi_image"]
+    match_tokens = ["vggt", "vggt-1b", "vggt_1b"]
+    PARAM_SPEC = [
+        {"name": "conf_threshold", "type": "float", "default": 50.0, "min": 0.0, "max": 100.0},
+        {"name": "poisson_depth", "type": "int", "default": 9, "min": 4, "max": 12},
+    ]
+
+    def __init__(self, model_path):
+        self.model_path = model_path
+        self._model = None
+
+    def is_available(self):
+        try:
+            from vggt.models.vggt import VGGT  # noqa: F401
+            import open3d  # noqa: F401
+            return trimesh is not None
+        except ImportError:
+            return False
+
+    def _load(self):
+        if self._model is None:
+            from vggt.models.vggt import VGGT
+            repo = self.model_path if os.path.isdir(self.model_path) else "facebook/VGGT-1B"
+            self._model = VGGT.from_pretrained(repo)
+            self._model.eval()
+            if torch is not None and torch.cuda.is_available():
+                self._model.to("cuda")
+        return self._model
+
+    def generate(self, input_kind, prompt, images, params):
+        if not images:
+            raise ValueError("VGGT requires at least one image input")
+        import numpy as np
+        import open3d as o3d
+        from vggt.utils.load_fn import load_and_preprocess_images
+        from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+        from vggt.utils.geometry import unproject_depth_map_to_point_map
+
+        resolved = self.resolve_params(params)
+        conf_threshold = resolved["conf_threshold"]
+        poisson_depth = resolved["poisson_depth"]
+
+        model = self._load()
+        device = "cuda" if torch is not None and torch.cuda.is_available() else "cpu"
+        dtype = torch.bfloat16 if device == "cuda" and torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+
+        # load_and_preprocess_images expects file paths; VGGT's own resize/crop
+        # logic (pad to 14-divisible dims, center crop) is easiest to reuse by
+        # writing the decoded PIL images to a temp dir and pointing it there.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            image_paths = []
+            for i, img in enumerate(images):
+                path = os.path.join(tmp_dir, f"{i:03d}.png")
+                img.convert("RGB").save(path)
+                image_paths.append(path)
+            image_tensor = load_and_preprocess_images(image_paths).to(device)
+
+        with torch.no_grad():
+            autocast_ctx = torch.cuda.amp.autocast(dtype=dtype) if device == "cuda" else torch.autocast(device_type="cpu", enabled=False)
+            with autocast_ctx:
+                batched = image_tensor[None]
+                predictions = model(batched)
+                pose_enc = predictions["pose_enc"]
+                extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, batched.shape[-2:])
+                depth_map = predictions["depth"]
+                depth_conf = predictions["depth_conf"]
+
+        world_points = unproject_depth_map_to_point_map(
+            depth_map.squeeze(0), extrinsic.squeeze(0), intrinsic.squeeze(0)
+        )
+        depth_conf = _as_numpy(depth_conf.squeeze(0))
+        colors = (_as_numpy(image_tensor).transpose(0, 2, 3, 1) * 255.0).astype(np.uint8)
+        extrinsic_np = _as_numpy(extrinsic.squeeze(0))
+
+        threshold_value = np.percentile(depth_conf, conf_threshold) if depth_conf.size else 0.0
+        mask = depth_conf >= threshold_value
+
+        # Orient normals per-view towards that view's own camera center before
+        # merging. A single global tangent-plane fit over a sparse, multi-view
+        # (or single-view "front only") point cloud tends to produce
+        # inconsistently-oriented normals, which makes Poisson reconstruction
+        # emit a broken/one-sided shell instead of a closed surface. Each
+        # view's points are, by construction, front-facing to its own camera,
+        # so orienting per-view against the known camera center is far more
+        # reliable.
+        all_points, all_colors, all_normals = [], [], []
+        for i in range(world_points.shape[0]):
+            view_mask = mask[i]
+            if not np.any(view_mask):
+                continue
+            view_points = world_points[i][view_mask].reshape(-1, 3).astype(np.float64)
+            view_colors = colors[i][view_mask].reshape(-1, 3).astype(np.float64) / 255.0
+            if view_points.shape[0] < 3:
+                continue
+            r = extrinsic_np[i][:, :3]
+            t = extrinsic_np[i][:, 3]
+            cam_center = -r.T @ t  # extrinsic is world->camera [R|t]; center = -R^T t
+            view_pcd = o3d.geometry.PointCloud()
+            view_pcd.points = o3d.utility.Vector3dVector(view_points)
+            view_pcd.estimate_normals()
+            view_pcd.orient_normals_towards_camera_location(cam_center)
+            all_points.append(view_points)
+            all_colors.append(view_colors)
+            all_normals.append(np.asarray(view_pcd.normals))
+
+        if not all_points:
+            raise ValueError("VGGT produced too few confident 3D points to reconstruct a mesh")
+
+        points = np.concatenate(all_points, axis=0)
+        point_colors = np.concatenate(all_colors, axis=0)
+        normals = np.concatenate(all_normals, axis=0)
+
+        if points.shape[0] < 4:
+            raise ValueError("VGGT produced too few confident 3D points to reconstruct a mesh")
+
+        # VGGT/OpenCV camera convention is X-right, Y-down, Z-forward
+        # (into the scene). Mesh viewers/exporters (trimesh, glTF, etc.)
+        # expect Y-up, Z-toward-viewer, which is a 180-degree rotation
+        # about X (negate Y and Z). This is a proper rotation (det=+1), so
+        # face winding/normals stay consistent and no extra invert() is
+        # needed.
+        axis_fix = np.array([[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]])
+        points = points @ axis_fix.T
+        normals = normals @ axis_fix.T
+
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points)
+        pcd.colors = o3d.utility.Vector3dVector(point_colors)
+        pcd.normals = o3d.utility.Vector3dVector(normals)
+
+        o3d_mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+            pcd, depth=poisson_depth
+        )
+        densities = np.asarray(densities)
+        low_density_mask = densities < np.quantile(densities, 0.05)
+        o3d_mesh.remove_vertices_by_mask(low_density_mask)
+
+        verts = np.asarray(o3d_mesh.vertices)
+        faces = np.asarray(o3d_mesh.triangles)
+        vertex_colors = None
+        if o3d_mesh.has_vertex_colors():
+            vertex_colors = (np.asarray(o3d_mesh.vertex_colors) * 255.0).astype(np.uint8)
+        return trimesh.Trimesh(vertices=verts, faces=faces, vertex_colors=vertex_colors)
 
 
 class TrellisAdapter(MeshAdapter):
@@ -1354,6 +1509,7 @@ ADAPTER_REGISTRY = [
     ShapEAdapter,
     TripoSRAdapter,
     SF3DAdapter,
+    VggtAdapter,
     InstantMeshAdapter,
     TrellisAdapter,
     Hunyuan3DAdapter,

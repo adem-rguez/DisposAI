@@ -123,10 +123,10 @@ pub fn local_heuristic_tags_for_file(path: &Path) -> Vec<String> {
                 vec!["text-to-speech".to_string()]
             } else if file_name.contains("whisper") || file_name.contains("wav2vec") || file_name.contains("hubert") || file_name.contains("asr") {
                 vec!["automatic-speech-recognition".to_string()]
-            } else if file_name.contains("stable") || file_name.contains("diffusion") || file_name.contains("sdxl") || file_name.contains("flux") || file_name.contains("vae") || file_name.contains("unet") || file_name.contains("qwen-image") || file_name.contains("image-edit") || file_name.contains("z-image") || file_name.contains("z_image") {
-                image_tag(&file_name)
             } else if file_name.contains("video") || file_name.contains("wan") || file_name.contains("mochi") {
                 vec!["text-to-video".to_string()]
+            } else if file_name.contains("stable") || file_name.contains("diffusion") || file_name.contains("sdxl") || file_name.contains("flux") || file_name.contains("vae") || file_name.contains("unet") || file_name.contains("qwen-image") || file_name.contains("image-edit") || file_name.contains("z-image") || file_name.contains("z_image") {
+                image_tag(&file_name)
             } else if crate::http::is_mesh3d_name(&file_name) {
                 mesh_tags_from_kinds(crate::http::detect_mesh_input_kinds(path))
             } else {
@@ -141,6 +141,8 @@ pub fn local_heuristic_tags_for_file(path: &Path) -> Vec<String> {
                 vec!["automatic-speech-recognition".to_string()]
             } else if file_name.contains("kokoro") || file_name.contains("tts") || file_name.contains("vits") || file_name.contains("bark") {
                 vec!["text-to-speech".to_string()]
+            } else if file_name.contains("video") || file_name.contains("wan") || file_name.contains("mochi") {
+                vec!["text-to-video".to_string()]
             } else {
                 image_tag(&file_name)
             }

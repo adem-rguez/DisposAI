@@ -65,7 +65,7 @@ impl DaemonService for DaemonGrpcService {
             cancel: None,
         };
 
-        let backend = backend_arc.read().await;
+        let mut backend = backend_arc.write().await;
         let res = backend
             .generate(inf_req)
             .await

@@ -228,6 +228,39 @@ impl InferenceBackend for WhisperBackend {
     }
 
     async fn generate(
+        &mut self,
+        request: InferenceRequest,
+    ) -> Result<InferenceResponse, BackendError> {
+        self.generate_impl(request).await
+    }
+
+    async fn generate_stream(
+        &self,
+        request: InferenceRequest,
+    ) -> Result<InferenceStream, BackendError> {
+        if !self.is_loaded() {
+            return Err(BackendError::ModelNotLoaded);
+        }
+
+        let response = self.generate_impl(request.clone()).await?;
+
+        let chunks = vec![Ok(InferenceChunk {
+            request_id: response.request_id,
+            delta_text: response.output_text,
+            delta_data: None,
+            is_final: true,
+            delta_tool_call: None,
+        })];
+
+        Ok(Box::pin(stream::iter(chunks)))
+    }
+}
+
+impl WhisperBackend {
+    /// Shared transcription logic used by both `generate` and
+    /// `generate_stream` (the latter needs `&self` per the trait, so it
+    /// can't call `generate` directly once `generate` became `&mut self`).
+    async fn generate_impl(
         &self,
         request: InferenceRequest,
     ) -> Result<InferenceResponse, BackendError> {
@@ -295,26 +328,5 @@ impl InferenceBackend for WhisperBackend {
             tool_calls: None,
             finish_reason: None,
         })
-    }
-
-    async fn generate_stream(
-        &self,
-        request: InferenceRequest,
-    ) -> Result<InferenceStream, BackendError> {
-        if !self.is_loaded() {
-            return Err(BackendError::ModelNotLoaded);
-        }
-
-        let response = self.generate(request.clone()).await?;
-
-        let chunks = vec![Ok(InferenceChunk {
-            request_id: response.request_id,
-            delta_text: response.output_text,
-            delta_data: None,
-            is_final: true,
-            delta_tool_call: None,
-        })];
-
-        Ok(Box::pin(stream::iter(chunks)))
     }
 }

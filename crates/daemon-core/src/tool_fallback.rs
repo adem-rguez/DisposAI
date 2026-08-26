@@ -9,12 +9,10 @@ pub fn build_tool_prompt(tools: &[ToolSchema]) -> String {
 
     let mut prompt = String::from(
         "\n\nYou orchestrate the other models on this machine through the following tools. \
-         Most messages — greetings, general knowledge questions, chit-chat, anything you can \
-         just answer directly — need NO tool call at all. Only reach for a tool when the user's \
-         request actually requires generating media (speech, an image, a transcription, a video) \
-         or otherwise needs information about what is installed. Never call list_models 'just in \
-         case' or as a default first step — only call it when you specifically need to check what \
-         models are available to fulfill the current request. run_model waits for generation to \
+         Use them proactively when the user's request would benefit from them — if you are asked \
+         for speech, an image, a transcription or a video, run the model that produces it rather \
+         than describing what you would do. When you are unsure what is available, call \
+         list_models first and pick from what it reports. run_model waits for generation to \
          finish and returns the result directly, so you don't need to poll for it.\n\n"
     );
     for tool in tools {
@@ -197,6 +195,116 @@ pub fn detect_tool_intent(
     None
 }
 
+/// Last-resort parse for models that emit JSON without any fence or wrapper —
+/// a bare `{"name": ..., "arguments": {...}}`, or just an argument object whose
+/// keys happen to match one tool's parameters (`{"model": ..., "prompt": ...}`),
+/// optionally batched into an array. Only reached after the native, fenced and
+/// XML forms have all failed, so a false positive costs one wasted hop.
+pub fn parse_loose_json_call(output: &str, tools: &[ToolSchema]) -> Option<ToolCall> {
+    let body = output.rsplit("</think>").next().unwrap_or(output);
+    for (i, ch) in body.char_indices() {
+        if ch != '{' && ch != '[' {
+            continue;
+        }
+        let mut stream =
+            serde_json::Deserializer::from_str(&body[i..]).into_iter::<serde_json::Value>();
+        if let Some(Ok(value)) = stream.next() {
+            if let Some(call) = call_from_json(&value, tools) {
+                return Some(call);
+            }
+        }
+    }
+    None
+}
+
+/// A batch (`[{...}, {...}]`) yields its first usable call — the orchestrator loop
+/// runs one tool per hop and the model re-asks for the rest on the next one.
+fn call_from_json(value: &serde_json::Value, tools: &[ToolSchema]) -> Option<ToolCall> {
+    match value {
+        serde_json::Value::Array(items) => items.iter().find_map(|v| call_from_json(v, tools)),
+        serde_json::Value::Object(map) => {
+            if let Some(name) = map.get("name").and_then(|n| n.as_str()) {
+                if tools.iter().any(|t| t.name == name) {
+                    return Some(ToolCall {
+                        id: format!("loose-{}", Uuid::new_v4()),
+                        name: name.to_string(),
+                        arguments: map
+                            .get("arguments")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::Value::Object(Default::default())),
+                    });
+                }
+            }
+            // Arguments with the tool name stripped off. Accept only when every key
+            // belongs to the same tool and at least two of them match, so a stray
+            // one-field JSON snippet in prose can't trigger a call.
+            for tool in tools {
+                let Some(props) = tool.parameters.get("properties").and_then(|p| p.as_object())
+                else {
+                    continue;
+                };
+                if map.len() >= 2 && map.keys().all(|k| props.contains_key(k)) {
+                    let mut args = map.clone();
+                    // A model improvising this shape also improvises the media handle
+                    // ("/v1/generate/cat"), and run_model treats an unresolvable one as
+                    // fatal. Drop anything that isn't handle-shaped rather than lose the
+                    // whole call to it.
+                    args.retain(|key, value| {
+                        key != "image" || value.as_str().is_none_or(is_media_handle)
+                    });
+                    return Some(ToolCall {
+                        id: format!("loose-{}", Uuid::new_v4()),
+                        name: tool.name.clone(),
+                        arguments: serde_json::Value::Object(args),
+                    });
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// `run_model` accepts a media handle as `/v1/media/<id>` or a bare id.
+fn is_media_handle(value: &str) -> bool {
+    match value.strip_prefix("/v1/media/") {
+        Some(id) => !id.is_empty(),
+        None => !value.is_empty() && !value.contains('/'),
+    }
+}
+
+/// True when the model wrote as if it had already produced media ("Here are your
+/// generated images:", "[An image of a cat]") on a hop where it called no tool at all.
+/// Small models do this constantly — `detect_tool_intent` misses it because the text
+/// never mentions a tool name. The caller turns a hit into one corrective hop rather
+/// than letting the claim reach the user unbacked.
+pub fn claims_unbacked_media(output: &str) -> bool {
+    const CLAIMS: &[&str] = &[
+        "here is the", "here is your", "here is a", "here's the", "here's your", "here's a",
+        "here are the", "here are your", "i've generated", "i have generated", "i generated",
+        "i've created", "i have created", "i created", "i've made", "i have made", "i made",
+        "i've attached", "below is", "below are",
+    ];
+    const MEDIA: &[&str] = &[
+        "image", "picture", "photo", "illustration", "render", "video", "clip", "audio",
+        "sound", "speech", "voice", "song", "mesh", "3d model",
+    ];
+
+    let lower = output.to_lowercase();
+    // Planning to generate inside a reasoning block is fine; only the reply counts.
+    let body = lower.rsplit("</think>").next().unwrap_or(&lower);
+
+    body.split(['.', '\n', ':', '!']).any(|sentence| {
+        let has_media = MEDIA.iter().any(|m| sentence.contains(m));
+        if !has_media {
+            return false;
+        }
+        // A bracketed stand-in ("[an image of a cat]") is a fake on its own.
+        CLAIMS.iter().any(|c| sentence.contains(c))
+            || sentence.trim_start().starts_with('[')
+    })
+}
+
 fn extract_quoted_text(text: &str) -> Option<String> {
     let start = text.find('"')?;
     let rest = &text[start + 1..];
@@ -237,6 +345,75 @@ mod tests {
         let output = "```tool_call\n{\"name\": \"run_model\", \"arguments\": {\"text\": \"hi\"}}\n```";
         let parsed = parse_tool_calls(output).expect("should parse");
         assert_eq!(parsed.tool_call.name, "run_model");
+    }
+
+    #[test]
+    fn parses_unfenced_batched_argument_objects() {
+        // Verbatim shape emitted by flux-orchestration run: an array of run_model
+        // argument objects, no fence and no name/arguments wrapper.
+        let output = r#"I'll create distinct prompts for each.
+[
+  {"model": "flux-2-klein-4b-Q8_0.gguf", "image": "/v1/generate/cat", "prompt": "A fluffy orange tabby cat"},
+  {"model": "flux-2-klein-4b-Q8_0.gguf", "image": "/v1/generate/dog", "prompt": "A golden retriever puppy"}
+]
+Both images will be generated."#;
+        let tools = crate::orchestrator_tools::schemas();
+        let call = parse_loose_json_call(output, &tools).expect("should recover a call");
+        assert_eq!(call.name, "run_model");
+        assert_eq!(call.arguments["model"], "flux-2-klein-4b-Q8_0.gguf");
+        assert_eq!(call.arguments["prompt"], "A fluffy orange tabby cat");
+        // The invented handle must not survive — run_model would reject it outright.
+        assert!(call.arguments.get("image").is_none());
+    }
+
+    #[test]
+    fn real_media_handles_survive_the_loose_parser() {
+        let tools = crate::orchestrator_tools::schemas();
+        for handle in ["/v1/media/abc123", "abc123"] {
+            let output = format!(
+                r#"{{"model": "shap-e.gguf", "image": "{}", "prompt": "a chair"}}"#,
+                handle
+            );
+            let call = parse_loose_json_call(&output, &tools).expect("should parse");
+            assert_eq!(call.arguments["image"], handle);
+        }
+    }
+
+    #[test]
+    fn parses_unfenced_name_arguments_object() {
+        let tools = crate::orchestrator_tools::schemas();
+        let output = r#"{"name": "list_models", "arguments": {"task_tag": "image"}}"#;
+        let call = parse_loose_json_call(output, &tools).expect("should parse");
+        assert_eq!(call.name, "list_models");
+    }
+
+    #[test]
+    fn loose_parser_ignores_unrelated_json() {
+        let tools = crate::orchestrator_tools::schemas();
+        assert!(parse_loose_json_call(r#"Config: {"theme": "dark", "size": 12}"#, &tools).is_none());
+        assert!(parse_loose_json_call("No JSON here at all.", &tools).is_none());
+    }
+
+    #[test]
+    fn detects_faked_media_replies() {
+        assert!(claims_unbacked_media(
+            "I'll generate two images for you.\n\nHere are your generated images:"
+        ));
+        assert!(claims_unbacked_media(
+            "[An image of a cute fluffy orange tabby cat sitting on a windowsill]"
+        ));
+        assert!(claims_unbacked_media("I've created the audio clip you asked for."));
+    }
+
+    #[test]
+    fn planning_and_questions_are_not_faked_media() {
+        assert!(!claims_unbacked_media(
+            "Would you like me to generate these images now, or prefer different prompts?"
+        ));
+        assert!(!claims_unbacked_media("Here is the answer to your question."));
+        assert!(!claims_unbacked_media(
+            "<think>Here is the image I should make.</think>\n\nWhich style do you want?"
+        ));
     }
 
     #[test]

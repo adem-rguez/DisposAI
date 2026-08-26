@@ -41,6 +41,7 @@ import inspect
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -298,8 +299,207 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": str(e)})
 
 
+# Base repo used only as a source for the shared non-quantized LTX-Video
+# components (text_encoder/tokenizer/scheduler, and vae if none is found
+# locally) when loading a bare .gguf/.safetensors LTX transformer that isn't
+# packaged as a full diffusers pipeline directory.
+LTX_BASE_REPO = "Lightricks/LTX-Video"
+
+# Weights file extensions considered "main weights" candidates when scanning
+# a directory for a loose (non model_index.json) checkpoint.
+_WEIGHTS_EXTS = {".gguf", ".safetensors", ".ckpt", ".bin", ".pt", ".pth"}
+_VAE_EXTS = {".gguf", ".safetensors", ".bin", ".pt", ".pth"}
+
+# Set from --ltx-components-dir. When it holds a complete set of the files
+# below, the LTX-Video text_encoder/tokenizer/scheduler are built from these
+# local files instead of silently auto-downloading them from LTX_BASE_REPO
+# (see crates/backends/video-backend's `detect_video_components`, which lets
+# the UI offer these as a visible, user-triggered download with progress).
+LTX_COMPONENTS_DIR = None
+
+_LTX_TEXT_ENCODER_FILES = (
+    "config.json",
+    "model.safetensors.index.json",
+    "model-00001-of-00004.safetensors",
+    "model-00002-of-00004.safetensors",
+    "model-00003-of-00004.safetensors",
+    "model-00004-of-00004.safetensors",
+)
+_LTX_TOKENIZER_FILES = ("added_tokens.json", "special_tokens_map.json", "spiece.model", "tokenizer_config.json")
+_LTX_SCHEDULER_FILES = ("scheduler_config.json",)
+
+
+def _ltx_local_components_complete(components_dir):
+    if not components_dir:
+        return False
+    checks = (
+        ("text_encoder", _LTX_TEXT_ENCODER_FILES),
+        ("tokenizer", _LTX_TOKENIZER_FILES),
+        ("scheduler", _LTX_SCHEDULER_FILES),
+    )
+    return all(
+        os.path.isfile(os.path.join(components_dir, subdir, name))
+        for subdir, files in checks
+        for name in files
+    )
+
+
+def _load_ltx_local_pipeline_components(components_dir):
+    """Build text_encoder/tokenizer/scheduler from a complete local
+    components dir (see `_ltx_local_components_complete`)."""
+    from transformers import T5EncoderModel, T5TokenizerFast
+
+    text_encoder = T5EncoderModel.from_pretrained(
+        os.path.join(components_dir, "text_encoder"), torch_dtype=torch.float16,
+    )
+    tokenizer = T5TokenizerFast.from_pretrained(os.path.join(components_dir, "tokenizer"))
+    scheduler = diffusers.FlowMatchEulerDiscreteScheduler.from_pretrained(os.path.join(components_dir, "scheduler"))
+    return {"text_encoder": text_encoder, "tokenizer": tokenizer, "scheduler": scheduler}
+
+
+def _filename_is_vae(name: str) -> bool:
+    """True if `name` (a bare filename) identifies a VAE weights file: "vae"
+    appears as a distinct word-boundary token in the filename stem (split on
+    `_`/`-`/`.`), e.g. "vae.safetensors" or "ltx_vae.gguf". Case-insensitive.
+    Mirrors `filename_is_vae` in crates/daemon-core/src/http.rs."""
+    stem = os.path.splitext(name)[0].lower()
+    return "vae" in re.split(r"[_\-.]", stem)
+
+
+def _find_loose_main_weights(directory: str):
+    """Find a loose (non model_index.json) main weights file directly inside
+    `directory`, skipping VAE and mmproj companion files."""
+    try:
+        entries = os.listdir(directory)
+    except OSError:
+        return None
+    for entry in sorted(entries):
+        full = os.path.join(directory, entry)
+        if not os.path.isfile(full):
+            continue
+        ext = os.path.splitext(entry)[1].lower()
+        if ext not in _WEIGHTS_EXTS:
+            continue
+        if _filename_is_vae(entry) or "mmproj" in entry.lower():
+            continue
+        return full
+    return None
+
+
+def _find_sibling_vae(main_weights_path: str):
+    """Look for a same-directory sibling VAE file for `main_weights_path`
+    (e.g. LTX-Video repos ship `ltx-video.gguf` + `vae.gguf` as loose
+    root-level siblings). Mirrors `find_sibling_vae` in http.rs."""
+    directory = os.path.dirname(main_weights_path) or "."
+    try:
+        entries = os.listdir(directory)
+    except OSError:
+        return None
+    for entry in sorted(entries):
+        full = os.path.join(directory, entry)
+        if full == main_weights_path or not os.path.isfile(full):
+            continue
+        ext = os.path.splitext(entry)[1].lower()
+        if ext in _VAE_EXTS and _filename_is_vae(entry):
+            return full
+    return None
+
+
+def _load_ltx_pipeline_from_single_files(transformer_path: str):
+    """Build an LTXPipeline from a loose (bare) transformer weights file
+    (`.gguf` or `.safetensors`), with an optional sibling VAE file, pulling
+    any other required components (text_encoder/tokenizer/scheduler, and vae
+    if not found locally) from LTX_BASE_REPO."""
+    required_symbols = ("LTXVideoTransformer3DModel", "AutoencoderKLLTXVideo", "GGUFQuantizationConfig", "LTXPipeline")
+    missing = [s for s in required_symbols if not hasattr(diffusers, s)]
+    if missing:
+        raise RuntimeError(
+            f"Cannot load LTX-Video model from loose weights file {transformer_path!r}: "
+            f"installed diffusers ({getattr(diffusers, '__version__', '?')}) is missing "
+            f"{', '.join('diffusers.' + s for s in missing)}. Upgrade diffusers to a version "
+            "with LTX-Video single-file loading support."
+        )
+
+    ext = os.path.splitext(transformer_path)[1].lower()
+    if ext not in (".gguf", ".safetensors"):
+        raise RuntimeError(
+            f"Cannot load LTX-Video transformer from {transformer_path!r}: unsupported "
+            f"extension {ext!r} (expected .gguf or .safetensors)."
+        )
+
+    try:
+        if ext == ".gguf":
+            transformer = diffusers.LTXVideoTransformer3DModel.from_single_file(
+                transformer_path,
+                quantization_config=diffusers.GGUFQuantizationConfig(compute_dtype=torch.float16),
+                torch_dtype=torch.float16,
+            )
+        else:
+            transformer = diffusers.LTXVideoTransformer3DModel.from_single_file(
+                transformer_path, torch_dtype=torch.float16,
+            )
+
+        vae_path = _find_sibling_vae(transformer_path)
+        vae = None
+        if vae_path:
+            # diffusers' LTX VAE conversion expects checkpoint keys prefixed with
+            # "vae." (it filters a combined pipeline checkpoint by that prefix),
+            # but standalone VAE-only files like this one store keys unprefixed
+            # (e.g. "encoder.conv_out.conv.weight"). from_single_file accepts an
+            # in-memory state dict directly, so prefix it ourselves rather than
+            # writing a rewritten copy of a multi-GB file to disk.
+            from safetensors.torch import load_file as _load_safetensors_file
+
+            vae_state_dict = _load_safetensors_file(vae_path)
+            if not any(k.startswith("vae.") for k in vae_state_dict):
+                vae_state_dict = {f"vae.{k}": v for k, v in vae_state_dict.items()}
+
+            # Do NOT pass `config=` here: diffusers auto-detects the LTX-Video
+            # *version* (0.9.0 / 0.9.1 / 0.9.5 / ...) from marker keys like
+            # "vae.decoder.last_scale_shift_table", each version having a
+            # differently-shaped VAE. Forcing a fixed base-repo config caused a
+            # 0.9.1 VAE checkpoint to be loaded against the 0.9.0 architecture
+            # (mismatched channel counts). Auto-detection only works now that
+            # the checkpoint keys carry the "vae." prefix it looks for.
+            vae = diffusers.AutoencoderKLLTXVideo.from_single_file(
+                vae_state_dict, torch_dtype=torch.float16,
+            )
+
+        pipeline_kwargs = {"transformer": transformer, "torch_dtype": torch.float16}
+        if vae is not None:
+            pipeline_kwargs["vae"] = vae
+
+        if _ltx_local_components_complete(LTX_COMPONENTS_DIR):
+            print(f"Loading LTX-Video pipeline components from local cache: {LTX_COMPONENTS_DIR}", file=sys.stderr)
+            pipeline_kwargs.update(_load_ltx_local_pipeline_components(LTX_COMPONENTS_DIR))
+            pipe = diffusers.LTXPipeline(**pipeline_kwargs)
+        else:
+            pipe = diffusers.LTXPipeline.from_pretrained(LTX_BASE_REPO, **pipeline_kwargs)
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to load LTX-Video pipeline from local weights {transformer_path!r} "
+            f"(base repo {LTX_BASE_REPO!r} used for missing components): {e}"
+        ) from e
+
+    return pipe
+
+
 def load_pipeline(model_path: str):
-    pipe = diffusers.DiffusionPipeline.from_pretrained(model_path, torch_dtype=torch.float16)
+    is_full_pipeline_dir = os.path.isdir(model_path) and os.path.isfile(os.path.join(model_path, "model_index.json"))
+
+    loose_transformer_path = None
+    if not is_full_pipeline_dir:
+        if os.path.isfile(model_path) and os.path.splitext(model_path)[1].lower() in (".gguf", ".safetensors"):
+            loose_transformer_path = model_path
+        elif os.path.isdir(model_path):
+            loose_transformer_path = _find_loose_main_weights(model_path)
+
+    if loose_transformer_path is not None:
+        pipe = _load_ltx_pipeline_from_single_files(loose_transformer_path)
+    else:
+        pipe = diffusers.DiffusionPipeline.from_pretrained(model_path, torch_dtype=torch.float16)
 
     # Opportunistically apply whatever VRAM-saving hooks the loaded pipeline
     # exposes. Never hardcode which architectures have them — just probe.
@@ -334,12 +534,15 @@ def load_pipeline(model_path: str):
 
 
 def main():
-    global PIPE, DEVICE
+    global PIPE, DEVICE, LTX_COMPONENTS_DIR
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--port", type=int, required=True)
+    parser.add_argument("--ltx-components-dir", default=None)
     args = parser.parse_args()
+
+    LTX_COMPONENTS_DIR = args.ltx_components_dir
 
     print(f"Loading diffusers video pipeline from {args.model_path}...", file=sys.stderr)
 

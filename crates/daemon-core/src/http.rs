@@ -38,6 +38,20 @@ pub struct LoadedModelEntry {
     /// which input kinds this model accepts (subset of "text", "image",
     /// "multi_image"). `None` for other models.
     pub mesh_input_kinds: Option<Vec<String>>,
+    /// Readiness of the underlying spawned backend process: "loading" while
+    /// it's still starting up (weights not yet in VRAM / not yet serving),
+    /// "ready" once it responds to health checks, or "error" if it failed or
+    /// timed out. Callers should treat a missing/absent value as "ready" for
+    /// backwards compatibility. See `poll_llama_server_ready`.
+    #[serde(default = "default_ready_status")]
+    pub status: String,
+    /// Human-readable detail when `status` is "error".
+    #[serde(default)]
+    pub status_message: Option<String>,
+}
+
+fn default_ready_status() -> String {
+    "ready".to_string()
 }
 
 /// Backwards-compat status for single-model callers
@@ -99,6 +113,23 @@ pub struct AppState {
     /// it" to the right media handle, and lets the orchestrator fall back to the most
     /// recent matching asset when a media-consuming tool call omits its argument.
     pub generated_assets: GeneratedAssetRegistry,
+    /// Progress records for Python environment installs (sd/video/tts/mesh3d),
+    /// keyed by backend key. See `venv_dir_for_backend`.
+    pub install_progress: Arc<tokio::sync::Mutex<HashMap<String, InstallProgress>>>,
+}
+
+/// Progress record for a Python backend environment install (e.g. `.venv-sd`),
+/// driven by `scripts/setup_*_env.py`'s `PROGRESS: {...}` stdout lines.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallProgress {
+    pub backend: String,
+    pub phase: String,
+    pub step: u32,
+    pub total: u32,
+    pub percent: f32,
+    pub status: String,
+    pub message: Option<String>,
+    pub updated_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,6 +235,9 @@ pub struct ChatCompletionRequest {
     /// resolve correctly across separate HTTP requests in the same conversation.
     /// Requests without one share a common `"default"` bucket (backward compatible).
     pub conversation_id: Option<String>,
+    /// Caller-supplied system prompt overriding the hardcoded default persona.
+    #[serde(default)]
+    pub system_prompt: Option<String>,
 }
 
 /// Conversation bucket key for the generated-assets registry, falling back to a
@@ -422,15 +456,19 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/cluster/nodes", get(list_cluster_nodes))
         .route("/v1/model/hf-search", get(hf_search))
         .route("/v1/model/hf-files", get(hf_files))
+        .route("/v1/model/hf-avatar", get(hf_avatar))
         .route("/v1/model/hf-download", post(hf_download))
         .route("/v1/model/hf-token", post(hf_set_token).get(hf_get_token_status))
         .route("/v1/model/hf-download/status", get(hf_download_status))
         .route("/v1/model/hf-download/cancel", post(hf_download_cancel))
+        .route("/v1/env/install/:backend", post(install_env))
+        .route("/v1/env/install/:backend/status", get(install_env_status))
         .route("/v1/model/open-folder", post(open_model_folder))
         .route("/v1/model/delete", post(delete_model))
         .route("/v1/jobs", get(list_jobs))
         .route("/v1/jobs/:id/progress", get(get_job_progress))
         .route("/v1/jobs/:id/cancel", post(cancel_job))
+        .route("/v1/conversations/:id/reset-assets", post(reset_conversation_assets))
         .with_state(state)
 }
 
@@ -1490,19 +1528,33 @@ async fn stream_chat_completions(
     Json(payload): Json<StreamChatRequest>,
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>, (axum::http::StatusCode, String)> {
 
-    // Determine which port to send to
-    let port: u16 = {
+    // Determine which port to send to, and keep the resolved model entry around
+    // in case the orchestrator process has died and needs to be reloaded below.
+    let (port, orch_entry): (u16, Option<LoadedModelEntry>) = {
         let models = state.loaded_models.lock().await;
-        if let Some(mid) = &payload.model_id {
-            // Route to the requested model
-            models.get(mid)
-                .map(|e| e.port)
-                .unwrap_or(50052)
+        let entry = if let Some(mid) = &payload.model_id {
+            // Route to the requested model. The frontend caches a model_id from
+            // whenever it last loaded/selected a model, but `run_model`'s
+            // orchestrator-reload cycle (VRAM-swap for media jobs, or recovery
+            // from a crash) always allocates a fresh model_id/port and drops the
+            // old entry — so a stale client-held id can go stale mid-session.
+            // Fall back to whatever chat-capable model is actually loaded now
+            // rather than falling through to the hardcoded default port below.
+            models.get(mid).cloned().or_else(|| {
+                models
+                    .values()
+                    .find(|e| crate::task_tags::backend_category_for_tags(&e.task_tags).is_none())
+                    .cloned()
+            })
         } else {
             // Chat needs a model that speaks /v1/chat/completions. Tool calls can
             // load speech or image models alongside it, so never route to those.
-            first_chat_port(&models)
-        }
+            models
+                .values()
+                .find(|e| crate::task_tags::backend_category_for_tags(&e.task_tags).is_none())
+                .cloned()
+        };
+        (entry.as_ref().map(|e| e.port).unwrap_or(50052), entry)
     };
 
     // Auto-load via backend trait if nothing is loaded yet (backwards compat)
@@ -1567,20 +1619,27 @@ async fn stream_chat_completions(
     } else {
         vec![]
     };
+    let base_prompt = payload.inner.system_prompt.as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("You are a helpful, knowledgeable AI assistant");
     let system_content = if !tool_schemas.is_empty() {
-        let fallback_prompt = tool_fallback::build_tool_prompt(&tool_schemas);
+        let fallback_prompt = format!(
+            "{}{}",
+            orchestrator_tools::installed_models_note(&state).await,
+            tool_fallback::build_tool_prompt(&tool_schemas),
+        );
         format!(
-            "You are a helpful, knowledgeable AI assistant that also orchestrates the other models \
+            "{} that also orchestrates the other models \
              installed on this machine. You can discover what is available and run any of it — \
-             image generation, speech, transcription, video — when the user's request actually \
-             calls for it; when it does, don't just describe what you could do, actually do it. \
+             image generation, speech, transcription, video — when the user's request calls for it. \
+             Use tools proactively; don't just describe what you could do, actually do it. \
              run_model waits for generation to finish and hands you the result directly, so you \
-             don't need to poll for it. For everything else — questions, conversation, requests \
-             you can just answer — reply normally without calling any tool.{}",
-            fallback_prompt
+             don't need to poll for it.{}",
+            base_prompt, fallback_prompt
         )
     } else {
-        "You are a helpful, knowledgeable AI assistant.".to_string()
+        format!("{}.", base_prompt)
     };
     let system_content = match &image_media_id {
         Some(id) => format!("{}{}", system_content, image_handle_note(id)),
@@ -1590,6 +1649,12 @@ async fn stream_chat_completions(
         "{}{}",
         system_content,
         generated_assets_manifest(&state, &conversation_id).await
+    );
+    tracing::info!(
+        "orchestrator system prompt ({} chars, {} tools offered):\n{}",
+        system_content.len(),
+        tool_schemas.len(),
+        system_content
     );
 
     let mut chat_messages: Vec<serde_json::Value> = vec![
@@ -1642,14 +1707,33 @@ async fn stream_chat_completions(
     let top_p = payload.inner.top_p.unwrap_or(0.9);
     let thinking = payload.inner.enable_thinking.unwrap_or(true);
 
-    let url = format!("http://127.0.0.1:{}/v1/chat/completions", port);
+    let mut url = format!("http://127.0.0.1:{}/v1/chat/completions", port);
     let client = reqwest::Client::builder().no_proxy().build().unwrap_or_else(|_| reqwest::Client::new());
-    let upstream = client
-        .post(&url)
-        .json(&stream_request_body(&chat_messages, &tools_json, max_tokens, temperature, top_p, thinking))
-        .send()
-        .await
-        .map_err(|e| (axum::http::StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let initial_body = stream_request_body(&chat_messages, &tools_json, max_tokens, temperature, top_p, thinking);
+    let mut upstream_result = client.post(&url).json(&initial_body).send().await;
+    if let Err(e) = &upstream_result {
+        // The orchestrator's llama-server may have died (e.g. crashed under VRAM
+        // pressure from a media job). Reload it from the entry we already have
+        // and retry once before giving up. `reload_orchestrator` allocates a new
+        // port for the respawned process, so `url` must be updated to match —
+        // retrying against the old `port` would just hit the dead process again.
+        if let Some(orch) = &orch_entry {
+            tracing::warn!(
+                "stream_chat_completions: initial connect to orchestrator at port {} failed ({}); reloading and retrying once",
+                port, e
+            );
+            if let Some(new_entry) = orchestrator_tools::reload_orchestrator(&state, orch).await {
+                url = format!("http://127.0.0.1:{}/v1/chat/completions", new_entry.port);
+                upstream_result = client.post(&url).json(&initial_body).send().await;
+            }
+        }
+    }
+    let upstream = upstream_result.map_err(|e| {
+        (
+            axum::http::StatusCode::BAD_GATEWAY,
+            format!("orchestrator model is not responding and could not be automatically recovered: {}", e),
+        )
+    })?;
 
     let last_user_prompt = payload.inner.messages.iter().rev()
         .find(|m| m.role == "user")
@@ -1672,11 +1756,27 @@ async fn stream_chat_completions(
         // Set when the loop exhausts MAX_TOOL_HOPS while the model still wanted
         // to call a tool on the final hop (as opposed to naturally finishing).
         let mut hop_exhausted_with_tool = false;
+        // One corrective hop is allowed per turn when the model claims it produced
+        // media without ever calling a tool. Tracked alongside whether any tool has
+        // actually run, since describing a real result trips the same detector.
+        let mut media_correction_sent = false;
+        let mut any_tool_ran = false;
 
         for hop in 0..MAX_TOOL_HOPS {
             let response = match pending.take() {
                 Some(response) => response,
                 None => {
+                    // A tool call (e.g. run_model) may have unloaded and reloaded the
+                    // orchestrator to make VRAM room, which lands it on a *new* port.
+                    // Re-resolve the port fresh from current state rather than reusing
+                    // the possibly-stale `url` captured before this hop, or the
+                    // follow-up request silently dies against the old, now-unloaded
+                    // process — leaving the tool result without any reaction.
+                    let current_port = {
+                        let models = task_state.loaded_models.lock().await;
+                        first_chat_port(&models)
+                    };
+                    url = format!("http://127.0.0.1:{}/v1/chat/completions", current_port);
                     let body = stream_request_body(&messages, &tools_json, max_tokens, temperature, top_p, thinking);
                     match client.post(&url).json(&body).send().await {
                         Ok(response) => response,
@@ -1770,6 +1870,7 @@ async fn stream_chat_completions(
 
             let resolved_call = native_call
                 .or_else(|| tool_fallback::parse_tool_calls(&combined).map(|parsed| parsed.tool_call))
+                .or_else(|| tool_fallback::parse_loose_json_call(&combined, &task_tool_schemas))
                 .or_else(|| {
                     // Loose intent matching only on the opening turn: once a tool has
                     // run, the model names it while describing the result, which would
@@ -1782,10 +1883,39 @@ async fn stream_chat_completions(
                 });
 
             let Some(tool_call) = resolved_call else {
+                tracing::warn!(
+                    "stream_chat_completions: hop {} parsed NO tool call from output:\n{}",
+                    hop, combined
+                );
+                // No tool call, but the model talks as though it had already produced
+                // media. Nothing was generated — tell it so and give it one more hop
+                // instead of letting the claim stand.
+                if !media_correction_sent
+                    && !any_tool_ran
+                    && tool_fallback::claims_unbacked_media(&accumulated_content)
+                {
+                    media_correction_sent = true;
+                    tracing::info!("stream_chat_completions: hop {} claimed media with no tool call; correcting", hop);
+                    messages.push(serde_json::json!({
+                        "role": "assistant",
+                        "content": accumulated_content,
+                    }));
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": "You did not call run_model, so nothing was generated and I \
+                                    received no media — only your text. Call run_model now, using \
+                                    one of the model names listed in your instructions and a \
+                                    generation prompt you write yourself. Do not reply with prose \
+                                    or ask me anything until the call is made; if I asked for \
+                                    several items, call it once per item.",
+                    }));
+                    continue;
+                }
                 break;
             };
 
             tracing::info!("stream_chat_completions: hop {} calls tool '{}'", hop, tool_call.name);
+            any_tool_ran = true;
 
             let job_id = format!("tool-{}", uuid::Uuid::new_v4());
 
@@ -2012,20 +2142,27 @@ async fn chat_completions(
     } else {
         vec![]
     };
+    let base_prompt = payload.system_prompt.as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("You are a helpful, knowledgeable AI assistant");
     let system_content = if !tool_schemas.is_empty() {
-        let fallback_prompt = tool_fallback::build_tool_prompt(&tool_schemas);
+        let fallback_prompt = format!(
+            "{}{}",
+            orchestrator_tools::installed_models_note(&state).await,
+            tool_fallback::build_tool_prompt(&tool_schemas),
+        );
         format!(
-            "You are a helpful, knowledgeable AI assistant that also orchestrates the other models \
+            "{} that also orchestrates the other models \
              installed on this machine. You can discover what is available and run any of it — \
-             image generation, speech, transcription, video — when the user's request actually \
-             calls for it; when it does, don't just describe what you could do, actually do it. \
+             image generation, speech, transcription, video — when the user's request calls for it. \
+             Use tools proactively; don't just describe what you could do, actually do it. \
              run_model waits for generation to finish and hands you the result directly, so you \
-             don't need to poll for it. For everything else — questions, conversation, requests \
-             you can just answer — reply normally without calling any tool.{}",
-            fallback_prompt
+             don't need to poll for it.{}",
+            base_prompt, fallback_prompt
         )
     } else {
-        "You are a helpful, knowledgeable AI assistant.".to_string()
+        format!("{}.", base_prompt)
     };
     let system_content = match &image_media_id {
         Some(id) => format!("{}{}", system_content, image_handle_note(id)),
@@ -2221,6 +2358,10 @@ async fn chat_completions(
 
         let resolved_call = tool_fallback::parse_tool_calls(&combined_text)
             .map(|parsed| (parsed.text_before, parsed.tool_call))
+            .or_else(|| {
+                tool_fallback::parse_loose_json_call(&combined_text, &tool_schemas)
+                    .map(|tc| (combined_text.clone(), tc))
+            })
             .or_else(|| {
                 tool_fallback::detect_tool_intent(&combined_text, &tool_schemas, last_user_prompt)
                     .map(|tc| (combined_text.clone(), tc))
@@ -2522,7 +2663,7 @@ async fn generate_images(
     let mut inf_req = inf_req;
     inf_req.cancel = Some(cancel_flag);
 
-    let backend = backend_arc.read().await;
+    let mut backend = backend_arc.write().await;
     let inf_res = backend.generate(inf_req).await;
     done_flag.store(true, AtomicOrdering::Relaxed);
     poller.abort();
@@ -2533,6 +2674,10 @@ async fn generate_images(
         Err(e) => {
             finalize_job_progress(&state, &job_id, "image", Some(&e.to_string())).await;
             return Err(match e {
+                backend_trait::BackendError::EnvNotInstalled(backend_key) => {
+                    let (status, body) = env_not_installed_error(&backend_key);
+                    GenerateImagesError::Simple(status, body)
+                }
                 backend_trait::BackendError::MissingComponents(list) => {
                     GenerateImagesError::MissingComponents(list)
                 }
@@ -2639,7 +2784,7 @@ async fn generate_mesh3d(
     let mut inf_req = inf_req;
     inf_req.cancel = Some(cancel_flag);
 
-    let backend = backend_arc.read().await;
+    let mut backend = backend_arc.write().await;
     let inf_res = backend.generate(inf_req).await;
     done_flag.store(true, AtomicOrdering::Relaxed);
     poller.abort();
@@ -2649,7 +2794,12 @@ async fn generate_mesh3d(
         Ok(res) => res,
         Err(e) => {
             finalize_job_progress(&state, &job_id, "mesh", Some(&e.to_string())).await;
-            return Err((axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+            return Err(match e {
+                backend_trait::BackendError::EnvNotInstalled(backend_key) => {
+                    env_not_installed_error(&backend_key)
+                }
+                other => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+            });
         }
     };
     finalize_job_progress(&state, &job_id, "mesh", None).await;
@@ -2755,7 +2905,7 @@ async fn generate_videos(
     let mut inf_req = inf_req;
     inf_req.cancel = Some(cancel_flag);
 
-    let backend = backend_arc.read().await;
+    let mut backend = backend_arc.write().await;
     let inf_res = backend.generate(inf_req).await;
     done_flag.store(true, AtomicOrdering::Relaxed);
     poller.abort();
@@ -2765,7 +2915,12 @@ async fn generate_videos(
         Ok(res) => res,
         Err(e) => {
             finalize_job_progress(&state, &job_id, "video", Some(&e.to_string())).await;
-            return Err((axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+            return Err(match e {
+                backend_trait::BackendError::EnvNotInstalled(backend_key) => {
+                    env_not_installed_error(&backend_key)
+                }
+                other => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+            });
         }
     };
     finalize_job_progress(&state, &job_id, "video", None).await;
@@ -2799,7 +2954,7 @@ async fn get_mesh3d_schema(
             "No 3D backend registered".to_string(),
         ))?;
 
-    let backend = backend_arc.read().await;
+    let mut backend = backend_arc.write().await;
     match backend.get_param_schema().await {
         Some(schema) => Ok(Json(schema)),
         None => Err((
@@ -2824,7 +2979,7 @@ async fn get_video_schema(
             "No video backend registered".to_string(),
         ))?;
 
-    let backend = backend_arc.read().await;
+    let mut backend = backend_arc.write().await;
     match backend.get_param_schema().await {
         Some(schema) => Ok(Json(schema)),
         None => Err((
@@ -2886,7 +3041,7 @@ async fn transcribe_audio(
         }
     }
 
-    let backend = backend_arc.read().await;
+    let mut backend = backend_arc.write().await;
     let inf_res = backend.generate(inf_req).await.map_err(|e| {
         (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -2964,7 +3119,7 @@ async fn synthesize_speech(
     let mut inf_req = inf_req;
     inf_req.cancel = Some(cancel_flag);
 
-    let backend = backend_arc.read().await;
+    let mut backend = backend_arc.write().await;
     let inf_res = backend.generate(inf_req).await;
     state.job_cancel.lock().await.remove(&job_id);
 
@@ -2972,7 +3127,12 @@ async fn synthesize_speech(
         Ok(res) => res,
         Err(e) => {
             finalize_job_progress(&state, &job_id, "tts", Some(&e.to_string())).await;
-            return Err((axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+            return Err(match e {
+                backend_trait::BackendError::EnvNotInstalled(backend_key) => {
+                    env_not_installed_error(&backend_key)
+                }
+                other => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+            });
         }
     };
     finalize_job_progress(&state, &job_id, "tts", None).await;
@@ -3048,6 +3208,17 @@ async fn get_job_progress(
 /// started directly via `/v1/images|models3d|audio` or by the orchestrator's
 /// `run_model` tool). Sets the job's cancel flag; the backend polls it and
 /// aborts the in-flight `sd.exe` process / HTTP request cooperatively.
+/// Clears a conversation's generated-assets bucket. Called when the user edits
+/// and resends an earlier message, since discarded turns may have generated
+/// assets that should no longer be resolvable via pronoun references.
+async fn reset_conversation_assets(
+    State(state): State<AppState>,
+    axum::extract::Path(conversation_id): axum::extract::Path<String>,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    crate::media_store::clear_conversation_assets(&state.generated_assets, &conversation_id).await;
+    (axum::http::StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+}
+
 async fn cancel_job(
     State(state): State<AppState>,
     axum::extract::Path(job_id): axum::extract::Path<String>,
@@ -3103,6 +3274,10 @@ pub struct DetectedModelEntry {
     /// A vision GGUF also needs a local image projector before chat can accept images.
     pub image_input_available: bool,
     pub mmproj_path: Option<String>,
+    /// For models shipped as a loose main-weights file plus a flat
+    /// root-level VAE sibling (e.g. LTX-Video's `model.safetensors` +
+    /// `vae.safetensors`), the resolved path to that sibling VAE file.
+    pub vae_path: Option<String>,
     /// For mesh3d models (task_tags containing "text-to-3d"/"image-to-3d"),
     /// which input kinds this model accepts (subset of "text", "image",
     /// "multi_image"). `None` for other models.
@@ -3122,6 +3297,67 @@ pub struct DetectedModelEntry {
     /// text-encoder/VAE components. `None` for models that aren't
     /// split-checkpoint diffusion-model files.
     pub image_components: Option<Vec<sd_backend::ImageComponentStatus>>,
+    /// For loose single-file LTX-Video checkpoints: the resolved (or
+    /// missing, with a download source) pipeline components (text encoder,
+    /// tokenizer, scheduler) that would otherwise be silently auto-downloaded
+    /// on first generation. `None` for models that don't need this.
+    pub video_components: Option<Vec<video_backend::VideoComponentStatus>>,
+}
+
+/// True if `name` (a bare filename, not a full path) identifies a VAE
+/// weights file — either exactly "vae.<ext>" or with "vae" appearing as a
+/// distinct word-boundary token in the filename stem (split on `_`/`-`/`.`),
+/// e.g. "ltx_vae.safetensors" or "vae-fp16.gguf". Case-insensitive. Avoids
+/// false positives on names that merely contain "vae" as a substring.
+fn filename_is_vae(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let stem = lower.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(lower.as_str());
+    stem.split(['_', '-', '.']).any(|token| token == "vae")
+}
+
+/// Given the path to a repo's main weights file, look for a same-directory
+/// sibling file that is a flat (non-subfolder) VAE, e.g. LTX-Video repos
+/// ship `model.safetensors` + `vae.safetensors` as loose root-level siblings
+/// rather than nesting the VAE under a `vae/` subfolder.
+fn find_sibling_vae(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let directory = path.parent()?;
+    std::fs::read_dir(directory).ok().into_iter().flatten().flatten().find_map(|entry| {
+        let entry_path = entry.path();
+        if entry_path == path {
+            return None;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if filename_is_vae(&name) {
+            Some(entry_path)
+        } else {
+            None
+        }
+    })
+}
+
+/// Given the path to a loose VAE file, look for a same-directory sibling
+/// that is the VAE's main weights file (i.e. another model weights file
+/// that is not itself a VAE or mmproj companion). Used to determine whether
+/// a loose VAE file belongs to a sibling model (and so should not become
+/// its own standalone catalog entry).
+fn find_sibling_main_weights_for_vae(vae_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let directory = vae_path.parent()?;
+    std::fs::read_dir(directory).ok().into_iter().flatten().flatten().find_map(|entry| {
+        let entry_path = entry.path();
+        if entry_path == vae_path || entry_path.is_dir() {
+            return None;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let is_weights_ext = entry_path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "gguf" | "safetensors" | "ckpt" | "bin" | "pt" | "pth"));
+        if is_weights_ext && !filename_is_vae(&name) && !name.to_ascii_lowercase().contains("mmproj") {
+            Some(entry_path)
+        } else {
+            None
+        }
+    })
 }
 
 fn find_sibling_mmproj(path: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -3220,6 +3456,7 @@ const MESH3D_NAME_TOKENS: &[&str] = &[
     "instantmesh", "instant-mesh", "instant_mesh", "trellis", "hunyuan3d", "hunyuan-3d",
     "hunyuan_3d", "sf3d", "stable-fast-3d", "stable_fast_3d", "zero123", "zero-1-2-3",
     "wonder3d", "sv3d", "lgm", "crm", "-3d", "_3d", " 3d", "llama-mesh", "llama_mesh", "llamamesh",
+    "vggt", "vggt-1b", "vggt_1b",
 ];
 
 pub(crate) fn is_mesh3d_name(file_name: &str) -> bool {
@@ -3247,6 +3484,8 @@ pub(crate) fn detect_mesh_input_kinds(path: &std::path::Path) -> Option<Vec<Stri
         || file_name.contains("stable-fast-3d") || file_name.contains("stable_fast_3d")
     {
         vec!["image".to_string()]
+    } else if file_name.contains("vggt") {
+        vec!["image".to_string(), "multi_image".to_string()]
     } else if file_name.contains("instantmesh") || file_name.contains("instant-mesh") || file_name.contains("instant_mesh")
         || file_name.contains("wonder3d") || file_name.contains("sv3d") || file_name.contains("zero123")
         || file_name.contains("zero-1-2-3")
@@ -3389,11 +3628,13 @@ fn hf_model_dir_entry(dir: &std::path::Path) -> Option<DetectedModelEntry> {
         max_context_size: None,
         image_input_available: crate::task_tags::image_input_available(&task_tags),
         mmproj_path: None,
+        vae_path: None,
         mesh_input_kinds,
         mesh_vae_path,
         mesh_texgen_path,
         mesh_components: is_mesh3d.then_some(mesh_components),
         image_components: None,
+        video_components: None,
         task_tags,
     })
 }
@@ -3425,12 +3666,14 @@ fn collect_model_files(directory: &std::path::Path, entries: &mut Vec<DetectedMo
                     max_context_size: None,
                     image_input_available: false,
                     mmproj_path: None,
+                    vae_path: None,
                     task_tags: crate::task_tags::mesh_tags_from_kinds(mesh_input_kinds.clone()),
                     mesh_input_kinds,
                     mesh_vae_path,
                     mesh_texgen_path,
                     mesh_components: Some(mesh_components),
                     image_components: None,
+                    video_components: None,
                 });
                 continue;
             }
@@ -3447,6 +3690,14 @@ fn collect_model_files(directory: &std::path::Path, entries: &mut Vec<DetectedMo
             if file_name_lower.contains("mmproj") {
                 continue;
             }
+            // A loose, flat (non-subfolder) VAE sibling (e.g. LTX-Video's
+            // vae.safetensors next to model.safetensors) is a companion
+            // component, not a standalone model — it gets attached to its
+            // sibling main-weights entry below instead of getting its own
+            // catalog entry.
+            if filename_is_vae(&file_name_lower) && find_sibling_main_weights_for_vae(&path).is_some() {
+                continue;
+            }
             let size_bytes = child.metadata().map(|metadata| metadata.len()).unwrap_or(0);
             let task_tags = path
                 .parent()
@@ -3455,8 +3706,11 @@ fn collect_model_files(directory: &std::path::Path, entries: &mut Vec<DetectedMo
             let is_mesh3d = task_tags.iter().any(|t| t == "text-to-3d" || t == "image-to-3d");
             let mesh_input_kinds = if is_mesh3d { detect_mesh_input_kinds(&path) } else { None };
             let sibling_mmproj = find_sibling_mmproj(&path).map(|p| p.to_string_lossy().to_string());
+            let sibling_vae = find_sibling_vae(&path).map(|p| p.to_string_lossy().to_string());
             let is_image = task_tags.iter().any(|t| t == "text-to-image" || t == "image-to-image");
             let image_components = if is_image { sd_backend::SdBackend::detect_image_components(&path) } else { None };
+            let is_video = task_tags.iter().any(|t| t == "text-to-video" || t == "image-to-video" || t == "video-to-video");
+            let video_components = if is_video { video_backend::VideoBackend::detect_video_components(&path) } else { None };
             entries.push(DetectedModelEntry {
                 name: path.file_name().and_then(|name| name.to_str()).unwrap_or("Unknown model").to_string(),
                 path: path.to_string_lossy().to_string(),
@@ -3464,11 +3718,13 @@ fn collect_model_files(directory: &std::path::Path, entries: &mut Vec<DetectedMo
                 max_context_size: gguf_context_length(&path),
                 image_input_available: crate::task_tags::image_input_available(&task_tags) || sibling_mmproj.is_some(),
                 mmproj_path: sibling_mmproj,
+                vae_path: sibling_vae,
                 mesh_input_kinds,
                 mesh_vae_path: None,
                 mesh_texgen_path: None,
                 mesh_components: None,
                 image_components,
+                video_components,
                 task_tags,
             });
         }
@@ -3932,7 +4188,7 @@ fn classify_hf_file_role(rfilename: &str) -> String {
     if lower.split('/').any(|segment| segment == "unet") {
         return "unet".to_string();
     }
-    if lower.split('/').any(|segment| segment == "vae") {
+    if lower.split('/').any(|segment| segment == "vae") || filename_is_vae(base) {
         return "vae".to_string();
     }
     if lower.split('/').any(|segment| segment == "text_encoder" || segment == "text_encoder_2") {
@@ -4297,6 +4553,118 @@ async fn hf_files(
     };
 
     Json(HfFilesResponse { files, kind, autodownload, autodownload_reason })
+}
+
+#[derive(Debug, Deserialize)]
+struct HfAvatarQuery {
+    author: String,
+}
+
+/// Fetch and cache a HuggingFace author's (user or org) avatar image, so the
+/// catalog UI can show a logo next to models. Caches to
+/// `<models_dir>/.avatars/{sanitized_author}` on first fetch; subsequent
+/// requests are served straight from disk.
+async fn hf_avatar(
+    axum::extract::Query(params): axum::extract::Query<HfAvatarQuery>,
+) -> Result<axum::response::Response, (axum::http::StatusCode, String)> {
+    let models_dir = resolve_models_dir()
+        .ok_or((axum::http::StatusCode::NOT_FOUND, "No models directory configured".into()))?;
+    let cache_dir = models_dir.join(".avatars");
+    let sanitized = sanitize_repo_id(&params.author);
+    let cache_file = cache_dir.join(&sanitized);
+    let meta_file = cache_dir.join(format!("{sanitized}.meta"));
+
+    if let Ok(data) = tokio::fs::read(&cache_file).await {
+        let content_type = tokio::fs::read_to_string(&meta_file)
+            .await
+            .unwrap_or_else(|_| "image/png".to_string());
+        return Ok(axum::response::Response::builder()
+            .header("Content-Type", content_type)
+            .header("Cache-Control", "public, max-age=86400")
+            .body(axum::body::Body::from(data))
+            .unwrap());
+    }
+
+    let client = reqwest::Client::builder()
+        .user_agent("dispos-ai/0.1")
+        .build()
+        .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let urls = [
+        format!("https://huggingface.co/api/users/{}/avatar", params.author),
+        format!("https://huggingface.co/api/organizations/{}/avatar", params.author),
+    ];
+
+    #[derive(Deserialize)]
+    struct HfAvatarUrl {
+        #[serde(rename = "avatarUrl")]
+        avatar_url: Option<String>,
+    }
+
+    let mut fetched: Option<(bytes::Bytes, String)> = None;
+    for url in urls {
+        let resp = match client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => resp,
+            _ => continue,
+        };
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("image/png")
+            .to_string();
+
+        // The HF users/organizations avatar endpoints return JSON with an
+        // `avatarUrl` pointing at the actual image, not the image bytes
+        // themselves. Follow it to fetch the real image.
+        if content_type.contains("json") {
+            let avatar_url = match resp.json::<HfAvatarUrl>().await {
+                Ok(v) => v.avatar_url,
+                Err(_) => None,
+            };
+            let Some(avatar_url) = avatar_url else { continue };
+            match client.get(&avatar_url).send().await {
+                Ok(img_resp) if img_resp.status().is_success() => {
+                    let img_content_type = img_resp
+                        .headers()
+                        .get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("image/png")
+                        .to_string();
+                    match img_resp.bytes().await {
+                        Ok(data) => {
+                            fetched = Some((data, img_content_type));
+                            break;
+                        }
+                        Err(_) => continue,
+                    }
+                }
+                _ => continue,
+            }
+        } else {
+            match resp.bytes().await {
+                Ok(data) => {
+                    fetched = Some((data, content_type));
+                    break;
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
+    let (data, content_type) = fetched
+        .ok_or((axum::http::StatusCode::NOT_FOUND, "No avatar found for author".into()))?;
+
+    if tokio::fs::create_dir_all(&cache_dir).await.is_ok() {
+        let _ = tokio::fs::write(&cache_file, &data).await;
+        let _ = tokio::fs::write(&meta_file, &content_type).await;
+    }
+
+    Ok(axum::response::Response::builder()
+        .header("Content-Type", content_type)
+        .header("Cache-Control", "public, max-age=86400")
+        .body(axum::body::Body::from(data))
+        .unwrap())
 }
 
 #[derive(Debug, Deserialize)]
@@ -4683,6 +5051,211 @@ async fn hf_download_cancel(
     }
 }
 
+/// Venv directory (relative to CWD) that each generation backend's Python
+/// helper environment lives in. Mirrors the per-backend `resolve_*_python()`
+/// functions' naming convention without depending on the backend crates.
+fn venv_dir_for_backend(backend: &str) -> Option<&'static str> {
+    match backend {
+        "sd" => Some(".venv-sd"),
+        "video" => Some(".venv-video"),
+        "tts" => Some(".venv-tts"),
+        "mesh3d" => Some(".venv-3d"),
+        _ => None,
+    }
+}
+
+/// Setup script (relative to CWD) that installs the given backend's Python
+/// environment.
+fn setup_script_for_backend(backend: &str) -> Option<&'static str> {
+    match backend {
+        "sd" => Some("scripts/setup_sd_env.py"),
+        "video" => Some("scripts/setup_video_env.py"),
+        "tts" => Some("scripts/setup_tts_env.py"),
+        "mesh3d" => Some("scripts/setup_3d_env.py"),
+        _ => None,
+    }
+}
+
+/// True iff the given backend's venv has already completed setup, marked by
+/// a `.install_complete` sentinel file written by `scripts/setup_*_env.py`.
+fn is_env_installed(backend: &str) -> bool {
+    match venv_dir_for_backend(backend) {
+        Some(venv_dir) => std::path::Path::new(venv_dir).join(".install_complete").is_file(),
+        None => false,
+    }
+}
+
+async fn install_env(
+    State(state): State<AppState>,
+    axum::extract::Path(backend): axum::extract::Path<String>,
+) -> Result<Json<InstallProgress>, (axum::http::StatusCode, String)> {
+    if venv_dir_for_backend(&backend).is_none() {
+        return Err((axum::http::StatusCode::BAD_REQUEST, format!("Unknown backend: {}", backend)));
+    }
+
+    if is_env_installed(&backend) {
+        let entry = InstallProgress {
+            backend: backend.clone(),
+            phase: "complete".to_string(),
+            step: 1,
+            total: 1,
+            percent: 100.0,
+            status: "complete".to_string(),
+            message: None,
+            updated_at: now_millis(),
+        };
+        state.install_progress.lock().await.insert(backend.clone(), entry.clone());
+        return Ok(Json(entry));
+    }
+
+    {
+        let mut progress = state.install_progress.lock().await;
+        if let Some(existing) = progress.get(&backend) {
+            if existing.status == "running" {
+                return Ok(Json(existing.clone()));
+            }
+        }
+        progress.insert(
+            backend.clone(),
+            InstallProgress {
+                backend: backend.clone(),
+                phase: "starting".to_string(),
+                step: 0,
+                total: 1,
+                percent: 0.0,
+                status: "running".to_string(),
+                message: None,
+                updated_at: now_millis(),
+            },
+        );
+    }
+
+    let script = setup_script_for_backend(&backend).unwrap();
+    let progress_map = state.install_progress.clone();
+    let backend_key = backend.clone();
+
+    tokio::task::spawn_blocking(move || {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+
+        let mut cmd = Command::new("python");
+        cmd.arg(script)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                mark_install_error(&progress_map, &backend_key, format!("Failed to spawn {}: {}", script, e));
+                return;
+            }
+        };
+
+        let stdout = match child.stdout.take() {
+            Some(s) => s,
+            None => {
+                mark_install_error(&progress_map, &backend_key, format!("Failed to capture stdout of {}", script));
+                let _ = child.kill();
+                return;
+            }
+        };
+
+        let mut seen_phases: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut last_error_message: Option<String> = None;
+        let reader = BufReader::new(stdout);
+        for line in reader.lines().flatten() {
+            let Some(json_str) = line.strip_prefix("PROGRESS: ") else { continue };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) else { continue };
+            let phase = value.get("phase").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let status = value.get("status").and_then(|v| v.as_str()).unwrap_or("running").to_string();
+            let message = value.get("message").and_then(|v| v.as_str()).map(|s| s.to_string());
+            if status == "error" {
+                last_error_message = message.clone();
+            }
+            if !phase.is_empty() {
+                seen_phases.insert(phase.clone());
+            }
+            let step = seen_phases.len() as u32;
+            // Rough progress estimate: not exact, just gives the UI something
+            // to render while the install runs.
+            let total = step.max(1) + 1;
+            let percent = (step as f32 / total as f32) * 100.0;
+
+            let mut progress = progress_map.blocking_lock();
+            if let Some(entry) = progress.get_mut(&backend_key) {
+                entry.phase = phase;
+                entry.step = step;
+                entry.total = total;
+                entry.percent = percent;
+                entry.message = message;
+                entry.updated_at = now_millis();
+            }
+        }
+
+        let exit_ok = child.wait().map(|s| s.success()).unwrap_or(false);
+        let mut progress = progress_map.blocking_lock();
+        if let Some(entry) = progress.get_mut(&backend_key) {
+            if exit_ok {
+                entry.status = "complete".to_string();
+                entry.phase = "complete".to_string();
+                entry.percent = 100.0;
+                entry.message = None;
+            } else {
+                entry.status = "error".to_string();
+                entry.message = Some(last_error_message.unwrap_or_else(|| "install failed".to_string()));
+            }
+            entry.updated_at = now_millis();
+        }
+    });
+
+    let progress = state.install_progress.lock().await;
+    Ok(Json(progress.get(&backend).cloned().unwrap_or(InstallProgress {
+        backend,
+        phase: "starting".to_string(),
+        step: 0,
+        total: 1,
+        percent: 0.0,
+        status: "running".to_string(),
+        message: None,
+        updated_at: now_millis(),
+    })))
+}
+
+/// Mark an in-progress install as errored from the `spawn_blocking` worker
+/// thread, which can't `.await` directly.
+fn mark_install_error(
+    progress_map: &Arc<tokio::sync::Mutex<HashMap<String, InstallProgress>>>,
+    backend: &str,
+    message: String,
+) {
+    let mut progress = progress_map.blocking_lock();
+    if let Some(entry) = progress.get_mut(backend) {
+        entry.status = "error".to_string();
+        entry.message = Some(message);
+        entry.updated_at = now_millis();
+    }
+}
+
+async fn install_env_status(
+    State(state): State<AppState>,
+    axum::extract::Path(backend): axum::extract::Path<String>,
+) -> Json<InstallProgress> {
+    if let Some(entry) = state.install_progress.lock().await.get(&backend).cloned() {
+        return Json(entry);
+    }
+    let status = if is_env_installed(&backend) { "complete" } else { "not_started" };
+    Json(InstallProgress {
+        backend,
+        phase: status.to_string(),
+        step: 0,
+        total: 1,
+        percent: if status == "complete" { 100.0 } else { 0.0 },
+        status: status.to_string(),
+        message: None,
+        updated_at: now_millis(),
+    })
+}
+
 /// Find llama-server binary (same logic as in llama-backend)
 fn find_llama_server_binary() -> Option<std::path::PathBuf> {
     let lmstudio_dir = std::env::var("USERPROFILE")
@@ -4791,6 +5364,56 @@ async fn spawn_hf_transformers_server(
     .map_err(|e| format!("spawn_blocking join error: {}", e))?
 }
 
+/// How long to wait for a spawned llama-server to answer `/health` before
+/// giving up and marking the registry entry "error".
+pub(crate) const LLAMA_SERVER_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Poll a freshly spawned llama-server's `/health` endpoint until it reports
+/// ready, then flip the model's registry entry from "loading" to "ready" (or
+/// "error" on timeout) so `/v1/model/list` reflects real backend readiness
+/// instead of just "a process was spawned". Runs detached from the
+/// `load_model` request that spawned it.
+async fn poll_llama_server_ready(state: AppState, model_id: String, port: u16) {
+    let client = reqwest::Client::builder().no_proxy().build().unwrap_or_else(|_| reqwest::Client::new());
+    let url = format!("http://127.0.0.1:{}/health", port);
+    let start = std::time::Instant::now();
+    loop {
+        if let Ok(res) = client.get(&url).send().await {
+            if res.status().is_success() {
+                let mut models = state.loaded_models.lock().await;
+                if let Some(entry) = models.get_mut(&model_id) {
+                    entry.status = "ready".to_string();
+                }
+                return;
+            }
+        }
+        if start.elapsed() > LLAMA_SERVER_READY_TIMEOUT {
+            tracing::warn!("Timed out waiting for llama-server on port {} to become ready", port);
+            let mut models = state.loaded_models.lock().await;
+            if let Some(entry) = models.get_mut(&model_id) {
+                entry.status = "error".to_string();
+                entry.status_message = Some("Timed out waiting for the model backend to become ready".to_string());
+            }
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+/// Build the (422, JSON body) error `load_model` returns when a generation
+/// backend's Python environment hasn't been installed yet. `load_model`'s
+/// error type is `(StatusCode, String)`, so the body is a JSON-serialized
+/// string (parseable by the frontend) rather than an `axum::Json` wrapper —
+/// consistent with how `GenerateImagesError::MissingComponents` encodes its
+/// structured body as JSON for the frontend to parse and act on.
+fn env_not_installed_error(backend_key: &str) -> (axum::http::StatusCode, String) {
+    let body = serde_json::json!({
+        "error": "Python environment not installed for this backend",
+        "envNotInstalled": backend_key,
+    });
+    (axum::http::StatusCode::UNPROCESSABLE_ENTITY, body.to_string())
+}
+
 /// Load a model: detect modality and spawn the appropriate backend.
 pub(crate) async fn set_studio_models(
     State(state): State<AppState>,
@@ -4863,6 +5486,12 @@ pub(crate) async fn load_model(
     // Set when a text/vision model is launched with an mmproj projector, so the
     // loaded entry can advertise image input even for models detected as "text".
     let mut mmproj_loaded = false;
+    // Tracks whether the spawned backend process is expected to still be
+    // starting up when this handler returns, so the registry entry can be
+    // marked "loading" and handed off to a background readiness poller
+    // instead of being reported "ready" before it can actually serve requests.
+    let mut initial_status = "ready".to_string();
+    let mut initial_status_message: Option<String> = None;
 
     match backend_category {
         Some(Modality::AudioTts) => {
@@ -5020,10 +5649,16 @@ pub(crate) async fn load_model(
                 match child {
                     Ok(c) => {
                         state.children.register(model_id.clone(), c);
-                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                        // llama-server has been spawned but weight loading into
+                        // VRAM/RAM happens after this point — mark the entry
+                        // "loading" and let a background task flip it to
+                        // "ready" once it actually answers /health.
+                        initial_status = "loading".to_string();
                     }
                     Err(e) => {
                         tracing::warn!("Failed to spawn llama-server on port {}: {}", port, e);
+                        initial_status = "error".to_string();
+                        initial_status_message = Some(format!("Failed to spawn llama-server: {}", e));
                     }
                 }
             } else {
@@ -5045,11 +5680,17 @@ pub(crate) async fn load_model(
         image_input_available: crate::task_tags::image_input_available(&task_tags) || mmproj_loaded,
         mesh_input_kinds,
         task_tags,
+        status: initial_status.clone(),
+        status_message: initial_status_message,
     };
 
     {
         let mut models = state.loaded_models.lock().await;
-        models.insert(model_id, entry.clone());
+        models.insert(model_id.clone(), entry.clone());
+    }
+
+    if initial_status == "loading" {
+        tokio::spawn(poll_llama_server_ready(state.clone(), model_id, port));
     }
 
     // Keep backwards-compat active_model pointing at this (most recently loaded) model

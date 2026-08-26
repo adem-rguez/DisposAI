@@ -1,5 +1,14 @@
-const { app, BrowserWindow, dialog, ipcMain } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, Menu } = require('electron');
 const path = require('path');
+
+Menu.setApplicationMenu(null);
+
+// Without an explicit AppUserModelID, Windows groups/caches the taskbar icon
+// under the generic electron.exe identity, so icon-file changes can appear
+// to have no effect between dev runs. Giving this app its own ID avoids that.
+if (process.platform === 'win32') {
+  app.setAppUserModelId('com.disposai.studio');
+}
 
 process.on('uncaughtException', (err) => {
   console.error('[Main Exception]', err);
@@ -23,8 +32,15 @@ function createWindow() {
     minWidth: 1000,
     minHeight: 650,
     title: 'Dispos Studio',
+    icon: path.join(__dirname, 'src', 'assets', 'dispos_logo.ico'),
     backgroundColor: '#07090e',
     show: true,
+    titleBarStyle: 'hidden',
+    titleBarOverlay: {
+      color: '#0f172a',
+      symbolColor: '#f8fafc',
+      height: 52,
+    },
     webPreferences: {
       nodeIntegration: true,
       contextIsolation: false,
@@ -45,6 +61,10 @@ function createWindow() {
   win.webContents.on('console-message', (event, level, message, line, sourceId) => {
     console.log(`[Renderer Console] ${message}`);
   });
+
+  if (process.env.DISPOS_DEBUG) {
+    win.webContents.openDevTools({ mode: 'detach' });
+  }
 
   win.on('closed', () => {
     console.log('[Electron] Window closed event');

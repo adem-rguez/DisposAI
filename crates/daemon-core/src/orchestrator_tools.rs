@@ -63,7 +63,13 @@ pub fn schemas() -> Vec<ToolSchema> {
                     },
                     "prompt": {
                         "type": "string",
-                        "description": "The prompt to send to that model"
+                        "description": "The prompt to send to that model. For non-text-chat \
+                                        modalities (image, video, TTS, 3D), do not just relay the \
+                                        user's wording verbatim - author your own concrete, \
+                                        detailed generation prompt (specific visual/descriptive \
+                                        details, style, composition, etc.), especially for \
+                                        subjective/interpretive requests (e.g. 'generate an image \
+                                        of yourself')."
                     },
                     "image": {
                         "type": "string",
@@ -249,6 +255,28 @@ async fn inventory(state: &AppState) -> Vec<serde_json::Value> {
         }
     }
     rows
+}
+
+/// Note appended to the orchestrator's system prompt instructing it to discover the
+/// installed models itself instead of being handed the roster up front. Pre-feeding the
+/// list here made it stale the moment a model was installed/removed after the process
+/// started, and let the orchestrator skip list_models entirely. It must call list_models
+/// (optionally filtered by task_tag) before it can know a real model name to pass to
+/// run_model.
+pub async fn installed_models_note(state: &AppState) -> String {
+    if inventory(state).await.is_empty() {
+        return "\n\nNo models are installed on this machine right now, so run_model cannot \
+                produce anything. Tell the user that instead of pretending otherwise."
+            .to_string();
+    }
+
+    "\n\nYou are not told what models are installed in advance — call list_models first to \
+     discover the exact model names and modalities available on this machine, then pass one \
+     of those exact names as run_model's 'model' argument. There is no Midjourney, DALL-E, \
+     Sora, Stable Diffusion API or any other cloud model here — naming one only wastes a turn \
+     on an error. If the user asks for a modality that list_models doesn't return, say it \
+     isn't installed rather than guessing."
+        .to_string()
 }
 
 fn file_name_of(path: &str) -> String {
@@ -546,9 +574,29 @@ async fn find_orchestrator_entry(state: &AppState) -> Option<crate::http::Loaded
 }
 
 /// Reload the orchestrator model that was unloaded to make VRAM room for a
-/// media/on-demand load. Must be awaited inline before `run_model` returns —
-/// the next chat-completion request goes straight to the orchestrator's port.
-async fn reload_orchestrator(state: &AppState, orch: &crate::http::LoadedModelEntry) {
+/// media/on-demand load (or that has died, e.g. crashed under VRAM pressure).
+/// Must be awaited inline before `run_model` returns — the next chat-completion
+/// request goes straight to the orchestrator's port.
+///
+/// `load_model` always allocates a *new* port/model_id rather than reusing the
+/// old one, so the stale `orch` entry is explicitly unloaded first. Otherwise
+/// it lingers in the registry alongside the freshly loaded one, and callers
+/// that resolve the orchestrator's port by scanning `loaded_models` (e.g.
+/// `first_chat_port`, `find_orchestrator_entry`) can keep landing on the dead
+/// entry indefinitely. Returns the freshly loaded entry (with its new port) so
+/// callers holding a stale port can update it instead of retrying against the
+/// process that just died.
+pub(crate) async fn reload_orchestrator(
+    state: &AppState,
+    orch: &crate::http::LoadedModelEntry,
+) -> Option<crate::http::LoadedModelEntry> {
+    unload_model(
+        State(state.clone()),
+        Json(ModelUnloadRequest { model_id: Some(orch.model_id.clone()) }),
+    )
+    .await
+    .ok();
+
     let reloaded = load_model(
         State(state.clone()),
         Json(ModelLoadRequest {
@@ -559,9 +607,50 @@ async fn reload_orchestrator(state: &AppState, orch: &crate::http::LoadedModelEn
         }),
     )
     .await;
-    if let Err((_, e)) = reloaded {
-        tracing::warn!("run_model: failed to reload orchestrator '{}': {}", orch.model_path, e);
+    let entry = match reloaded {
+        Ok(Json(l)) => l,
+        Err((_, e)) => {
+            tracing::warn!("run_model: failed to reload orchestrator '{}': {}", orch.model_path, e);
+            return None;
+        }
+    };
+
+    if entry.status == "error" {
+        tracing::warn!(
+            "run_model: orchestrator '{}' failed to spawn on reload: {:?}",
+            orch.model_path, entry.status_message
+        );
+        return None;
     }
+
+    // `load_model` returns as soon as the backend process is *spawned*, not once
+    // it is actually serving — a freshly spawned llama-server still has to load
+    // weights into VRAM before /health (and /v1/chat/completions) will respond.
+    // The caller here is about to retry a request against this port immediately,
+    // so poll until it is actually ready (or bail) rather than handing back a
+    // port nothing is listening on yet.
+    if entry.status == "loading" {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap_or_else(|_| reqwest::Client::new());
+        let url = format!("http://127.0.0.1:{}/health", entry.port);
+        let start = std::time::Instant::now();
+        loop {
+            if let Ok(res) = client.get(&url).send().await {
+                if res.status().is_success() {
+                    break;
+                }
+            }
+            if start.elapsed() > crate::http::LLAMA_SERVER_READY_TIMEOUT {
+                tracing::warn!(
+                    "run_model: timed out waiting for reloaded orchestrator '{}' to become ready on port {}",
+                    orch.model_path, entry.port
+                );
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+
+    Some(entry)
 }
 
 /// Extract the id from a media handle (either `/v1/media/<id>` or a bare id)
@@ -640,7 +729,7 @@ async fn inspect_model(state: &AppState, tool_call: &ToolCall) -> ToolResult {
         }
         Some(backend_modality @ (Modality::Video | Modality::Mesh3D)) => {
             let schema = match state.registry.get_backend(backend_modality).await {
-                Some(backend_arc) => backend_arc.read().await.get_param_schema().await,
+                Some(backend_arc) => backend_arc.write().await.get_param_schema().await,
                 None => None,
             };
             match schema {
@@ -857,7 +946,7 @@ async fn run_media_model(
     // kept up to date throughout so the UI's independent progress bar keeps working, and
     // get_generation_progress/cancel_job remain available if the orchestrator wants to check
     // on or abort a job out of band (e.g. after starting more than one).
-    let backend = backend_arc.read().await;
+    let mut backend = backend_arc.write().await;
     let gen_result = tokio::time::timeout(std::time::Duration::from_secs(900), backend.generate(request)).await;
     done_flag.store(true, std::sync::atomic::Ordering::Relaxed);
     poller.abort();

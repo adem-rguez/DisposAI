@@ -265,6 +265,56 @@ impl MeshBackend {
             updated_at,
         })
     }
+
+    /// Ensure `threed_server.py` has been spawned for the currently loaded
+    /// model. No-op if a process is already running. Returns
+    /// `BackendError::EnvNotInstalled` if the `.venv-3d` environment hasn't
+    /// been set up yet (rather than attempting to spawn against a missing
+    /// interpreter/deps).
+    async fn ensure_process_started(&mut self) -> Result<(), BackendError> {
+        if self.process.is_some() {
+            return Ok(());
+        }
+
+        let model_path = self
+            .model_path
+            .clone()
+            .ok_or(BackendError::ModelNotLoaded)?;
+
+        if !model_path.exists() {
+            // Simulation mode: no real model file to serve, nothing to spawn.
+            return Ok(());
+        }
+
+        let marker = PathBuf::from(".venv-3d").join(".install_complete");
+        if !marker.exists() {
+            return Err(BackendError::EnvNotInstalled("mesh3d".to_string()));
+        }
+
+        info!("Starting threed_server.py for: {}", model_path.display());
+        let port = next_free_mesh_port();
+        let model_path_owned = model_path.clone();
+
+        match tokio::task::spawn_blocking(move || Self::spawn_threed_server(&model_path_owned, port))
+            .await
+            .map_err(|e| BackendError::LoadError(format!("spawn_blocking join error: {}", e)))?
+        {
+            Ok(child) => {
+                info!("threed_server.py ready on port {} (PID: {})", port, child.id());
+                self.process = Some(child);
+                self.port = port;
+            }
+            Err(e) => {
+                warn!(
+                    "Could not start the 3D mesh server for '{}': {}. Falling back to simulation mode.",
+                    model_path.display(),
+                    e
+                );
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl Default for MeshBackend {
@@ -336,31 +386,10 @@ impl InferenceBackend for MeshBackend {
         }
 
         info!("Loading 3D mesh generator model: {}", model_path.display());
-        let port = next_free_mesh_port();
-        let model_path_owned = model_path.to_path_buf();
-
-        match tokio::task::spawn_blocking(move || Self::spawn_threed_server(&model_path_owned, port))
-            .await
-            .map_err(|e| BackendError::LoadError(format!("spawn_blocking join error: {}", e)))?
-        {
-            Ok(child) => {
-                info!("threed_server.py ready on port {} (PID: {})", port, child.id());
-                self.process = Some(child);
-                self.port = port;
-            }
-            Err(e) => {
-                warn!(
-                    "Could not start the 3D mesh server for '{}': {}. Falling back to simulation mode.",
-                    model_path.display(),
-                    e
-                );
-            }
-        }
-
         self.model_path = Some(model_path.to_path_buf());
         self.is_loaded.store(true, Ordering::SeqCst);
 
-        info!("Successfully loaded model in Mesh3D backend");
+        info!("Successfully loaded model in Mesh3D backend (server spawn deferred to first generate)");
         Ok(())
     }
 
@@ -382,12 +411,14 @@ impl InferenceBackend for MeshBackend {
     }
 
     async fn generate(
-        &self,
+        &mut self,
         request: InferenceRequest,
     ) -> Result<InferenceResponse, BackendError> {
         if !self.is_loaded() {
             return Err(BackendError::ModelNotLoaded);
         }
+
+        self.ensure_process_started().await?;
 
         let start_time = std::time::Instant::now();
         let params = request.mesh_params.clone().unwrap_or_default();
@@ -444,7 +475,11 @@ impl InferenceBackend for MeshBackend {
         Self::poll_threed_progress(self.port).await
     }
 
-    async fn get_param_schema(&self) -> Option<serde_json::Value> {
+    async fn get_param_schema(&mut self) -> Option<serde_json::Value> {
+        // Schema is static per-adapter (no GPU load happens until an actual
+        // `generate()` call), so it's safe to spawn threed_server.py here
+        // rather than waiting for the user to trigger a generation first.
+        let _ = self.ensure_process_started().await;
         if self.process.is_none() {
             // No threed_server.py running (simulation mode) — no schema source.
             return None;
