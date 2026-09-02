@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering as AtomicOrdering};
 use axum::{
     extract::State,
     response::{Html, sse::{Event, KeepAlive, Sse}},
@@ -447,6 +447,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/model/catalog", get(list_detected_models))
         .route("/v1/model/list", get(list_loaded_models))
         .route("/v1/model/load", post(load_model))
+        .route("/v1/model/load-progress", get(get_video_load_progress))
         .route("/v1/model/unload", post(unload_model))
         .route("/v1/studio/models", post(set_studio_models))
         .route("/v1/config/media-retention", get(get_media_retention).post(set_media_retention))
@@ -465,6 +466,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/env/install/:backend/status", get(install_env_status))
         .route("/v1/model/open-folder", post(open_model_folder))
         .route("/v1/model/delete", post(delete_model))
+        .route("/v1/model/assign-component", post(assign_component_file))
+        .route("/v1/model/component-override", post(set_component_override))
         .route("/v1/jobs", get(list_jobs))
         .route("/v1/jobs/:id/progress", get(get_job_progress))
         .route("/v1/jobs/:id/cancel", post(cancel_job))
@@ -1728,11 +1731,19 @@ async fn stream_chat_completions(
             }
         }
     }
+    let no_model_loaded = orch_entry.is_none();
     let upstream = upstream_result.map_err(|e| {
-        (
-            axum::http::StatusCode::BAD_GATEWAY,
-            format!("orchestrator model is not responding and could not be automatically recovered: {}", e),
-        )
+        if no_model_loaded {
+            (
+                axum::http::StatusCode::BAD_GATEWAY,
+                "No model is loaded. Load a model before sending a message.".to_string(),
+            )
+        } else {
+            (
+                axum::http::StatusCode::BAD_GATEWAY,
+                format!("The orchestrator model crashed and could not be automatically recovered: {}", e),
+            )
+        }
     })?;
 
     let last_user_prompt = payload.inner.messages.iter().rev()
@@ -1787,6 +1798,34 @@ async fn stream_chat_completions(
                     }
                 }
             };
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let err_body = response.text().await.unwrap_or_default();
+                let raw_message = serde_json::from_str::<serde_json::Value>(&err_body)
+                    .ok()
+                    .and_then(|v| v["error"]["message"].as_str().map(|s| s.to_string()))
+                    .unwrap_or_else(|| {
+                        if err_body.trim().is_empty() {
+                            format!("llama-server returned {}", status)
+                        } else {
+                            err_body.clone()
+                        }
+                    });
+                let message = if raw_message.contains("exceeds the available context size") {
+                    "This conversation is too long for the model's context window. \
+                     Start a new chat or trim earlier messages and try again.".to_string()
+                } else {
+                    raw_message
+                };
+                let error_event = serde_json::json!({
+                    "type": "error",
+                    "message": message,
+                });
+                let _ = tx.send(Ok(Event::default().data(error_event.to_string()))).await;
+                let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
+                return;
+            }
 
             let mut byte_stream = response.bytes_stream();
             let mut accumulated_content = String::new();
@@ -3242,6 +3281,24 @@ pub struct ModelLoadRequest {
     pub gpu_layers: Option<u32>,
     pub context_size: Option<u32>,
     pub mmproj_path: Option<String>,
+    pub mtp_path: Option<String>,
+    /// Max draft tokens per MTP step. Defaults to 4 when unset.
+    pub spec_draft_n_max: Option<u32>,
+    /// Minimum acceptance probability for MTP draft tokens. Leaving this
+    /// unset omits the flag and defers to llama.cpp's own default (0.00).
+    /// Raising it makes drafting stop earlier when the drafter is
+    /// unconfident, trading potential throughput for fewer rejected drafts.
+    pub spec_draft_p_min: Option<f32>,
+    /// Set false to skip the MTP drafter even when one is detected.
+    pub mtp_enabled: Option<bool>,
+    /// Manual override for the LTX-Video text encoder, pointing directly at
+    /// a local file (gguf/safetensors/ckpt/pt/bin). Bypasses sibling
+    /// auto-detection when set.
+    pub text_encoder_override_path: Option<String>,
+    /// Manual override for the LTX-Video VAE, pointing directly at a local
+    /// file (gguf/safetensors/ckpt/pt/bin). Bypasses sibling auto-detection
+    /// when set.
+    pub vae_override_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3274,6 +3331,7 @@ pub struct DetectedModelEntry {
     /// A vision GGUF also needs a local image projector before chat can accept images.
     pub image_input_available: bool,
     pub mmproj_path: Option<String>,
+    pub mtp_path: Option<String>,
     /// For models shipped as a loose main-weights file plus a flat
     /// root-level VAE sibling (e.g. LTX-Video's `model.safetensors` +
     /// `vae.safetensors`), the resolved path to that sibling VAE file.
@@ -3366,6 +3424,41 @@ fn find_sibling_mmproj(path: &std::path::Path) -> Option<std::path::PathBuf> {
         let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
         if name.contains("mmproj") && name.ends_with(".gguf") {
             Some(entry.path())
+        } else {
+            None
+        }
+    })
+}
+
+/// Given the path to a model's main weights file, look for a companion MTP
+/// (Multi-Token Prediction) drafter GGUF used for speculative decoding.
+/// Checks same-directory siblings whose name contains "mtp" first, then an
+/// `mtp/` subdirectory next to the model (case-insensitive), returning the
+/// first `.gguf` file found inside it.
+fn find_sibling_mtp(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let directory = path.parent()?;
+    if let Some(found) = std::fs::read_dir(directory).ok().into_iter().flatten().flatten().find_map(|entry| {
+        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        if name.contains("mtp") && name.ends_with(".gguf") {
+            Some(entry.path())
+        } else {
+            None
+        }
+    }) {
+        return Some(found);
+    }
+    let mtp_dir = std::fs::read_dir(directory).ok().into_iter().flatten().flatten().find_map(|entry| {
+        let entry_path = entry.path();
+        if entry_path.is_dir() && entry.file_name().to_string_lossy().eq_ignore_ascii_case("mtp") {
+            Some(entry_path)
+        } else {
+            None
+        }
+    })?;
+    std::fs::read_dir(&mtp_dir).ok().into_iter().flatten().flatten().find_map(|entry| {
+        let entry_path = entry.path();
+        if entry_path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("gguf")) {
+            Some(entry_path)
         } else {
             None
         }
@@ -3628,6 +3721,7 @@ fn hf_model_dir_entry(dir: &std::path::Path) -> Option<DetectedModelEntry> {
         max_context_size: None,
         image_input_available: crate::task_tags::image_input_available(&task_tags),
         mmproj_path: None,
+        mtp_path: None,
         vae_path: None,
         mesh_input_kinds,
         mesh_vae_path,
@@ -3656,6 +3750,11 @@ fn collect_model_files(directory: &std::path::Path, entries: &mut Vec<DetectedMo
             if dir_name == "shared" {
                 continue;
             }
+            // Skip "mtp" folder — it contains MTP drafter companion files
+            // consumed via find_sibling_mtp(), not standalone models.
+            if dir_name == "mtp" {
+                continue;
+            }
             if is_mesh3d_name(&dir_name) {
                 let (mesh_vae_path, mesh_texgen_path, mesh_components) = find_mesh3d_siblings(&path);
                 let mesh_input_kinds = detect_mesh_input_kinds(&path);
@@ -3666,6 +3765,7 @@ fn collect_model_files(directory: &std::path::Path, entries: &mut Vec<DetectedMo
                     max_context_size: None,
                     image_input_available: false,
                     mmproj_path: None,
+                    mtp_path: None,
                     vae_path: None,
                     task_tags: crate::task_tags::mesh_tags_from_kinds(mesh_input_kinds.clone()),
                     mesh_input_kinds,
@@ -3690,6 +3790,9 @@ fn collect_model_files(directory: &std::path::Path, entries: &mut Vec<DetectedMo
             if file_name_lower.contains("mmproj") {
                 continue;
             }
+            if file_name_lower.contains("mtp") {
+                continue;
+            }
             // A loose, flat (non-subfolder) VAE sibling (e.g. LTX-Video's
             // vae.safetensors next to model.safetensors) is a companion
             // component, not a standalone model — it gets attached to its
@@ -3706,6 +3809,7 @@ fn collect_model_files(directory: &std::path::Path, entries: &mut Vec<DetectedMo
             let is_mesh3d = task_tags.iter().any(|t| t == "text-to-3d" || t == "image-to-3d");
             let mesh_input_kinds = if is_mesh3d { detect_mesh_input_kinds(&path) } else { None };
             let sibling_mmproj = find_sibling_mmproj(&path).map(|p| p.to_string_lossy().to_string());
+            let sibling_mtp = find_sibling_mtp(&path).map(|p| p.to_string_lossy().to_string());
             let sibling_vae = find_sibling_vae(&path).map(|p| p.to_string_lossy().to_string());
             let is_image = task_tags.iter().any(|t| t == "text-to-image" || t == "image-to-image");
             let image_components = if is_image { sd_backend::SdBackend::detect_image_components(&path) } else { None };
@@ -3718,6 +3822,7 @@ fn collect_model_files(directory: &std::path::Path, entries: &mut Vec<DetectedMo
                 max_context_size: gguf_context_length(&path),
                 image_input_available: crate::task_tags::image_input_available(&task_tags) || sibling_mmproj.is_some(),
                 mmproj_path: sibling_mmproj,
+                mtp_path: sibling_mtp,
                 vae_path: sibling_vae,
                 mesh_input_kinds,
                 mesh_vae_path: None,
@@ -4179,6 +4284,9 @@ fn classify_hf_file_role(rfilename: &str) -> String {
     if base.contains("mmproj") {
         return "mmproj".to_string();
     }
+    if base.contains("mtp") || lower.split('/').any(|segment| segment.eq_ignore_ascii_case("mtp")) {
+        return "mtp".to_string();
+    }
     if base == "config.json" || base == "generation_config.json" || base == "config.yaml" {
         return "config".to_string();
     }
@@ -4305,6 +4413,48 @@ fn pick_best_variant<'a>(variants: &[&'a HfFileEntry], free_vram_bytes: u64) -> 
     let smallest = sized.iter().copied().min_by_key(|e| e.size.unwrap())?;
     let label = smallest.quant.clone().unwrap_or_else(|| smallest.filename.clone());
     Some((smallest, format!("picked {} (smallest) — may exceed {:.1} GB free VRAM", label, free_gb)))
+}
+
+/// Preference rank for a companion file variant (lower is better).
+/// The vision projector is small and quality-sensitive, so F16 (the
+/// universally supported default) wins over BF16, a quantized copy, and
+/// finally F32 — twice the size for no meaningful gain. An MTP drafter's
+/// output is verified by the main model, so its quantized build (the
+/// vendor's own auto-discovery default) is preferred instead.
+fn companion_variant_rank(role: &str, filename: &str) -> u8 {
+    let lower = filename.to_ascii_lowercase();
+    // "bf16" contains "f16", so it must be tested first.
+    let precision = if lower.contains("f32") || lower.contains("fp32") {
+        "f32"
+    } else if lower.contains("bf16") {
+        "bf16"
+    } else if lower.contains("f16") || lower.contains("fp16") {
+        "f16"
+    } else if lower.contains("q4") || lower.contains("q5") || lower.contains("q6") || lower.contains("q8") {
+        "quant"
+    } else {
+        "unknown"
+    };
+    match (role, precision) {
+        ("mtp", "quant") => 0,
+        ("mtp", "f16") | ("mtp", "unknown") => 1,
+        ("mtp", "bf16") => 2,
+        (_, "f16") => 0,
+        (_, "bf16") => 1,
+        (_, "quant") | (_, "unknown") => 2,
+        // f32 for either role
+        _ => 3,
+    }
+}
+
+/// Pick the single best companion file (`mmproj`/`mtp`) for a repo that
+/// ships several precision variants of it: best precision rank, then
+/// smallest on a tie. Returns `None` if the repo has no file in that role.
+fn pick_companion_file<'a>(files: &'a [HfFileEntry], role: &str) -> Option<&'a HfFileEntry> {
+    files
+        .iter()
+        .filter(|f| f.role == role)
+        .min_by_key(|f| (companion_variant_rank(role, &f.filename), f.size.unwrap_or(u64::MAX)))
 }
 
 /// Extracts the `rel="next"` URL from an RFC 5988 `Link` header value,
@@ -4443,13 +4593,13 @@ async fn hf_files(
     // Directory-scoped so a component-pipeline repo's per-subfolder weights
     // (e.g. transformer/model.safetensors) never get lumped in with an
     // unrelated root-level convenience copy of the same extension.
-    let mut variant_counts: std::collections::HashMap<(String, &'static str), usize> = std::collections::HashMap::new();
+    let mut variant_counts: std::collections::HashMap<(String, String, &'static str), usize> = std::collections::HashMap::new();
     for f in files.iter() {
         if !matches!(f.role.as_str(), "weights" | "unet" | "vae" | "text_encoder") {
             continue;
         }
         if let Some(ext) = standalone_weight_ext(&f.filename) {
-            *variant_counts.entry((parent_dir(&f.filename).to_string(), ext)).or_insert(0) += 1;
+            *variant_counts.entry((parent_dir(&f.filename).to_string(), f.role.clone(), ext)).or_insert(0) += 1;
         }
     }
     for f in files.iter_mut() {
@@ -4458,8 +4608,8 @@ async fn hf_files(
         }
         if let Some(ext) = standalone_weight_ext(&f.filename) {
             let dir = parent_dir(&f.filename).to_string();
-            if variant_counts.get(&(dir, ext)).copied().unwrap_or(0) >= 2 {
-                f.variant_group = Some(ext.to_string());
+            if variant_counts.get(&(dir, f.role.clone(), ext)).copied().unwrap_or(0) >= 2 {
+                f.variant_group = Some(format!("{}:{}", f.role, ext));
             }
         }
     }
@@ -4480,7 +4630,8 @@ async fn hf_files(
     }
     .to_string();
 
-    let mmproj_filename = files.iter().find(|f| f.role == "mmproj").map(|f| f.filename.clone());
+    let mmproj_filename = pick_companion_file(&files, "mmproj").map(|f| f.filename.clone());
+    let mtp_filename = pick_companion_file(&files, "mtp").map(|f| f.filename.clone());
 
     let (autodownload, autodownload_reason): (Vec<String>, Option<String>) = match kind.as_str() {
         "sharded" => {
@@ -4492,6 +4643,9 @@ async fn hf_files(
                 .collect();
             if let Some(mmproj) = &mmproj_filename {
                 names.push(mmproj.clone());
+            }
+            if let Some(mtp) = &mtp_filename {
+                names.push(mtp.clone());
             }
             (names, Some(format!("Complete {}-shard set + config & tokenizer", shard_count)))
         }
@@ -4508,13 +4662,19 @@ async fn hf_files(
 
             let mut names: Vec<String> = files
                 .iter()
-                .filter(|f| f.variant_group.is_none())
+                .filter(|f| f.variant_group.is_none() && !matches!(f.role.as_str(), "mmproj" | "mtp"))
                 .map(|f| f.filename.clone())
                 .collect();
             for variants in groups.values() {
                 if let Some((chosen, _reason)) = pick_best_variant(variants, free_vram_bytes) {
                     names.push(chosen.filename.clone());
                 }
+            }
+            if let Some(mmproj) = &mmproj_filename {
+                names.push(mmproj.clone());
+            }
+            if let Some(mtp) = &mtp_filename {
+                names.push(mtp.clone());
             }
             (names, Some("All pipeline components (best-fit variant per part)".to_string()))
         }
@@ -4533,6 +4693,9 @@ async fn hf_files(
                     if let Some(mmproj) = &mmproj_filename {
                         names.push(mmproj.clone());
                     }
+                    if let Some(mtp) = &mtp_filename {
+                        names.push(mtp.clone());
+                    }
                     (names, Some(reason))
                 }
                 None => (Vec::new(), None),
@@ -4547,6 +4710,9 @@ async fn hf_files(
                 .collect();
             if let Some(mmproj) = &mmproj_filename {
                 names.push(mmproj.clone());
+            }
+            if let Some(mtp) = &mtp_filename {
+                names.push(mtp.clone());
             }
             (names, Some("Model weights + config".to_string()))
         }
@@ -4814,6 +4980,10 @@ struct ModelPathRequest {
     /// to anything else in the folder.
     #[serde(default)]
     mmproj_path: Option<String>,
+    /// Optional companion MTP drafter file belonging exclusively to this
+    /// model — deleted alongside it if present.
+    #[serde(default)]
+    mtp_path: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -4884,9 +5054,120 @@ async fn delete_model(
                 }
             }
         }
+
+        if let Some(mtp) = payload.mtp_path.as_ref() {
+            let mtp_path = std::path::Path::new(mtp);
+            if mtp_path.is_file() {
+                let mtp_canon = mtp_path.canonicalize().unwrap_or_else(|_| mtp_path.to_path_buf());
+                if mtp_canon.starts_with(&models_root_canon) {
+                    let _ = std::fs::remove_file(mtp_path);
+                }
+            }
+        }
     }
 
     Ok(Json(ModelActionResponse { status: "deleted" }))
+}
+
+#[derive(Debug, Deserialize)]
+struct AssignComponentRequest {
+    source_path: String,
+    target_path: String,
+}
+
+/// Places a user-picked local file at the exact path a missing model
+/// component (text encoder, VAE, etc.) is expected to live at, so the
+/// existing detection logic finds it next time without needing an HF
+/// download. Modality-agnostic — works for any component `target_path`
+/// computed by the backends' component-status detection.
+async fn assign_component_file(
+    Json(payload): Json<AssignComponentRequest>,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let source = std::path::Path::new(&payload.source_path);
+    if !source.is_file() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "source_path does not exist or is not a file" })),
+        );
+    }
+
+    let target = std::path::Path::new(&payload.target_path);
+    if let Some(parent) = target.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("failed to create target directory: {e}") })),
+            );
+        }
+    }
+
+    if target.exists() {
+        if let Err(e) = std::fs::remove_file(target) {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("failed to remove existing file at target_path: {e}") })),
+            );
+        }
+    }
+
+    if std::fs::hard_link(source, target).is_err() {
+        if let Err(e) = std::fs::copy(source, target) {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("failed to copy file to target_path: {e}") })),
+            );
+        }
+    }
+
+    (
+        axum::http::StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "target_path": payload.target_path })),
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct ComponentOverrideRequest {
+    model_path: String,
+    kind_name: String,
+    /// Absolute path to the user-picked file, or omitted/empty to clear the
+    /// override and fall back to auto-detection again.
+    #[serde(default)]
+    source_path: Option<String>,
+}
+
+/// Records which exact file a diffusion model's split-checkpoint component
+/// (text encoder, VAE, etc.) should use, bypassing sd-backend's fuzzy
+/// filename-pattern search — a user-picked file often won't match the
+/// pattern (e.g. a custom finetune's text encoder won't contain "qwen3"),
+/// so recording the exact path is the only way a manual pick survives a
+/// restart instead of being silently re-detected as something else.
+async fn set_component_override(
+    Json(payload): Json<ComponentOverrideRequest>,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let source_path = payload.source_path.filter(|p| !p.is_empty());
+    if let Some(path) = &source_path {
+        if !std::path::Path::new(path).is_file() {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "source_path does not exist or is not a file" })),
+            );
+        }
+    }
+
+    let model_path = std::path::Path::new(&payload.model_path);
+    let result = sd_backend::SdBackend::set_component_override(
+        model_path,
+        &payload.kind_name,
+        source_path.as_deref().map(std::path::Path::new),
+    );
+
+    match result {
+        Ok(()) => (axum::http::StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("failed to save component override: {e}") })),
+        ),
+    }
 }
 
 /// Composite key for `hf_downloads`/`hf_cancel` maps — filename alone can
@@ -4943,7 +5224,10 @@ async fn run_hf_download(
         .await
         .map_err(|e| e.to_string())?;
 
-    let response = if initial.status().is_redirection() {
+    // `final_url` is the resolved (post-redirect) URL, reused for ranged
+    // requests in the parallel-chunk path below — HF's redirect target
+    // (S3/Xet CDN) is what actually needs to be range-requested.
+    let (response, final_url) = if initial.status().is_redirection() {
         let location = initial
             .headers()
             .get("location")
@@ -4952,7 +5236,7 @@ async fn run_hf_download(
             .to_string();
         let base = reqwest::Url::parse(&url).map_err(|e| e.to_string())?;
         let redirect_url = base.join(&location).map_err(|e| e.to_string())?;
-        reqwest::Client::builder()
+        let resp = reqwest::Client::builder()
             .user_agent("dispos-ai/0.1")
             .no_proxy()
             .http2_initial_stream_window_size(16 * 1024 * 1024)
@@ -4964,9 +5248,10 @@ async fn run_hf_download(
             .await
             .map_err(|e| e.to_string())?
             .error_for_status()
-            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        (resp, redirect_url.to_string())
     } else {
-        initial.error_for_status().map_err(|e| e.to_string())?
+        (initial.error_for_status().map_err(|e| e.to_string())?, url.clone())
     };
 
     let total_bytes = response.content_length();
@@ -4974,6 +5259,31 @@ async fn run_hf_download(
         let mut downloads = downloads_map.lock().await;
         if let Some(entry) = downloads.get_mut(&key) {
             entry.total_bytes = total_bytes;
+        }
+    }
+
+    // Repos served off HF's Xet backend proxy crawl over a single connection
+    // — if the server advertises range support and the file is big enough
+    // to be worth it, fan the download out across parallel ranged requests
+    // instead of the plain sequential stream below.
+    let accepts_ranges = response
+        .headers()
+        .get("accept-ranges")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("bytes"))
+        .unwrap_or(false);
+    const PARALLEL_MIN_SIZE: u64 = 8 * 1024 * 1024;
+    if accepts_ranges {
+        if let Some(total) = total_bytes {
+            if total > PARALLEL_MIN_SIZE {
+                // Body of `response` is unused (headers only) — dropping it
+                // here is fine, we haven't started reading the stream.
+                drop(response);
+                return run_hf_download_parallel(
+                    &final_url, hf_token, target_path, total, downloads_map, cancel_flag, &key,
+                )
+                .await;
+            }
         }
     }
 
@@ -5015,6 +5325,202 @@ async fn run_hf_download(
         entry.downloaded_bytes = downloaded;
         entry.status = "complete".to_string();
     }
+    Ok(())
+}
+
+/// Number of concurrent ranged requests used by the parallel-chunk path in
+/// `run_hf_download_parallel`.
+const HF_PARALLEL_CHUNK_CONCURRENCY: usize = 8;
+/// Target size per ranged request — big enough to amortize per-request
+/// overhead, small enough to keep in-flight memory (chunks are buffered
+/// fully before being written) bounded to roughly
+/// `HF_PARALLEL_CHUNK_CONCURRENCY * HF_PARALLEL_CHUNK_SIZE`.
+const HF_PARALLEL_CHUNK_SIZE: u64 = 32 * 1024 * 1024;
+
+/// Parallel-ranged-request download path, used when the server advertises
+/// `Accept-Ranges: bytes` and the file is large enough to be worth
+/// splitting. Pre-allocates `target_path` to `total_bytes`, fires off
+/// concurrent `Range:` GETs against `final_url`, and writes each chunk to
+/// its own offset via `seek_write`. Falls back to returning an error on any
+/// chunk failure (caller surfaces it the same way the single-stream path
+/// does); cancellation removes the partial file, matching the existing
+/// behavior.
+async fn run_hf_download_parallel(
+    final_url: &str,
+    hf_token: Option<String>,
+    target_path: &std::path::Path,
+    total_bytes: u64,
+    downloads_map: &Arc<tokio::sync::Mutex<HashMap<String, DownloadProgress>>>,
+    cancel_flag: &Arc<AtomicBool>,
+    key: &str,
+) -> Result<(), String> {
+    // Pre-size the target file so every chunk task can seek+write into its
+    // own offset independently.
+    {
+        let file = tokio::fs::File::create(target_path)
+            .await
+            .map_err(|e| e.to_string())?;
+        file.set_len(total_bytes).await.map_err(|e| e.to_string())?;
+    }
+
+    let range_client = Arc::new(
+        reqwest::Client::builder()
+            .user_agent("dispos-ai/0.1")
+            .no_proxy()
+            .http2_initial_stream_window_size(16 * 1024 * 1024)
+            .http2_initial_connection_window_size(16 * 1024 * 1024)
+            .build()
+            .map_err(|e| e.to_string())?,
+    );
+
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    let mut start = 0u64;
+    while start < total_bytes {
+        let end = (start + HF_PARALLEL_CHUNK_SIZE - 1).min(total_bytes - 1);
+        ranges.push((start, end));
+        start = end + 1;
+    }
+
+    let downloaded_counter = Arc::new(AtomicU64::new(0));
+
+    // Periodic progress reporter, shared across all concurrent chunk tasks
+    // so we don't lock `downloads_map` once per chunk per read (matches the
+    // ~250ms throttling the single-stream path uses).
+    let reporter_done = Arc::new(AtomicBool::new(false));
+    let reporter_handle = {
+        let reporter_done = reporter_done.clone();
+        let downloaded_counter = downloaded_counter.clone();
+        let downloads_map = downloads_map.clone();
+        let key = key.to_string();
+        tokio::spawn(async move {
+            while !reporter_done.load(AtomicOrdering::Relaxed) {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                let mut downloads = downloads_map.lock().await;
+                if let Some(entry) = downloads.get_mut(&key) {
+                    entry.downloaded_bytes = downloaded_counter.load(AtomicOrdering::Relaxed);
+                }
+            }
+        })
+    };
+
+    let url = final_url.to_string();
+    let mut chunk_stream = futures::stream::iter(ranges.into_iter().map(|(chunk_start, chunk_end)| {
+        download_range_chunk(
+            range_client.clone(),
+            url.clone(),
+            hf_token.clone(),
+            target_path.to_path_buf(),
+            chunk_start,
+            chunk_end,
+            downloaded_counter.clone(),
+            cancel_flag.clone(),
+        )
+    }))
+    .buffer_unordered(HF_PARALLEL_CHUNK_CONCURRENCY);
+
+    let mut first_err: Option<String> = None;
+    while let Some(res) = chunk_stream.next().await {
+        if let Err(e) = res {
+            first_err = Some(e);
+            break;
+        }
+    }
+    drop(chunk_stream);
+
+    reporter_done.store(true, AtomicOrdering::Relaxed);
+    let _ = reporter_handle.await;
+
+    if let Some(err) = first_err {
+        if cancel_flag.load(AtomicOrdering::Relaxed) {
+            let _ = tokio::fs::remove_file(target_path).await;
+            let mut downloads = downloads_map.lock().await;
+            if let Some(entry) = downloads.get_mut(key) {
+                entry.status = "cancelled".to_string();
+            }
+            return Ok(());
+        }
+        return Err(err);
+    }
+
+    if cancel_flag.load(AtomicOrdering::Relaxed) {
+        let _ = tokio::fs::remove_file(target_path).await;
+        let mut downloads = downloads_map.lock().await;
+        if let Some(entry) = downloads.get_mut(key) {
+            entry.status = "cancelled".to_string();
+        }
+        return Ok(());
+    }
+
+    let mut downloads = downloads_map.lock().await;
+    if let Some(entry) = downloads.get_mut(key) {
+        entry.downloaded_bytes = downloaded_counter.load(AtomicOrdering::Relaxed);
+        entry.status = "complete".to_string();
+    }
+    Ok(())
+}
+
+/// Downloads a single byte range (`chunk_start..=chunk_end`, inclusive) of
+/// `url` and writes it into `target_path` at the matching offset. Runs the
+/// actual write on a blocking task via `seek_write` (Windows-only API) so
+/// concurrent chunk tasks can write to disjoint regions of the same file
+/// handle without racing each other.
+async fn download_range_chunk(
+    client: Arc<reqwest::Client>,
+    url: String,
+    hf_token: Option<String>,
+    target_path: std::path::PathBuf,
+    chunk_start: u64,
+    chunk_end: u64,
+    downloaded_counter: Arc<AtomicU64>,
+    cancel_flag: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let mut req = client
+        .get(&url)
+        .header("Range", format!("bytes={}-{}", chunk_start, chunk_end));
+    if let Some(ref t) = hf_token {
+        req = req.header("Authorization", format!("Bearer {}", t));
+    }
+    let response = req
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?;
+
+    let mut stream = response.bytes_stream();
+    let mut buf: Vec<u8> = Vec::with_capacity((chunk_end - chunk_start + 1) as usize);
+    while let Some(chunk) = stream.next().await {
+        if cancel_flag.load(AtomicOrdering::Relaxed) {
+            return Err("cancelled".to_string());
+        }
+        let chunk = chunk.map_err(|e| e.to_string())?;
+        downloaded_counter.fetch_add(chunk.len() as u64, AtomicOrdering::Relaxed);
+        buf.extend_from_slice(&chunk);
+    }
+
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        use std::os::windows::fs::FileExt;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&target_path)
+            .map_err(|e| e.to_string())?;
+        let mut offset = chunk_start;
+        let mut written = 0usize;
+        while written < buf.len() {
+            let n = file
+                .seek_write(&buf[written..], offset)
+                .map_err(|e| e.to_string())?;
+            if n == 0 {
+                return Err("seek_write wrote 0 bytes".to_string());
+            }
+            written += n;
+            offset += n as u64;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
     Ok(())
 }
 
@@ -5272,6 +5778,34 @@ fn find_llama_server_binary() -> Option<std::path::PathBuf> {
     None
 }
 
+/// Default max draft tokens per MTP step, used when the request doesn't
+/// specify one. Shared here so the frontend and backend defaults can't
+/// silently drift.
+const DEFAULT_SPEC_DRAFT_N_MAX: u32 = 4;
+
+/// True if the resolved llama-server build knows the MTP/speculative-decoding
+/// flags. Older builds abort on an unknown argument, so an undetected MTP
+/// sibling file would otherwise break loading outright. Probed once per
+/// process by running `--help` and cached.
+fn llama_server_supports_mtp() -> bool {
+    static SUPPORTS_MTP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTS_MTP.get_or_init(|| {
+        let supported = (|| -> Option<bool> {
+            let server_bin = find_llama_server_binary()?;
+            let output = std::process::Command::new(&server_bin)
+                .arg("--help")
+                .output()
+                .ok()?;
+            let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+            combined.push_str(&String::from_utf8_lossy(&output.stderr));
+            Some(combined.contains("--spec-type") && combined.contains("--spec-draft-n-max"))
+        })()
+        .unwrap_or(false);
+        tracing::info!("llama-server MTP/speculative-decoding flags supported: {}", supported);
+        supported
+    })
+}
+
 /// Generate a simple unique model ID using timestamp + port
 fn new_model_id(port: u16) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -5441,6 +5975,22 @@ pub(crate) async fn get_media_retention(
     Json(MediaRetentionConfig { ttl_seconds, persist_disk })
 }
 
+/// Poll the GGUF de-quantization progress (tqdm bar on
+/// `video_diffusers_server.py`'s stderr) of an in-flight video model load.
+/// Simple global-state read, independent of `state.loaded_models`/job ids.
+pub(crate) async fn get_video_load_progress() -> Json<serde_json::Value> {
+    match video_backend::current_load_progress() {
+        Some(p) => Json(serde_json::json!({
+            "loading": true,
+            "phase": p.phase,
+            "percent": p.percent,
+            "current": p.current,
+            "total": p.total,
+        })),
+        None => Json(serde_json::json!({ "loading": false })),
+    }
+}
+
 pub(crate) async fn load_model(
     State(state): State<AppState>,
     Json(payload): Json<ModelLoadRequest>,
@@ -5555,6 +6105,8 @@ pub(crate) async fn load_model(
                 let opts = backend_trait::LoadOptions {
                     gpu_layers: Some(gpu_layers),
                     context_size: Some(context_size),
+                    text_encoder_override_path: payload.text_encoder_override_path.clone(),
+                    vae_override_path: payload.vae_override_path.clone(),
                     ..Default::default()
                 };
                 if let Err(e) = b.load_model(&model_path, &opts).await {
@@ -5644,6 +6196,50 @@ pub(crate) async fn load_model(
                     mmproj_loaded = true;
                 } else {
                     tracing::warn!("No vision projector found for model: {}", model_path.display());
+                }
+                if !payload.mtp_enabled.unwrap_or(true) {
+                    tracing::info!("MTP drafter disabled via mtp_enabled=false for model: {}", model_path.display());
+                } else {
+                    let mtp = payload.mtp_path
+                        .as_ref()
+                        .filter(|s| !s.is_empty())
+                        .map(std::path::PathBuf::from)
+                        .filter(|p| p.exists())
+                        .or_else(|| find_sibling_mtp(&model_path));
+                    if let Some(mtp_path) = &mtp {
+                        if !llama_server_supports_mtp() {
+                            tracing::warn!(
+                                "MTP drafter found ({}) but this llama-server build does not support --spec-type/--spec-draft-n-max; skipping",
+                                mtp_path.display()
+                            );
+                        } else {
+                            // Crude VRAM headroom heuristic (same `size * 1.2`
+                            // rule of thumb used by estimate_vram elsewhere):
+                            // only enable the drafter if the main model plus
+                            // drafter plausibly fit in free VRAM/RAM.
+                            let main_size = std::fs::metadata(&model_path).map(|m| m.len()).unwrap_or(0);
+                            let mtp_size = std::fs::metadata(mtp_path).map(|m| m.len()).unwrap_or(0);
+                            let estimated_required = ((main_size + mtp_size) as f64 * 1.2) as u64;
+                            let sys = HardwareProfiler::probe();
+                            let free_bytes = if sys.free_vram_bytes > 0 { sys.free_vram_bytes } else { sys.available_ram_bytes };
+                            if estimated_required > free_bytes {
+                                tracing::warn!(
+                                    "Skipping MTP drafter for {}: estimated required {} bytes (main {} + drafter {}, x1.2) exceeds free {} bytes",
+                                    model_path.display(), estimated_required, main_size, mtp_size, free_bytes
+                                );
+                            } else {
+                                let n_max = payload.spec_draft_n_max.unwrap_or(DEFAULT_SPEC_DRAFT_N_MAX);
+                                let p_min = payload.spec_draft_p_min;
+                                tracing::info!("Using MTP drafter: {} (spec-draft-n-max={}, spec-draft-p-min={:?})", mtp_path.display(), n_max, p_min);
+                                child_cmd.arg("--model-draft").arg(mtp_path)
+                                    .arg("--spec-type").arg("draft-mtp")
+                                    .arg("--spec-draft-n-max").arg(n_max.to_string());
+                                if let Some(p) = p_min {
+                                    child_cmd.arg("--spec-draft-p-min").arg(p.to_string());
+                                }
+                            }
+                        }
+                    }
                 }
                 let child = child_cmd.spawn();
                 match child {

@@ -21,10 +21,10 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from env_setup_common import ensure_uv, create_venv, uv_pip_install, stage, progress
+from env_setup_common import ensure_uv, create_venv, uv_pip_install, stage, progress, resolve_venv_root
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-VENV_DIR = PROJECT_ROOT / ".venv-video"
+VENV_DIR = resolve_venv_root(PROJECT_ROOT) / ".venv-video"
 VENV_PYTHON = VENV_DIR / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 INSTALL_MARKER = VENV_DIR / ".install_complete"
 
@@ -58,7 +58,7 @@ def install_core_deps():
         VENV_PYTHON,
         [
             "diffusers", "transformers", "accelerate", "safetensors",
-            "pillow", "numpy<2", "imageio", "imageio-ffmpeg",
+            "pillow", "numpy<2", "imageio", "imageio-ffmpeg", "sentencepiece", "protobuf",
         ],
     )
 

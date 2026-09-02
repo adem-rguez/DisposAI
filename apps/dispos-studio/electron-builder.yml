@@ -1,0 +1,35 @@
+appId: com.disposai.studio
+productName: DisposAI
+
+directories:
+  output: dist-installer
+
+files:
+  - dist/**/*
+  - electron-main.js
+  - preload*.js
+  - src/assets/**/*
+
+extraResources:
+  - from: resources/daemon-core.exe
+    to: daemon-core.exe
+  - from: resources/scripts
+    to: scripts
+
+win:
+  target: nsis
+  icon: src/assets/dispos_logo.ico
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+
+# --- Future work: not yet functional, stubs for later platform support ---
+# mac:
+#   target: dmg
+#
+# linux:
+#   target: AppImage

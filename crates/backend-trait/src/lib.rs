@@ -34,6 +34,14 @@ pub struct LoadOptions {
     /// Optional mmproj (vision projector) path to enable image input on a
     /// text/vision GGUF. `None` falls back to sibling auto-detection.
     pub mmproj_path: Option<String>,
+    /// Optional manual override for the LTX-Video text encoder, pointing
+    /// directly at a local file (gguf/safetensors/ckpt/pt/bin). `None` falls
+    /// back to sibling auto-detection.
+    pub text_encoder_override_path: Option<String>,
+    /// Optional manual override for the LTX-Video VAE, pointing directly at
+    /// a local file (gguf/safetensors/ckpt/pt/bin). `None` falls back to
+    /// sibling auto-detection.
+    pub vae_override_path: Option<String>,
     pub params: std::collections::HashMap<String, String>,
 }
 
@@ -45,6 +53,8 @@ impl Default for LoadOptions {
             batch_size: Some(512),
             threads: Some(8),
             mmproj_path: None,
+            text_encoder_override_path: None,
+            vae_override_path: None,
             params: std::collections::HashMap::new(),
         }
     }

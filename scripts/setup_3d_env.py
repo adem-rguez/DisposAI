@@ -35,10 +35,10 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from env_setup_common import ensure_uv, create_venv, uv_pip_install, stage, progress
+from env_setup_common import ensure_uv, create_venv, uv_pip_install, stage, progress, resolve_venv_root
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-VENV_DIR = PROJECT_ROOT / ".venv-3d"
+VENV_DIR = resolve_venv_root(PROJECT_ROOT) / ".venv-3d"
 VENV_PYTHON = VENV_DIR / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 INSTALL_MARKER = VENV_DIR / ".install_complete"
 
@@ -142,7 +142,38 @@ def install_sf3d():
         "GATED — you must `huggingface-cli login` and accept its license on\n"
         "huggingface.co before the model will download at runtime."
     )
-    uv_pip_install(VENV_PYTHON, ["git+https://github.com/Stability-AI/stable-fast-3d"])
+    # The stable-fast-3d repo has no pyproject.toml/setup.py at its root (only
+    # its texture_baker/ and uv_unwrapper/ native-extension subfolders do), so
+    # a plain `pip install git+<repo>` fails outright ("does not appear to be
+    # a Python project"). Its own run.py/gradio_app.py are meant to be run
+    # from a checkout of the repo root with `sf3d/` on PYTHONPATH instead, so
+    # mirror that: install its plain-python deps, clone the repo, and drop a
+    # .pth file pointing at the checkout. texture_baker/uv_unwrapper need a
+    # CUDA toolkit matching torch's build to compile and aren't needed by our
+    # adapter (which bypasses UV unwrapping/texture baking) — threed_server.py
+    # stubs them out at import time instead of building them here.
+    uv_pip_install(
+        VENV_PYTHON,
+        [
+            "einops", "jaxtyping", "omegaconf", "transformers",
+            "open_clip_torch", "trimesh", "huggingface-hub", "rembg",
+            "pynanoinstantmeshes", "gpytoolbox",
+        ],
+    )
+
+    src_dir = VENV_DIR / "_sf3d_src"
+    if not (src_dir / "sf3d").is_dir():
+        subprocess.run(
+            ["git", "clone", "--depth", "1", "https://github.com/Stability-AI/stable-fast-3d", str(src_dir)],
+            check=True,
+        )
+
+    site_packages = subprocess.run(
+        [str(VENV_PYTHON), "-c",
+         "import site; print([p for p in site.getsitepackages() if 'site-packages' in p][0])"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    Path(site_packages, "stable_fast_3d.pth").write_text(str(src_dir) + "\n")
 
 
 def install_hunyuan3d():

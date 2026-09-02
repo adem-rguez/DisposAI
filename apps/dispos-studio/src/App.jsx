@@ -111,9 +111,9 @@ function ToolCallChip({ event, onCancel, onExpand }) {
   const modelName = event.arguments?.model;
   const label = event.status === 'executing' ? `Calling ${event.name}...`
     : event.status === 'done' ? `Used tool: ${event.name}${modelName ? ` (${modelName})` : ''}`
-    : event.status === 'error' ? `Tool ${event.name} failed: ${event.detail}`
-    : event.status === 'cancelled' ? `Generation cancelled: ${event.name}`
-    : '';
+      : event.status === 'error' ? `Tool ${event.name} failed: ${event.detail}`
+        : event.status === 'cancelled' ? `Generation cancelled: ${event.name}`
+          : '';
 
   return (
     <div className={`tool-status-indicator ${event.status}`} style={{ flexDirection: 'column', alignItems: 'stretch' }}>
@@ -433,6 +433,7 @@ const TASK_TAG_CATEGORY = {
   'video-to-video': 'video',
   'video-classification': 'video',
   'video-text-to-text': 'video',
+  'image-text-to-video': 'video',
   'text-to-3d': 'mesh3d',
   'image-to-3d': 'mesh3d',
   'feature-extraction': 'embeddings',
@@ -443,6 +444,7 @@ const TASK_TAG_CATEGORY = {
   'visual-question-answering': 'chat',
 };
 const CATEGORY_PRIORITY = ['tts', 'audio', 'image', 'video', 'mesh3d', 'embeddings', 'chat'];
+const CATEGORY_DEFAULT_TITLE = { tts: 'New Audio', audio: 'New Audio', image: 'New Image', video: 'New Video', mesh3d: 'New 3D Model', embeddings: 'New Embedding', chat: 'New chat' };
 function categoryForTags(tags) {
   const set = new Set((tags || []).map(t => TASK_TAG_CATEGORY[t]).filter(Boolean));
   for (const c of CATEGORY_PRIORITY) if (set.has(c)) return c;
@@ -450,69 +452,83 @@ function categoryForTags(tags) {
 }
 
 const HF_MODEL_TYPE_GROUPS = [
-  { group: 'Multimodal', types: [
-    { label: 'Audio-Text-to-Text', tag: 'audio-text-to-text' },
-    { label: 'Image-Text-to-Text', tag: 'image-text-to-text' },
-    { label: 'Visual Question Answering', tag: 'visual-question-answering' },
-    { label: 'Document Question Answering', tag: 'document-question-answering' },
-    { label: 'Video-Text-to-Text', tag: 'video-text-to-text' },
-    { label: 'Visual Document Retrieval', tag: 'visual-document-retrieval' },
-    { label: 'Any-to-Any', tag: 'any-to-any' },
-  ]},
-  { group: 'Computer Vision', types: [
-    { label: 'Depth Estimation', tag: 'depth-estimation' },
-    { label: 'Image Classification', tag: 'image-classification' },
-    { label: 'Object Detection', tag: 'object-detection' },
-    { label: 'Image Segmentation', tag: 'image-segmentation' },
-    { label: 'Text-to-Image', tag: 'text-to-image' },
-    { label: 'Image-to-Text', tag: 'image-to-text' },
-    { label: 'Image-to-Image', tag: 'image-to-image' },
-    { label: 'Image-to-Video', tag: 'image-to-video' },
-    { label: 'Unconditional Image Generation', tag: 'unconditional-image-generation' },
-    { label: 'Video Classification', tag: 'video-classification' },
-    { label: 'Text-to-Video', tag: 'text-to-video' },
-    { label: 'Zero-Shot Image Classification', tag: 'zero-shot-image-classification' },
-    { label: 'Mask Generation', tag: 'mask-generation' },
-    { label: 'Zero-Shot Object Detection', tag: 'zero-shot-object-detection' },
-    { label: 'Text-to-3D', tag: 'text-to-3d' },
-    { label: 'Image-to-3D', tag: 'image-to-3d' },
-    { label: 'Image Feature Extraction', tag: 'image-feature-extraction' },
-    { label: 'Keypoint Detection', tag: 'keypoint-detection' },
-  ]},
-  { group: 'Natural Language Processing', types: [
-    { label: 'Text Classification', tag: 'text-classification' },
-    { label: 'Token Classification', tag: 'token-classification' },
-    { label: 'Table Question Answering', tag: 'table-question-answering' },
-    { label: 'Question Answering', tag: 'question-answering' },
-    { label: 'Zero-Shot Classification', tag: 'zero-shot-classification' },
-    { label: 'Translation', tag: 'translation' },
-    { label: 'Summarization', tag: 'summarization' },
-    { label: 'Feature Extraction', tag: 'feature-extraction' },
-    { label: 'Text Generation', tag: 'text-generation' },
-    { label: 'Text-to-Text Generation', tag: 'text2text-generation' },
-    { label: 'Fill-Mask', tag: 'fill-mask' },
-    { label: 'Sentence Similarity', tag: 'sentence-similarity' },
-  ]},
-  { group: 'Audio', types: [
-    { label: 'Text-to-Speech', tag: 'text-to-speech' },
-    { label: 'Text-to-Audio', tag: 'text-to-audio' },
-    { label: 'Automatic Speech Recognition', tag: 'automatic-speech-recognition' },
-    { label: 'Audio-to-Audio', tag: 'audio-to-audio' },
-    { label: 'Audio Classification', tag: 'audio-classification' },
-    { label: 'Voice Activity Detection', tag: 'voice-activity-detection' },
-  ]},
-  { group: 'Tabular', types: [
-    { label: 'Tabular Classification', tag: 'tabular-classification' },
-    { label: 'Tabular Regression', tag: 'tabular-regression' },
-    { label: 'Time Series Forecasting', tag: 'time-series-forecasting' },
-  ]},
-  { group: 'Reinforcement Learning', types: [
-    { label: 'Reinforcement Learning', tag: 'reinforcement-learning' },
-    { label: 'Robotics', tag: 'robotics' },
-  ]},
-  { group: 'Other', types: [
-    { label: 'Graph Machine Learning', tag: 'graph-machine-learning' },
-  ]},
+  {
+    group: 'Multimodal', types: [
+      { label: 'Audio-Text-to-Text', tag: 'audio-text-to-text' },
+      { label: 'Image-Text-to-Text', tag: 'image-text-to-text' },
+      { label: 'Visual Question Answering', tag: 'visual-question-answering' },
+      { label: 'Document Question Answering', tag: 'document-question-answering' },
+      { label: 'Video-Text-to-Text', tag: 'video-text-to-text' },
+      { label: 'Visual Document Retrieval', tag: 'visual-document-retrieval' },
+      { label: 'Any-to-Any', tag: 'any-to-any' },
+    ]
+  },
+  {
+    group: 'Computer Vision', types: [
+      { label: 'Depth Estimation', tag: 'depth-estimation' },
+      { label: 'Image Classification', tag: 'image-classification' },
+      { label: 'Object Detection', tag: 'object-detection' },
+      { label: 'Image Segmentation', tag: 'image-segmentation' },
+      { label: 'Text-to-Image', tag: 'text-to-image' },
+      { label: 'Image-to-Text', tag: 'image-to-text' },
+      { label: 'Image-to-Image', tag: 'image-to-image' },
+      { label: 'Image-to-Video', tag: 'image-to-video' },
+      { label: 'Unconditional Image Generation', tag: 'unconditional-image-generation' },
+      { label: 'Video Classification', tag: 'video-classification' },
+      { label: 'Text-to-Video', tag: 'text-to-video' },
+      { label: 'Zero-Shot Image Classification', tag: 'zero-shot-image-classification' },
+      { label: 'Mask Generation', tag: 'mask-generation' },
+      { label: 'Zero-Shot Object Detection', tag: 'zero-shot-object-detection' },
+      { label: 'Text-to-3D', tag: 'text-to-3d' },
+      { label: 'Image-to-3D', tag: 'image-to-3d' },
+      { label: 'Image Feature Extraction', tag: 'image-feature-extraction' },
+      { label: 'Keypoint Detection', tag: 'keypoint-detection' },
+    ]
+  },
+  {
+    group: 'Natural Language Processing', types: [
+      { label: 'Text Classification', tag: 'text-classification' },
+      { label: 'Token Classification', tag: 'token-classification' },
+      { label: 'Table Question Answering', tag: 'table-question-answering' },
+      { label: 'Question Answering', tag: 'question-answering' },
+      { label: 'Zero-Shot Classification', tag: 'zero-shot-classification' },
+      { label: 'Translation', tag: 'translation' },
+      { label: 'Summarization', tag: 'summarization' },
+      { label: 'Feature Extraction', tag: 'feature-extraction' },
+      { label: 'Text Generation', tag: 'text-generation' },
+      { label: 'Text-to-Text Generation', tag: 'text2text-generation' },
+      { label: 'Fill-Mask', tag: 'fill-mask' },
+      { label: 'Sentence Similarity', tag: 'sentence-similarity' },
+    ]
+  },
+  {
+    group: 'Audio', types: [
+      { label: 'Text-to-Speech', tag: 'text-to-speech' },
+      { label: 'Text-to-Audio', tag: 'text-to-audio' },
+      { label: 'Automatic Speech Recognition', tag: 'automatic-speech-recognition' },
+      { label: 'Audio-to-Audio', tag: 'audio-to-audio' },
+      { label: 'Audio Classification', tag: 'audio-classification' },
+      { label: 'Voice Activity Detection', tag: 'voice-activity-detection' },
+    ]
+  },
+  {
+    group: 'Tabular', types: [
+      { label: 'Tabular Classification', tag: 'tabular-classification' },
+      { label: 'Tabular Regression', tag: 'tabular-regression' },
+      { label: 'Time Series Forecasting', tag: 'time-series-forecasting' },
+    ]
+  },
+  {
+    group: 'Reinforcement Learning', types: [
+      { label: 'Reinforcement Learning', tag: 'reinforcement-learning' },
+      { label: 'Robotics', tag: 'robotics' },
+    ]
+  },
+  {
+    group: 'Other', types: [
+      { label: 'Graph Machine Learning', tag: 'graph-machine-learning' },
+    ]
+  },
 ];
 
 const HF_LANGUAGES = [
@@ -542,6 +558,7 @@ const HF_PARAM_STOPS = [0, 0.5, 1, 3, 7, 13, 30, 70, 150, 500];
 
 const HF_FILE_ROLE_INFO = {
   mmproj: { icon: '👁', tooltip: 'Gives the model vision — lets it understand images' },
+  mtp: { icon: '⚡', tooltip: 'Speeds up generation — predicts several tokens ahead' },
   config: { icon: '⚙', tooltip: 'Model configuration' },
   tokenizer: { icon: '🔤', tooltip: 'Tokenizer / vocabulary' },
   shard: { icon: '🧩', tooltip: 'One part of the split model weights (needs all parts)' },
@@ -621,7 +638,7 @@ function AppInner() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(appSettings.mediaRetention),
-    }).catch(() => {});
+    }).catch(() => { });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -635,7 +652,8 @@ function AppInner() {
     total_ram_gb: 32.0,
     free_ram_gb: 20.0,
     total_vram_gb: 16.0,
-    free_vram_gb: 12.0
+    free_vram_gb: 12.0,
+    gpu_name: null
   });
 
   // Image Studio State
@@ -663,6 +681,7 @@ function AppInner() {
   const [videoSrc, setVideoSrc] = useState(null);
   const [isGeneratingVideo, setIsGeneratingVideo] = useState(false);
   const [videoProgress, setVideoProgress] = useState(null);
+  const [modelLoadProgress, setModelLoadProgress] = useState(null); // polled from /v1/model/load-progress while isLoadingModel is true (e.g. GGUF video de-quantization)
   const [activeVideoJobId, setActiveVideoJobId] = useState(null);
   const [videoInitImage, setVideoInitImage] = useState(null);
   const [videoInitImageName, setVideoInitImageName] = useState(null);
@@ -734,7 +753,7 @@ function AppInner() {
         return { ...item, modelName, studioKey };
       });
       if (migrated) {
-        try { localStorage.setItem('dispos.chat-sessions', JSON.stringify(result)); } catch {}
+        try { localStorage.setItem('dispos.chat-sessions', JSON.stringify(result)); } catch { }
       }
       return result;
     } catch { return []; }
@@ -867,6 +886,39 @@ function AppInner() {
   const [configTarget, setConfigTarget] = useState(null);
   const [isLoadingModel, setIsLoadingModel] = useState(false);
   const [loadingModelPath, setLoadingModelPath] = useState(null); // model_path currently in-flight for /v1/model/load, drives the "loading" status dot
+
+  // Poll for model load progress (e.g. GGUF de-quantization). The video
+  // backend defers actually spawning its Python server — and thus the
+  // de-quantization pass — until the first /v1/videos/generations call
+  // (see video-backend's `ensure_process_started`, called from `generate()`),
+  // not from /v1/model/load. So this has to poll during isGeneratingVideo
+  // too, not just isLoadingModel, or the backend's real progress data (which
+  // does show up on /v1/model/load-progress) never gets picked up.
+  useEffect(() => {
+    if (!isLoadingModel && !isGeneratingVideo) {
+      setModelLoadProgress(null);
+      return;
+    }
+    const indeterminate = { percent: -1, total: 0, step: 0, phase: 'Loading model…' };
+    setModelLoadProgress(indeterminate);
+    const poll = async () => {
+      try {
+        const res = await fetch('http://127.0.0.1:8080/v1/model/load-progress');
+        const data = await res.json();
+        setModelLoadProgress(data.loading
+          ? { percent: data.percent, total: data.total, step: data.current, phase: data.phase }
+          : (isLoadingModel ? indeterminate : null));
+      } catch {
+        // daemon briefly unavailable, keep showing last known progress
+      }
+    };
+    poll();
+    const interval = setInterval(poll, 400);
+    return () => {
+      clearInterval(interval);
+      setModelLoadProgress(null);
+    };
+  }, [isLoadingModel, isGeneratingVideo]);
   const [installProgress, setInstallProgress] = useState(null); // active backend Python env install (auto-triggered by envNotInstalled), or null when idle; only one install runs at a time
   const [unloadingModelId, setUnloadingModelId] = useState(null);
   const [modelFitPreview, setModelFitPreview] = useState(null);
@@ -894,7 +946,9 @@ function AppInner() {
   const [hfAutodownload, setHfAutodownload] = useState([]);
   const [hfAutodownloadReason, setHfAutodownloadReason] = useState(null);
   const [hfCollapsedFolders, setHfCollapsedFolders] = useState(() => new Set());
+  const [hfFileSearch, setHfFileSearch] = useState('');
   const [hfDownloads, setHfDownloads] = useState({});
+  const [componentAssignStatus, setComponentAssignStatus] = useState({});
   const [showDownloadsPanel, setShowDownloadsPanel] = useState(false);
   const [pendingCatalogJump, setPendingCatalogJump] = useState(null);
   const [hfTokenInput, setHfTokenInput] = useState('');
@@ -990,7 +1044,7 @@ function AppInner() {
     fetch('http://127.0.0.1:8080/v1/model/hf-token')
       .then(res => res.json())
       .then(data => setHfHasToken(data.has_token))
-      .catch(() => {});
+      .catch(() => { });
   }, []);
 
   const saveHfToken = () => {
@@ -1006,7 +1060,7 @@ function AppInner() {
         setHfTokenInput('');
         setTimeout(() => setHfTokenSaved(false), 3000);
       })
-      .catch(() => {});
+      .catch(() => { });
   };
 
   const selectHfRepo = (repoId) => {
@@ -1024,6 +1078,7 @@ function AppInner() {
     setHfAutodownload([]);
     setHfAutodownloadReason(null);
     setHfCollapsedFolders(new Set());
+    setHfFileSearch('');
     setHfDownloads(current => {
       const next = { ...current };
       for (const key of Object.keys(next)) {
@@ -1062,6 +1117,77 @@ function AppInner() {
     });
   };
 
+  // Used by video pipeline components, whose expected filenames are fixed
+  // and known ahead of time (LTX's tokenizer/scheduler/text-encoder file
+  // lists) — so physically placing the picked file at the exact expected
+  // path/name is unambiguous and survives restarts via the normal
+  // exact-filename detection.
+  const assignComponentFile = async (comp) => {
+    const targetPath = comp.target_path;
+    const defaultPath = targetPath ? window.require('path').dirname(targetPath) : undefined;
+    const sourcePath = await browseForFile(defaultPath, undefined, ['openFile']);
+    if (!sourcePath) return;
+    const path = window.require('path');
+    const destination = comp.resolved_path
+      ? targetPath
+      : path.join(targetPath, comp.source?.target_filename || path.basename(sourcePath));
+    setComponentAssignStatus(current => ({ ...current, [targetPath]: { status: 'assigning' } }));
+    try {
+      const res = await fetch('http://127.0.0.1:8080/v1/model/assign-component', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ source_path: sourcePath, target_path: destination }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.error) {
+        setComponentAssignStatus(current => ({ ...current, [targetPath]: { status: 'error', error: data.error || 'Assign failed' } }));
+        return;
+      }
+      setComponentAssignStatus(current => {
+        const next = { ...current };
+        delete next[targetPath];
+        return next;
+      });
+      fetchCatalog();
+    } catch (err) {
+      setComponentAssignStatus(current => ({ ...current, [targetPath]: { status: 'error', error: String(err) } }));
+    }
+  };
+
+  // Used by image (sd-backend) sibling components. These are matched by a
+  // fuzzy filename hint (e.g. "qwen3", "flux2-vae"), so a user-picked file
+  // usually won't match the pattern and copying it into place wouldn't be
+  // found again on restart — this records the exact chosen path as an
+  // override instead, which the backend checks before falling back to the
+  // fuzzy search.
+  const assignImageComponentOverride = async (comp) => {
+    const key = comp.target_path;
+    const defaultPath = key ? window.require('path').dirname(key) : undefined;
+    const sourcePath = await browseForFile(defaultPath, undefined, ['openFile']);
+    if (!sourcePath) return;
+    setComponentAssignStatus(current => ({ ...current, [key]: { status: 'assigning' } }));
+    try {
+      const res = await fetch('http://127.0.0.1:8080/v1/model/component-override', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model_path: configTarget?.model_path, kind_name: comp.kind_name, source_path: sourcePath }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.error) {
+        setComponentAssignStatus(current => ({ ...current, [key]: { status: 'error', error: data.error || 'Assign failed' } }));
+        return;
+      }
+      setComponentAssignStatus(current => {
+        const next = { ...current };
+        delete next[key];
+        return next;
+      });
+      fetchCatalog();
+    } catch (err) {
+      setComponentAssignStatus(current => ({ ...current, [key]: { status: 'error', error: String(err) } }));
+    }
+  };
+
   const startHfDownloadAll = (repoId) => {
     hfRepoFiles.forEach(file => {
       if (hfDownloads[`${repoId}::${file.filename}`]?.status === 'complete') return;
@@ -1081,7 +1207,7 @@ function AppInner() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ repo, filename }),
-    }).catch(() => {});
+    }).catch(() => { });
   };
 
   // "Find in catalog" from the downloads tracker: open the catalog on Discover,
@@ -1140,7 +1266,7 @@ function AppInner() {
     fetch('http://127.0.0.1:8080/v1/model/hf-download/status')
       .then(res => res.ok ? res.json() : {})
       .then(status => setHfDownloads(current => ({ ...status, ...current })))
-      .catch(() => {});
+      .catch(() => { });
   }, []);
 
   // Global download-status polling: runs independent of the catalog modal
@@ -1169,7 +1295,7 @@ function AppInner() {
           // so it shows up under "my models" without a manual refresh.
           if (anyCompleted) fetchCatalog();
         })
-        .catch(() => {});
+        .catch(() => { });
     }, 2000);
     return () => clearInterval(interval);
   }, [hfDownloads, fetchCatalog]);
@@ -1198,7 +1324,7 @@ function AppInner() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ paths: modelCards.map(c => c.modelPath) }),
-    }).catch(() => {});
+    }).catch(() => { });
   }, [modelCards]);
 
   useEffect(() => {
@@ -1249,6 +1375,12 @@ function AppInner() {
       texture: s.texture,
       speed: s.speed,
       mmproj_path: s.mmproj_path || card.mmproj_path || detectedModels.find(m => m.path === card.modelPath)?.mmproj_path || '',
+      mtp_path: s.mtp_path || card.mtp_path || detectedModels.find(m => m.path === card.modelPath)?.mtp_path || '',
+      mtp_enabled: s.mtp_enabled,
+      spec_draft_n_max: s.spec_draft_n_max,
+      spec_draft_p_min: s.spec_draft_p_min,
+      text_encoder_override_path: s.text_encoder_override_path || card.text_encoder_override_path || '',
+      vae_override_path: s.vae_override_path || card.vae_override_path || '',
       mesh_vae_path: s.mesh_vae_path || card.mesh_vae_path || detectedModels.find(m => m.path === card.modelPath)?.mesh_vae_path || '',
       mesh_texgen_path: s.mesh_texgen_path || card.mesh_texgen_path || detectedModels.find(m => m.path === card.modelPath)?.mesh_texgen_path || '',
       // Generic sibling-component list (covers Hunyuan3D subfolders and flat
@@ -1262,6 +1394,37 @@ function AppInner() {
       video_components: detectedModels.find(m => m.path === card.modelPath)?.video_components || null,
       vae_path: s.vae_path || card.vae_path || detectedModels.find(m => m.path === card.modelPath)?.vae_path || '',
     });
+  };
+
+  const buildSettingsFromConfigTarget = (cfg) => ({
+    gpu_layers: cfg?.gpu_layers,
+    context_size: cfg?.context_size,
+    mmproj_path: cfg?.mmproj_path || undefined,
+    mtp_path: cfg?.mtp_path || undefined,
+    mtp_enabled: cfg?.mtp_enabled,
+    spec_draft_n_max: cfg?.spec_draft_n_max,
+    spec_draft_p_min: cfg?.spec_draft_p_min,
+    text_encoder_override_path: cfg?.text_encoder_override_path || undefined,
+    vae_override_path: cfg?.vae_override_path || undefined,
+    temperature: cfg?.temperature,
+    top_p: cfg?.top_p,
+    system_prompt: cfg?.system_prompt || '',
+    steps: cfg?.steps,
+    cfg_scale: cfg?.cfg_scale,
+    width: cfg?.width,
+    height: cfg?.height,
+    seed: cfg?.seed,
+    guidance_scale: cfg?.guidance_scale,
+    texture: cfg?.texture,
+    speed: cfg?.speed,
+  });
+
+  const closeConfigPanel = () => {
+    if (configTarget?.cardId) {
+      const settings = buildSettingsFromConfigTarget(configTarget);
+      setModelCards(current => current.map(item => item.id === configTarget.cardId ? { ...item, settings } : item));
+    }
+    setConfigTarget(null);
   };
 
   const fetchLoadedModels = useCallback(async () => {
@@ -1305,7 +1468,7 @@ function AppInner() {
           setOrchestratorModelId(null);
         }
       }
-    } catch {}
+    } catch { }
   }, [selectedModelId, orchestratorModelId]);
 
   const handleLoadModel = async (configuration = configTarget) => {
@@ -1321,6 +1484,12 @@ function AppInner() {
           gpu_layers: configuration.gpu_layers,
           context_size: configuration.context_size,
           mmproj_path: configuration.mmproj_path || undefined,
+          mtp_path: configuration.mtp_path || undefined,
+          mtp_enabled: configuration.mtp_enabled,
+          spec_draft_n_max: configuration.spec_draft_n_max,
+          spec_draft_p_min: configuration.spec_draft_p_min,
+          text_encoder_override_path: configuration.text_encoder_override_path || undefined,
+          vae_override_path: configuration.vae_override_path || undefined,
         }),
       });
       const text = await res.text();
@@ -1378,7 +1547,7 @@ function AppInner() {
               resolve(null);
             }
           })
-          .catch(() => {});
+          .catch(() => { });
       }, 200);
     });
   };
@@ -1427,11 +1596,20 @@ function AppInner() {
       ? Math.min(s.context_size ?? 4096, card.max_context_size)
       : (s.context_size ?? 4096);
     const mmproj = s.mmproj_path || card.mmproj_path || detectedModels.find(m => m.path === card.modelPath)?.mmproj_path || undefined;
+    const mtp = s.mtp_path || card.mtp_path || detectedModels.find(m => m.path === card.modelPath)?.mtp_path || undefined;
+    const textEncoderOverride = s.text_encoder_override_path || card.text_encoder_override_path || undefined;
+    const vaeOverride = s.vae_override_path || card.vae_override_path || undefined;
     const modelId = await handleLoadModel({
       model_path: card.modelPath,
       gpu_layers: s.gpu_layers ?? 99,
       context_size: contextSize,
       mmproj_path: mmproj,
+      mtp_path: mtp,
+      mtp_enabled: s.mtp_enabled,
+      spec_draft_n_max: s.spec_draft_n_max,
+      spec_draft_p_min: s.spec_draft_p_min,
+      text_encoder_override_path: textEncoderOverride,
+      vae_override_path: vaeOverride,
     });
     if (modelId) {
       applyModelDefaults({ ...s, task_tags: card.task_tags });
@@ -1491,7 +1669,7 @@ function AppInner() {
       const res = await fetch('http://127.0.0.1:8080/v1/model/delete', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path: model.path, mmproj_path: model.mmproj_path || undefined }),
+        body: JSON.stringify({ path: model.path, mmproj_path: model.mmproj_path || undefined, mtp_path: model.mtp_path || undefined }),
       });
       if (res.ok) {
         fetchCatalog();
@@ -1582,8 +1760,8 @@ function AppInner() {
   const activeChatStudio = activeChatSession
     ? { modelId: activeChatSession.modelId, name: activeChatSession.modelName, task_tags: activeChatSession.task_tags, modelPath: activeChatSession.modelPath }
     : (activeChatLoaded
-        ? { modelId: activeChatLoaded.model_id, name: activeChatLoaded.model_path?.split('\\').pop(), task_tags: activeChatLoaded.task_tags, modelPath: activeChatLoaded.model_path }
-        : studioForCategory('chat'));
+      ? { modelId: activeChatLoaded.model_id, name: activeChatLoaded.model_path?.split('\\').pop(), task_tags: activeChatLoaded.task_tags, modelPath: activeChatLoaded.model_path }
+      : studioForCategory('chat'));
 
   // Most recently opened loaded model with category "mesh3d" drives which
   // input kinds the 3D Model Studio panel adapts to.
@@ -1604,12 +1782,30 @@ function AppInner() {
   // Re-fetched whenever the active mesh3d model changes (not just once on
   // app mount) because the daemon's schema endpoint 503s until a mesh3d
   // model's threed_server.py subprocess is actually running — mounting is
-  // almost always before any 3D model has been loaded.
+  // almost always before any 3D model has been loaded. Polls with retry
+  // (mirrors the video schema effect below) so the params render as soon as
+  // the subprocess comes up, instead of requiring a generation attempt to
+  // re-trigger this effect.
   useEffect(() => {
-    fetch('http://127.0.0.1:8080/v1/models3d/schema')
-      .then(res => (res.ok ? res.json() : Promise.reject(new Error('schema fetch failed'))))
-      .then(schema => setMesh3dSchema(schema))
-      .catch(() => setMesh3dSchema(null));
+    if (!activeMesh3dLoaded?.model_path && !activeMesh3dCatalog?.path) {
+      setMesh3dSchema(null);
+      return;
+    }
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const res = await fetch('http://127.0.0.1:8080/v1/models3d/schema');
+        if (!res.ok) throw new Error('schema fetch failed');
+        const schema = await res.json();
+        if (!cancelled) setMesh3dSchema(schema);
+        return;
+      } catch {
+        if (!cancelled) setTimeout(poll, 1500);
+      }
+    };
+    setMesh3dSchema(null);
+    poll();
+    return () => { cancelled = true; };
   }, [activeMesh3dLoaded?.model_path, activeMesh3dCatalog?.path]);
   const mesh3dAdapterId = detectMesh3dAdapterId(activeMesh3dLoaded?.model_path || activeMesh3dCatalog?.path);
   const mesh3dAdapterParams = mesh3dSchema?.[mesh3dAdapterId]?.params || [];
@@ -1668,12 +1864,30 @@ function AppInner() {
   // negative_prompt only when the loaded architecture supports them.
   // Re-fetched whenever the active video model changes because the daemon's
   // schema endpoint 503s until a video model's video_diffusers_server.py
-  // subprocess is actually running.
+  // subprocess is actually running (the GET itself triggers that subprocess
+  // to spawn, but the first few requests race its startup and 503 before it
+  // binds its port) — so this has to retry, not just fetch once, or the
+  // params panel stays empty until something else re-triggers this effect.
   useEffect(() => {
-    fetch('http://127.0.0.1:8080/v1/videos/schema')
-      .then(res => (res.ok ? res.json() : Promise.reject(new Error('schema fetch failed'))))
-      .then(schema => setVideoSchema(schema))
-      .catch(() => setVideoSchema(null));
+    if (!activeVideoLoaded?.model_path) {
+      setVideoSchema(null);
+      return;
+    }
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const res = await fetch('http://127.0.0.1:8080/v1/videos/schema');
+        if (!res.ok) throw new Error('schema fetch failed');
+        const schema = await res.json();
+        if (!cancelled) setVideoSchema(schema);
+        return;
+      } catch {
+        if (!cancelled) setTimeout(poll, 1500);
+      }
+    };
+    setVideoSchema(null);
+    poll();
+    return () => { cancelled = true; };
   }, [activeVideoLoaded?.model_path]);
   // "prompt" has its own dedicated field above the dynamic params; "image"
   // (img2video conditioning) has its own dedicated upload control below.
@@ -1715,7 +1929,7 @@ function AppInner() {
       }
       return [...current, entry];
     });
-    const session = { id: chatId, title: 'New chat', modelId: loadedEntry.model_id, modelPath: loadedEntry.model_path, modelName, task_tags, studioKey: canonicalStudioKey(loadedEntry.model_path, modelName), messages: initialMessages, createdAt: Date.now(), updatedAt: Date.now() };
+    const session = { id: chatId, title: CATEGORY_DEFAULT_TITLE[categoryForTags(task_tags)] ?? 'New chat', modelId: loadedEntry.model_id, modelPath: loadedEntry.model_path, modelName, task_tags, studioKey: canonicalStudioKey(loadedEntry.model_path, modelName), messages: initialMessages, createdAt: Date.now(), updatedAt: Date.now() };
     setChatSessions(current => [...current, session]);
     setActiveChatId(chatId);
     openModelStudio({ task_tags });
@@ -1811,6 +2025,39 @@ function AppInner() {
     }
     if (category === 'tts' && 'speed' in params) setTtsSpeed(params.speed);
 
+    // Prefill the reference image for image/video/mesh3d tool calls that took
+    // one as input. Only fetch when the tool call actually specified an image
+    // handle — absence has server-side "fall back to most recent asset"
+    // behavior we can't see from here, so we leave the field empty rather
+    // than guess. Handles may come back as a bare id or a path like
+    // "/v1/media/<id>"; mirror the daemon's resolve_media_handle and take
+    // whatever follows the last "/".
+    const mediaHandle = event.arguments?.image;
+    if (mediaHandle && (category === 'image' || category === 'video' || category === 'mesh3d')) {
+      const mediaId = mediaHandle.split('/').pop();
+      fetch(`http://127.0.0.1:8080/v1/media/${mediaId}`)
+        .then(res => (res.ok ? res.blob() : Promise.reject(new Error(`status ${res.status}`))))
+        .then(blob => new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.onerror = reject;
+          reader.readAsDataURL(blob);
+        }))
+        .then(dataUrl => {
+          if (category === 'image') {
+            setImgInitImage(dataUrl);
+            setImgInitImageName('from orchestrator');
+          } else if (category === 'video') {
+            setVideoInitImage(dataUrl);
+            setVideoInitImageName('from orchestrator');
+          } else if (category === 'mesh3d') {
+            setMesh3dImages([{ name: 'from orchestrator', dataUrl }]);
+            setMesh3dInputKind('image');
+          }
+        })
+        .catch(err => console.warn('expandToolCallToStudio: failed to fetch reference image', err));
+    }
+
     if (!running) return;
     const interval = setInterval(() => {
       fetch(`http://127.0.0.1:8080/v1/jobs/${event.jobId}/progress`)
@@ -1825,7 +2072,7 @@ function AppInner() {
             clearInterval(interval);
           }
         })
-        .catch(() => {});
+        .catch(() => { });
     }, 200);
   };
   // Writes go to the orchestrator's own transcript (targetId === null) or to
@@ -1855,7 +2102,7 @@ function AppInner() {
       });
       if (!response.body) return;
       const reader = response.body.getReader(); const decoder = new TextDecoder(); let title = '';
-      while (true) { const { done, value } = await reader.read(); if (done) break; for (const line of decoder.decode(value, { stream: true }).split('\n')) { try { const raw = line.replace(/^data:\s*/, ''); if (raw && raw !== '[DONE]') title += JSON.parse(raw)?.choices?.[0]?.delta?.content ?? ''; } catch {} } }
+      while (true) { const { done, value } = await reader.read(); if (done) break; for (const line of decoder.decode(value, { stream: true }).split('\n')) { try { const raw = line.replace(/^data:\s*/, ''); if (raw && raw !== '[DONE]') title += JSON.parse(raw)?.choices?.[0]?.delta?.content ?? ''; } catch { } } }
       // Some small local models echo meta-words from the instruction (e.g.
       // "chat"/"title"/"label") or restate a "Label:"-style prefix instead of
       // just answering — strip those known leakage patterns.
@@ -1869,7 +2116,7 @@ function AppInner() {
         .trim()
         .slice(0, 64);
       if (title) setChatSessions(current => current.map(session => session.id === sessionId ? { ...session, title } : session));
-    } catch {}
+    } catch { }
   };
   // Was `loadedModels[0] ?? null` — that leaked whichever model happened to
   // load first regardless of modality. Scoped to activeChatLoaded (chat
@@ -1899,7 +2146,7 @@ function AppInner() {
     })
       .then(res => res.json())
       .then(data => setModelFitPreview(data))
-      .catch(() => {});
+      .catch(() => { });
   }, [configTarget?.cardId, configTarget?.context_size, configTarget?.task_tags, modelCards]);
 
   const messagesEndRef = useRef(null);
@@ -1941,10 +2188,11 @@ function AppInner() {
           total_ram_gb: (data.total_ram_bytes / (1024 * 1024 * 1024)).toFixed(1),
           free_ram_gb: (data.available_ram_bytes / (1024 * 1024 * 1024)).toFixed(1),
           total_vram_gb: (data.total_vram_bytes / (1024 * 1024 * 1024)).toFixed(1),
-          free_vram_gb: (data.free_vram_bytes / (1024 * 1024 * 1024)).toFixed(1)
+          free_vram_gb: (data.free_vram_bytes / (1024 * 1024 * 1024)).toFixed(1),
+          gpu_name: data.gpu_name || null
         });
       }
-    } catch {} finally {
+    } catch { } finally {
       sysInfoInFlight.current = false;
     }
   };
@@ -2076,6 +2324,13 @@ function AppInner() {
               continue;
             }
 
+            if (chunk.type === 'error') {
+              syncMessages(prev => prev.map(m =>
+                m.id === aiId ? { ...m, content: 'Error: ' + chunk.message, loading: false } : m
+              ), targetChatId);
+              continue;
+            }
+
             if (chunk.type === 'tool_status') {
               const jobId = chunk.job_id || null;
               syncMessages(prev => prev.map(m =>
@@ -2111,7 +2366,7 @@ function AppInner() {
                       }), targetChatId);
                       if (terminal) stopJobPolling(jobId);
                     })
-                    .catch(() => {});
+                    .catch(() => { });
                 }, 200);
                 jobIntervals.set(jobId, interval);
               }
@@ -2284,10 +2539,17 @@ function AppInner() {
     const priorMessages = chatSessions.find(s => s.id === activeChatId)?.messages ?? [];
     const history = priorMessages
       .filter(m => m.role === 'user' || m.role === 'assistant')
-      .map(m => ({
-        role: m.role,
-        content: m.role === 'assistant' ? (parseThinking(m.content).answer || m.content) : m.content,
-      }))
+      .map(m => {
+        let content = m.role === 'assistant' ? (parseThinking(m.content).answer || m.content) : m.content;
+        // Always record that a tool ran, regardless of whether the model also
+        // wrote trailing text — covers both the normal case and the model
+        // saying nothing after the call (or the user interrupting before it did).
+        if (m.role === 'assistant' && m.blocks && m.blocks.length > 0) {
+          const toolTrace = '[used tool: ' + m.blocks.map(b => b.name).join(', ') + ']';
+          content = content && content.trim() ? `${content}\n${toolTrace}` : toolTrace;
+        }
+        return { role: m.role, content };
+      })
       .filter(m => m.content && m.content.trim());
 
     syncMessages(prev => [...prev, userMsg, tempAiMsg]);
@@ -2307,10 +2569,12 @@ function AppInner() {
       model: modelPath,
       model_id: targetModelId,
       conversation_id: activeChatId,
-      messages: [...history, { role: 'user', content: imageAttachments.length ? [
-        { type: 'text', text: userText },
-        ...imageAttachments.map(attachment => ({ type: 'image_url', image_url: { url: attachment.dataUrl } })),
-      ] : userText }],
+      messages: [...history, {
+        role: 'user', content: imageAttachments.length ? [
+          { type: 'text', text: userText },
+          ...imageAttachments.map(attachment => ({ type: 'image_url', image_url: { url: attachment.dataUrl } })),
+        ] : userText
+      }],
       max_tokens: 4096,
       temperature: parseFloat(temperature),
       top_p: parseFloat(topP),
@@ -2348,7 +2612,7 @@ function AppInner() {
     if (idx === -1) return;
 
     syncMessages(prev => prev.slice(0, idx));
-    fetch(`http://127.0.0.1:8080/v1/conversations/${activeChatId}/reset-assets`, { method: 'POST' }).catch(() => {});
+    fetch(`http://127.0.0.1:8080/v1/conversations/${activeChatId}/reset-assets`, { method: 'POST' }).catch(() => { });
 
     await sendTurn(newText.trim(), msgAttachments ?? []);
   };
@@ -2415,7 +2679,7 @@ function AppInner() {
   // the existing progress poll picks up status "cancelled" once it notices.
   const cancelGenerationJob = (jobId) => {
     if (!jobId) return;
-    fetch(`http://127.0.0.1:8080/v1/jobs/${jobId}/cancel`, { method: 'POST' }).catch(() => {});
+    fetch(`http://127.0.0.1:8080/v1/jobs/${jobId}/cancel`, { method: 'POST' }).catch(() => { });
   };
 
   // Fires a generation request while polling GET /v1/jobs/:id/progress every
@@ -2440,7 +2704,7 @@ function AppInner() {
           setProgress(record);
           if (record.status === 'cancelled') cancelled = true;
         })
-        .catch(() => {});
+        .catch(() => { });
     }, 200);
     try {
       const res = await fetchPromise;
@@ -2704,6 +2968,8 @@ function AppInner() {
   const freeVram = parseFloat(sysInfo.free_vram_gb) || 6.0;
   const usedVram = totalVram - freeVram;
   const vramPct = Math.min(100, Math.max(0, (usedVram / totalVram) * 100)).toFixed(0);
+  const gpuRaw = sysInfo.gpu_name === 'NVIDIA GPU (CUDA)' ? '' : (sysInfo.gpu_name || '');
+  const gpuLabel = gpuRaw.replace(/^NVIDIA\s+/i, '').trim();
 
   const activeDownloadCount = Object.values(hfDownloads).filter(d => d.status === 'downloading').length;
   const sortedDownloads = Object.entries(hfDownloads).sort(([, a], [, b]) => {
@@ -2718,7 +2984,6 @@ function AppInner() {
         <div className="logo-group">
           <img className="logo-icon" src={disposLogo} alt="Dispos Studio" />
           <div className="logo-title">Dispos Studio</div>
-          <span className="version-tag">Standalone Native</span>
         </div>
 
         <div className="header-stats">
@@ -2740,9 +3005,10 @@ function AppInner() {
             <span>{usedRam.toFixed(1)} / {totalRam.toFixed(1)} GB</span>
           </div>
 
-          <div className="status-badge">
+          <div className="status-badge" title={sysInfo.gpu_name || 'CUDA GPU Active'}>
             <div className="status-dot"></div>
             <span>CUDA GPU Active</span>
+            {gpuLabel && <span className="status-badge-gpu">{gpuLabel}</span>}
           </div>
 
           <button className="downloads-tracker-btn" onClick={() => setShowDownloadsPanel(current => !current)} title="Downloads">
@@ -2872,300 +3138,300 @@ function AppInner() {
 
           <div className="nav-section" style={{ marginTop: '1rem' }}>STUDIOS</div>
           {chatSessions.length === 0 ? <div className="sidebar-empty-hint" style={{ color: 'var(--text-secondary)', fontSize: '0.78rem', padding: '0.25rem 0.75rem 0.75rem' }}>Start a studio from a loaded model in Model Center.</div>
-          : Object.entries(chatSessions.reduce((groups, chat) => {
+            : Object.entries(chatSessions.reduce((groups, chat) => {
               const modelKey = chat.studioKey || canonicalStudioKey(chat.modelPath, chat.modelName);
               if (!modelKey) return groups;
               groups[modelKey] ??= { name: chat.modelName, modelId: chat.modelId, modelPath: chat.modelPath, chats: [] };
               groups[modelKey].chats.push(chat);
               return groups;
             }, {}))
-            .sort(([, a], [, b]) =>
-              Math.max(...b.chats.map(chatLastModified), 0) - Math.max(...a.chats.map(chatLastModified), 0))
-            .map(([modelKey, model]) => {
-              const modelOpen = !(collapsedStudios[modelKey] ?? false);
-              const isPendingDeleteModel = pendingDeleteModelKey === modelKey;
-              const modelSessionIds = model.chats.map(c => c.id);
-              const openChatSession = (chat) => {
-                // Backend model_ids include a load timestamp (mdl-{ts}-{port}),
-                // so a re-loaded model has a fresh id even when the file
-                // is the same. Resolve chat.modelId against the current
-                // daemon registry (by id, then by stable modelPath) so
-                // the UI shows the actually-loaded model instead of "No
-                // Model Loaded" for studios created under a previous
-                // daemon instance. Falls back to the stored id so
-                // messages still route through the daemon's port-50052
-                // fallback when nothing matches.
-                const liveMatch = loadedModels.find(loaded => loaded.model_id === chat.modelId)
-                  ?? (chat.modelPath ? loadedModels.find(loaded => loaded.model_path === chat.modelPath) : null)
+              .sort(([, a], [, b]) =>
+                Math.max(...b.chats.map(chatLastModified), 0) - Math.max(...a.chats.map(chatLastModified), 0))
+              .map(([modelKey, model]) => {
+                const modelOpen = !(collapsedStudios[modelKey] ?? false);
+                const isPendingDeleteModel = pendingDeleteModelKey === modelKey;
+                const modelSessionIds = model.chats.map(c => c.id);
+                const openChatSession = (chat) => {
+                  // Backend model_ids include a load timestamp (mdl-{ts}-{port}),
+                  // so a re-loaded model has a fresh id even when the file
+                  // is the same. Resolve chat.modelId against the current
+                  // daemon registry (by id, then by stable modelPath) so
+                  // the UI shows the actually-loaded model instead of "No
+                  // Model Loaded" for studios created under a previous
+                  // daemon instance. Falls back to the stored id so
+                  // messages still route through the daemon's port-50052
+                  // fallback when nothing matches.
+                  const liveMatch = loadedModels.find(loaded => loaded.model_id === chat.modelId)
+                    ?? (chat.modelPath ? loadedModels.find(loaded => loaded.model_path === chat.modelPath) : null)
+                    ?? null;
+                  setSelectedModelId(liveMatch?.model_id ?? chat.modelId);
+                  setActiveChatId(chat.id);
+                  openModelStudio(chat);
+                };
+                const handleStudioToggleClick = () => {
+                  if (sidebarCollapsed) {
+                    const latestChat = model.chats.reduce((latest, chat) =>
+                      (!latest || chatLastModified(chat) >= chatLastModified(latest)) ? chat : latest, null);
+                    if (latestChat) openChatSession(latestChat);
+                    return;
+                  }
+                  setCollapsedStudios(current => ({ ...current, [modelKey]: !(current[modelKey] ?? false) }));
+                };
+                const loadedEntry = loadedModels.find(loaded => loaded.model_id === model.modelId)
+                  ?? (model.modelPath ? loadedModels.find(loaded => loaded.model_path === model.modelPath) : null)
                   ?? null;
-                setSelectedModelId(liveMatch?.model_id ?? chat.modelId);
-                setActiveChatId(chat.id);
-                openModelStudio(chat);
-              };
-              const handleStudioToggleClick = () => {
-                if (sidebarCollapsed) {
-                  const latestChat = model.chats.reduce((latest, chat) =>
-                    (!latest || chatLastModified(chat) >= chatLastModified(latest)) ? chat : latest, null);
-                  if (latestChat) openChatSession(latestChat);
-                  return;
-                }
-                setCollapsedStudios(current => ({ ...current, [modelKey]: !(current[modelKey] ?? false) }));
-              };
-              const loadedEntry = loadedModels.find(loaded => loaded.model_id === model.modelId)
-                ?? (model.modelPath ? loadedModels.find(loaded => loaded.model_path === model.modelPath) : null)
-                ?? null;
-              const handleNewStudioClick = (e) => {
-                e.stopPropagation();
-                if (!loadedEntry) return;
-                startStudio(loadedEntry, { name: model.name, task_tags: model.chats[0]?.task_tags });
-              };
-              const handleDeleteModelClick = (e) => {
-                e.stopPropagation();
-                if (isPendingDeleteModel) {
-                  setPendingRemoveIds(ids => {
-                    const additions = modelSessionIds.filter(id => !ids.includes(id));
-                    return additions.length ? [...ids, ...additions] : ids;
-                  });
-                  setTimeout(() => {
-                    setChatSessions(current => current.filter(item => {
-                      const k = item.studioKey || canonicalStudioKey(item.modelPath, item.modelName);
-                      return k !== modelKey;
-                    }));
-                    setPendingRemoveIds(ids => ids.filter(id => !modelSessionIds.includes(id)));
-                    if (activeChatId && modelSessionIds.includes(activeChatId)) {
-                      setActiveChatId(null);
-                    }
-                    setPendingDeleteModelKey(null);
-                  }, 350);
-                } else {
-                  setPendingDeleteModelKey(modelKey);
-                }
-              };
-              return <div key={modelKey} style={{ paddingLeft: '0.55rem' }}>
-                <div className={`studio-group-row ${isPendingDeleteModel ? 'pending-delete' : ''}`}>
-                  <button
-                    className="nav-btn studio-group-toggle"
-                    onClick={handleStudioToggleClick}
-                    title={model.name}
-                  >
-                    {sidebarCollapsed ? (
-                      <StudioAvatarIcon modelPath={model.modelPath} />
-                    ) : (
-                      <>{modelOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />} <span className="nav-label-text">{model.name}</span></>
-                    )}
-                  </button>
-                  <div className="studio-group-actions">
-                    {loadedEntry && (
-                      <button type="button" className="chat-session-action" onClick={handleNewStudioClick} title="New studio with this model" aria-label="New studio with this model">
-                        <Plus size={13} />
-                      </button>
-                    )}
-                    <button type="button" className={`chat-session-action delete ${isPendingDeleteModel ? 'confirm' : ''}`} onClick={handleDeleteModelClick} title={isPendingDeleteModel ? 'Click again to confirm delete all studios' : 'Delete all studios for this model'} aria-label="Delete all studios for this model">
-                      {isPendingDeleteModel ? <span className="confirm-label">Delete?</span> : <X size={13} />}
-                    </button>
-                  </div>
-                </div>
-                {modelOpen && !sidebarCollapsed && model.chats.map(chat => {
-                  const isEditing = editingSessionId === chat.id;
-                  const isPendingDelete = pendingDeleteId === chat.id;
-                  const commitRename = () => {
-                    const trimmed = editValue.trim();
-                    const targetId = editingSessionId;
-                    setEditingSessionId(null);
-                    setEditValue('');
-                    if (!trimmed || !targetId) return;
-                    setChatSessions(current => current.map(item => item.id === targetId && trimmed !== item.title ? { ...item, title: trimmed } : item));
-                  };
-                  const cancelRename = () => {
-                    setEditingSessionId(null);
-                    setEditValue('');
-                  };
-                  const startRename = (e) => {
-                    e.stopPropagation();
-                    setEditValue(chat.title);
-                    setEditingSessionId(chat.id);
-                  };
-                  const handleDeleteClick = (e) => {
-                    e.stopPropagation();
-                    if (isPendingDelete) {
-                      // Mark the row for fade-out, then drop it from state
-                      // once the CSS transition has played.
-                      setPendingRemoveIds(ids => ids.includes(chat.id) ? ids : [...ids, chat.id]);
-                      setTimeout(() => {
-                        setChatSessions(current => current.filter(item => item.id !== chat.id));
-                        setPendingRemoveIds(ids => ids.filter(id => id !== chat.id));
-                        if (activeChatId === chat.id) {
-                          setActiveChatId(null);
-                        }
-                        setPendingDeleteId(null);
-                      }, 350);
-                    } else {
-                      setPendingDeleteId(chat.id);
-                    }
-                  };
-                  return <div key={chat.id} className={`nav-btn chat-session-row ${activeChatId === chat.id ? 'active' : ''} ${isEditing ? 'editing' : ''} ${isPendingDelete ? 'pending-delete' : ''} ${pendingRemoveIds.includes(chat.id) ? 'fading-out' : ''}`} style={{ paddingLeft: '2.1rem', fontSize: '0.8rem' }}>
-                    <button type="button" className="chat-session-main" onClick={() => openChatSession(chat)} title={chat.title}>
-                      <MessageSquare size={14} />
-                      {isEditing ? (
-                        <input
-                          type="text"
-                          className="chat-session-edit-input"
-                          value={editValue}
-                          onChange={e => setEditValue(e.target.value)}
-                          onClick={e => e.stopPropagation()}
-                          onKeyDown={e => {
-                            if (e.key === 'Enter') { e.preventDefault(); commitRename(); }
-                            else if (e.key === 'Escape') { e.preventDefault(); cancelRename(); }
-                          }}
-                          onBlur={commitRename}
-                          autoFocus
-                          onFocus={e => e.target.select()}
-                          aria-label="Rename studio"
-                        />
+                const handleNewStudioClick = (e) => {
+                  e.stopPropagation();
+                  if (!loadedEntry) return;
+                  startStudio(loadedEntry, { name: model.name, task_tags: model.chats[0]?.task_tags });
+                };
+                const handleDeleteModelClick = (e) => {
+                  e.stopPropagation();
+                  if (isPendingDeleteModel) {
+                    setPendingRemoveIds(ids => {
+                      const additions = modelSessionIds.filter(id => !ids.includes(id));
+                      return additions.length ? [...ids, ...additions] : ids;
+                    });
+                    setTimeout(() => {
+                      setChatSessions(current => current.filter(item => {
+                        const k = item.studioKey || canonicalStudioKey(item.modelPath, item.modelName);
+                        return k !== modelKey;
+                      }));
+                      setPendingRemoveIds(ids => ids.filter(id => !modelSessionIds.includes(id)));
+                      if (activeChatId && modelSessionIds.includes(activeChatId)) {
+                        setActiveChatId(null);
+                      }
+                      setPendingDeleteModelKey(null);
+                    }, 350);
+                  } else {
+                    setPendingDeleteModelKey(modelKey);
+                  }
+                };
+                return <div key={modelKey} style={{ paddingLeft: '0.55rem' }}>
+                  <div className={`studio-group-row ${isPendingDeleteModel ? 'pending-delete' : ''}`}>
+                    <button
+                      className="nav-btn studio-group-toggle"
+                      onClick={handleStudioToggleClick}
+                      title={model.name}
+                    >
+                      {sidebarCollapsed ? (
+                        <StudioAvatarIcon modelPath={model.modelPath} />
                       ) : (
-                        <span className="chat-session-title">{displayedTitles[chat.id] ?? chat.title}</span>
+                        <>{modelOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />} <span className="nav-label-text">{model.name}</span></>
                       )}
                     </button>
-                    <div className="chat-session-actions">
-                      <button type="button" className="chat-session-action" onClick={startRename} title="Rename studio" aria-label="Rename studio">
-                        <Pencil size={13} />
-                      </button>
-                      <button type="button" className={`chat-session-action delete ${isPendingDelete ? 'confirm' : ''}`} onClick={handleDeleteClick} title={isPendingDelete ? 'Click again to confirm delete' : 'Delete studio'} aria-label="Delete studio">
-                        {isPendingDelete ? <span className="confirm-label">Delete?</span> : <X size={13} />}
+                    <div className="studio-group-actions">
+                      {loadedEntry && (
+                        <button type="button" className="chat-session-action" onClick={handleNewStudioClick} title="New studio with this model" aria-label="New studio with this model">
+                          <Plus size={13} />
+                        </button>
+                      )}
+                      <button type="button" className={`chat-session-action delete ${isPendingDeleteModel ? 'confirm' : ''}`} onClick={handleDeleteModelClick} title={isPendingDeleteModel ? 'Click again to confirm delete all studios' : 'Delete all studios for this model'} aria-label="Delete all studios for this model">
+                        {isPendingDeleteModel ? <span className="confirm-label">Delete?</span> : <X size={13} />}
                       </button>
                     </div>
-                  </div>;
-                })}
-              </div>;
-            })}
+                  </div>
+                  {modelOpen && !sidebarCollapsed && model.chats.map(chat => {
+                    const isEditing = editingSessionId === chat.id;
+                    const isPendingDelete = pendingDeleteId === chat.id;
+                    const commitRename = () => {
+                      const trimmed = editValue.trim();
+                      const targetId = editingSessionId;
+                      setEditingSessionId(null);
+                      setEditValue('');
+                      if (!trimmed || !targetId) return;
+                      setChatSessions(current => current.map(item => item.id === targetId && trimmed !== item.title ? { ...item, title: trimmed } : item));
+                    };
+                    const cancelRename = () => {
+                      setEditingSessionId(null);
+                      setEditValue('');
+                    };
+                    const startRename = (e) => {
+                      e.stopPropagation();
+                      setEditValue(chat.title);
+                      setEditingSessionId(chat.id);
+                    };
+                    const handleDeleteClick = (e) => {
+                      e.stopPropagation();
+                      if (isPendingDelete) {
+                        // Mark the row for fade-out, then drop it from state
+                        // once the CSS transition has played.
+                        setPendingRemoveIds(ids => ids.includes(chat.id) ? ids : [...ids, chat.id]);
+                        setTimeout(() => {
+                          setChatSessions(current => current.filter(item => item.id !== chat.id));
+                          setPendingRemoveIds(ids => ids.filter(id => id !== chat.id));
+                          if (activeChatId === chat.id) {
+                            setActiveChatId(null);
+                          }
+                          setPendingDeleteId(null);
+                        }, 350);
+                      } else {
+                        setPendingDeleteId(chat.id);
+                      }
+                    };
+                    return <div key={chat.id} className={`nav-btn chat-session-row ${activeChatId === chat.id ? 'active' : ''} ${isEditing ? 'editing' : ''} ${isPendingDelete ? 'pending-delete' : ''} ${pendingRemoveIds.includes(chat.id) ? 'fading-out' : ''}`} style={{ paddingLeft: '2.1rem', fontSize: '0.8rem' }}>
+                      <button type="button" className="chat-session-main" onClick={() => openChatSession(chat)} title={chat.title}>
+                        <MessageSquare size={14} />
+                        {isEditing ? (
+                          <input
+                            type="text"
+                            className="chat-session-edit-input"
+                            value={editValue}
+                            onChange={e => setEditValue(e.target.value)}
+                            onClick={e => e.stopPropagation()}
+                            onKeyDown={e => {
+                              if (e.key === 'Enter') { e.preventDefault(); commitRename(); }
+                              else if (e.key === 'Escape') { e.preventDefault(); cancelRename(); }
+                            }}
+                            onBlur={commitRename}
+                            autoFocus
+                            onFocus={e => e.target.select()}
+                            aria-label="Rename studio"
+                          />
+                        ) : (
+                          <span className="chat-session-title">{displayedTitles[chat.id] ?? chat.title}</span>
+                        )}
+                      </button>
+                      <div className="chat-session-actions">
+                        <button type="button" className="chat-session-action" onClick={startRename} title="Rename studio" aria-label="Rename studio">
+                          <Pencil size={13} />
+                        </button>
+                        <button type="button" className={`chat-session-action delete ${isPendingDelete ? 'confirm' : ''}`} onClick={handleDeleteClick} title={isPendingDelete ? 'Click again to confirm delete' : 'Delete studio'} aria-label="Delete studio">
+                          {isPendingDelete ? <span className="confirm-label">Delete?</span> : <X size={13} />}
+                        </button>
+                      </div>
+                    </div>;
+                  })}
+                </div>;
+              })}
 
           {false && (<>
-          {/* Legacy model controls: management now lives in the Models page. */}
-          <div className="nav-section" style={{ marginTop: '1rem' }}>MODEL CONTROLS</div>
+            {/* Legacy model controls: management now lives in the Models page. */}
+            <div className="nav-section" style={{ marginTop: '1rem' }}>MODEL CONTROLS</div>
 
-          <div className="sidebar-section">
-            <label className="section-label">Model Presets</label>
-            <select
-              className="control-select"
-              value={modelPath}
-              onChange={e => {
-                setModelPath(e.target.value);
-                setConfigTarget(current => ({ ...current, model_path: e.target.value }));
-              }}
-            >
-              <option value="C:\Users\adem2\.lmstudio\models\unsloth\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q8_0.gguf">
-                Qwen 3.5 0.8B (Q8_0)
-              </option>
-              <option value="C:\Users\adem2\.lmstudio\models\deepseek-ai\DeepSeek-R1-Distill-Qwen-1.5B-GGUF\DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf">
-                DeepSeek R1 1.5B (Q4_K_M)
-              </option>
-            </select>
-            <input
-              type="text"
-              className="control-input"
-              value={modelPath}
-              onChange={e => {
-                setModelPath(e.target.value);
-                setConfigTarget(current => ({ ...current, model_path: e.target.value }));
-              }}
-              placeholder="C:\path\to\model file"
-              style={{ marginTop: '0.4rem' }}
-            />
-          </div>
-
-          <div className="sidebar-section">
-            <div className="slider-header">
-              <label className="section-label">GPU Layers</label>
-              <span className="badge-value">{gpuLayers} / 99</span>
+            <div className="sidebar-section">
+              <label className="section-label">Model Presets</label>
+              <select
+                className="control-select"
+                value={modelPath}
+                onChange={e => {
+                  setModelPath(e.target.value);
+                  setConfigTarget(current => ({ ...current, model_path: e.target.value }));
+                }}
+              >
+                <option value="C:\Users\adem2\.lmstudio\models\unsloth\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q8_0.gguf">
+                  Qwen 3.5 0.8B (Q8_0)
+                </option>
+                <option value="C:\Users\adem2\.lmstudio\models\deepseek-ai\DeepSeek-R1-Distill-Qwen-1.5B-GGUF\DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf">
+                  DeepSeek R1 1.5B (Q4_K_M)
+                </option>
+              </select>
+              <input
+                type="text"
+                className="control-input"
+                value={modelPath}
+                onChange={e => {
+                  setModelPath(e.target.value);
+                  setConfigTarget(current => ({ ...current, model_path: e.target.value }));
+                }}
+                placeholder="C:\path\to\model file"
+                style={{ marginTop: '0.4rem' }}
+              />
             </div>
-            <input
-              type="range" min="0" max="99"
-              value={gpuLayers}
-              onChange={e => {
-                const value = parseInt(e.target.value, 10);
-                setGpuLayers(value);
-                setConfigTarget(current => ({ ...current, gpu_layers: value }));
-              }}
-              className="control-slider"
-            />
-            <div className="slider-hint">
-              {gpuLayers === 99 ? '🔥 Full GPU' : gpuLayers === 0 ? '💻 CPU Only' : `${gpuLayers} layers → VRAM`}
-            </div>
-          </div>
 
-          <div className="sidebar-section">
-            <label className="section-label">Context Window</label>
-            <select
-              className="control-select"
-              value={contextSize}
-              onChange={e => {
-                const value = parseInt(e.target.value, 10);
-                setContextSize(value);
-                setConfigTarget(current => ({ ...current, context_size: value }));
-              }}
-            >
-              <option value={2048}>2048 – Minimal VRAM</option>
-              <option value={4096}>4096 – Standard</option>
-              <option value={8192}>8192 – Extended</option>
-              <option value={16384}>16384 – Deep Reasoning</option>
-            </select>
-          </div>
-
-          <div className="sidebar-section">
-            <div className="slider-header">
-              <label className="section-label">Temperature</label>
-              <span className="badge-value">{temperature}</span>
-            </div>
-            <input
-              type="range" min="0.0" max="1.5" step="0.05"
-              value={temperature}
-              onChange={e => {
-                const value = parseFloat(e.target.value);
-                setTemperature(value);
-                setConfigTarget(current => ({ ...current, temperature: value }));
-              }}
-              className="control-slider"
-            />
-            <div className="slider-header" style={{ marginTop: '0.6rem' }}>
-              <label className="section-label">Top-P</label>
-              <span className="badge-value">{topP}</span>
-            </div>
-            <input
-              type="range" min="0.1" max="1.0" step="0.05"
-              value={topP}
-              onChange={e => {
-                const value = parseFloat(e.target.value);
-                setTopP(value);
-                setConfigTarget(current => ({ ...current, top_p: value }));
-              }}
-              className="control-slider"
-            />
-          </div>
-
-          <div className="vram-preview-card">
-            <div className="preview-title"><Cpu size={13} /> VRAM Impact</div>
-            <div className="preview-grid">
-              <div className="preview-item">
-                <span>Est. Required:</span>
-                <strong>{((modelFitPreview?.total_required_vram_bytes || 1.2e9) / 1e9).toFixed(2)} GB</strong>
+            <div className="sidebar-section">
+              <div className="slider-header">
+                <label className="section-label">GPU Layers</label>
+                <span className="badge-value">{gpuLayers} / 99</span>
               </div>
-              <div className="preview-item">
-                <span>Fits in GPU:</span>
-                <span className="status-yes"><CheckCircle2 size={12} /> YES</span>
+              <input
+                type="range" min="0" max="99"
+                value={gpuLayers}
+                onChange={e => {
+                  const value = parseInt(e.target.value, 10);
+                  setGpuLayers(value);
+                  setConfigTarget(current => ({ ...current, gpu_layers: value }));
+                }}
+                className="control-slider"
+              />
+              <div className="slider-hint">
+                {gpuLayers === 99 ? '🔥 Full GPU' : gpuLayers === 0 ? '💻 CPU Only' : `${gpuLayers} layers → VRAM`}
               </div>
             </div>
-          </div>
 
-          <div className="control-actions">
-            <button className="btn-load-model" onClick={handleLoadModel} disabled={isLoadingModel}>
-              <Zap size={15} /> {isLoadingModel ? 'Loading...' : modelStatus.is_loaded ? 'Reload' : 'Load to VRAM'}
-            </button>
-            {modelStatus.is_loaded && (
-              <button className="btn-unload-model" onClick={() => handleUnloadModel(selectedModelId)} disabled={unloadingModelId === selectedModelId}>
-                <Power size={15} /> {unloadingModelId === selectedModelId ? 'Ejecting...' : 'Eject Model'}
+            <div className="sidebar-section">
+              <label className="section-label">Context Window</label>
+              <select
+                className="control-select"
+                value={contextSize}
+                onChange={e => {
+                  const value = parseInt(e.target.value, 10);
+                  setContextSize(value);
+                  setConfigTarget(current => ({ ...current, context_size: value }));
+                }}
+              >
+                <option value={2048}>2048 – Minimal VRAM</option>
+                <option value={4096}>4096 – Standard</option>
+                <option value={8192}>8192 – Extended</option>
+                <option value={16384}>16384 – Deep Reasoning</option>
+              </select>
+            </div>
+
+            <div className="sidebar-section">
+              <div className="slider-header">
+                <label className="section-label">Temperature</label>
+                <span className="badge-value">{temperature}</span>
+              </div>
+              <input
+                type="range" min="0.0" max="1.5" step="0.05"
+                value={temperature}
+                onChange={e => {
+                  const value = parseFloat(e.target.value);
+                  setTemperature(value);
+                  setConfigTarget(current => ({ ...current, temperature: value }));
+                }}
+                className="control-slider"
+              />
+              <div className="slider-header" style={{ marginTop: '0.6rem' }}>
+                <label className="section-label">Top-P</label>
+                <span className="badge-value">{topP}</span>
+              </div>
+              <input
+                type="range" min="0.1" max="1.0" step="0.05"
+                value={topP}
+                onChange={e => {
+                  const value = parseFloat(e.target.value);
+                  setTopP(value);
+                  setConfigTarget(current => ({ ...current, top_p: value }));
+                }}
+                className="control-slider"
+              />
+            </div>
+
+            <div className="vram-preview-card">
+              <div className="preview-title"><Cpu size={13} /> VRAM Impact</div>
+              <div className="preview-grid">
+                <div className="preview-item">
+                  <span>Est. Required:</span>
+                  <strong>{((modelFitPreview?.total_required_vram_bytes || 1.2e9) / 1e9).toFixed(2)} GB</strong>
+                </div>
+                <div className="preview-item">
+                  <span>Fits in GPU:</span>
+                  <span className="status-yes"><CheckCircle2 size={12} /> YES</span>
+                </div>
+              </div>
+            </div>
+
+            <div className="control-actions">
+              <button className="btn-load-model" onClick={handleLoadModel} disabled={isLoadingModel}>
+                <Zap size={15} /> {isLoadingModel ? 'Loading...' : modelStatus.is_loaded ? 'Reload' : 'Load to VRAM'}
               </button>
-            )}
-          </div>
+              {modelStatus.is_loaded && (
+                <button className="btn-unload-model" onClick={() => handleUnloadModel(selectedModelId)} disabled={unloadingModelId === selectedModelId}>
+                  <Power size={15} /> {unloadingModelId === selectedModelId ? 'Ejecting...' : 'Eject Model'}
+                </button>
+              )}
+            </div>
           </>)}
 
         </div>
@@ -3382,12 +3648,12 @@ function AppInner() {
             <div className="tab-panel">
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.3rem' }}>
                 <h2 style={{ fontSize: '1.4rem' }}>Models</h2>
-                <button className="btn-load-model" onClick={() => setShowModelPicker(true)}>
+                <button className="btn-load-model" onClick={() => { setShowDownloadsPanel(false); setShowModelPicker(true); }}>
                   <PackagePlus size={14} /> Add Model
                 </button>
               </div>
               <div className="card" style={{ background: 'none', border: 'none', padding: 0 }}>
-                  <div className="model-cards-grid" style={{ marginTop: '10px' }}>
+                <div className="model-cards-grid" style={{ marginTop: '10px' }}>
                   {modelCards.map(card => {
                     // Backend model_ids include a load timestamp (mdl-{ts}-{port}), so a
                     // model reloaded server-side (e.g. the orchestrator stepping aside for
@@ -3428,15 +3694,15 @@ function AppInner() {
                             await handleUnloadModel(loadedEntry.model_id);
                             setModelCards(current => current.map(item => item.id === card.id ? { ...item, loadedModelId: null } : item));
                           }} disabled={unloadingModelId === loadedEntry.model_id}><Power size={14} /> Eject</button>
-                          : <button className="btn-load-model" onClick={() => loadCardModel(card)} disabled={isLoadingModel}><Zap size={14} /> Load</button>}
+                            : <button className="btn-load-model" onClick={() => loadCardModel(card)} disabled={isLoadingModel}><Zap size={14} /> Load</button>}
                           {isLoaded && <button className="btn-load-model" onClick={() => startStudio(loadedEntry, card)} title="Start studio"><Play size={14} /></button>}
                           <button className="btn-load-model" onClick={() => handleOpenModelFolder(card.modelPath)} title="Open containing folder"><Folder size={14} /> Open Folder</button>
                         </div>
                       </div>
                     );
                   })}
-                  </div>
-                  {modelCards.length === 0 && <p style={{ color: 'var(--text-secondary)' }}>No model cards yet. Click "Add Model" to add one from the catalog.</p>}
+                </div>
+                {modelCards.length === 0 && <p style={{ color: 'var(--text-secondary)' }}>No model cards yet. Click "Add Model" to add one from the catalog.</p>}
               </div>
             </div>
           )}
@@ -3487,6 +3753,7 @@ function AppInner() {
                                     max_context_size: model.max_context_size ?? null,
                                     image_input_available: model.image_input_available === true,
                                     mmproj_path: model.mmproj_path || null,
+                                    mtp_path: model.mtp_path || null,
                                     mesh_vae_path: model.mesh_vae_path || null,
                                     mesh_texgen_path: model.mesh_texgen_path || null,
                                     mesh_components: model.mesh_components || null,
@@ -3668,66 +3935,66 @@ function AppInner() {
                         </div>
 
                         <div className="modal-list">
-                        {hfSearchLoading && (
-                          <div className="hf-empty-state">
-                            <Loader size={22} className="spin" />
-                            <p>Searching Hugging Face...</p>
-                          </div>
-                        )}
-                        {!hfSearchLoading && hfSearchError && (
-                          <div className="hf-empty-state">
-                            <XCircle size={22} />
-                            <p>Search failed. Check your internet connection.</p>
-                          </div>
-                        )}
-                        {!hfSearchLoading && !hfSearchError && hfSearchResults.length === 0 && (
-                          <div className="hf-empty-state">
-                            <Search size={22} />
-                            <p>{hfSearchQuery.trim() ? 'No results found.' : 'No models match these filters.'}</p>
-                          </div>
-                        )}
-                        {!hfSearchLoading && !hfSearchError && hfSearchResults.map(result => {
-                          const repoId = result.id || `${result.author}/${result.modelId}`;
-                          const isSelected = hfSelectedRepo === repoId;
-                          return (
-                            <div
-                              key={repoId}
-                              className={`hf-result-card${isSelected ? ' hf-result-card-selected' : ''}`}
-                            >
-                              <div className="hf-result-header" onClick={() => selectHfRepo(repoId)}>
-                                <div>
-                                  <strong>{result.modelId || repoId}</strong>
-                                  <span className="modal-list-item-meta">
-                                    {' · '}
-                                    {result.author && (
-                                      <img
-                                        className="hf-author-avatar"
-                                        src={`http://127.0.0.1:8080/v1/model/hf-avatar?author=${encodeURIComponent(result.author)}&v=2`}
-                                        alt=""
-                                        onError={(e) => { e.currentTarget.style.display = 'none'; }}
-                                      />
-                                    )}
-                                    {result.author}
-                                  </span>
-                                  {formatParamCount(result.params) && (
-                                    <span className="hf-param-badge">{formatParamCount(result.params)}</span>
-                                  )}
-                                </div>
-                                <div className="hf-result-stats">
-                                  <span><Download size={12} /> {formatCount(result.downloads)}</span>
-                                  <span><Heart size={12} /> {formatCount(result.likes)}</span>
-                                </div>
-                              </div>
-                              {result.tags?.length > 0 && (
-                                <div className="hf-result-tags">
-                                  {result.tags.slice(0, 6).map(tag => (
-                                    <span key={tag} className="hf-tag-badge">{tag}</span>
-                                  ))}
-                                </div>
-                              )}
+                          {hfSearchLoading && (
+                            <div className="hf-empty-state">
+                              <Loader size={22} className="spin" />
+                              <p>Searching Hugging Face...</p>
                             </div>
-                          );
-                        })}
+                          )}
+                          {!hfSearchLoading && hfSearchError && (
+                            <div className="hf-empty-state">
+                              <XCircle size={22} />
+                              <p>Search failed. Check your internet connection.</p>
+                            </div>
+                          )}
+                          {!hfSearchLoading && !hfSearchError && hfSearchResults.length === 0 && (
+                            <div className="hf-empty-state">
+                              <Search size={22} />
+                              <p>{hfSearchQuery.trim() ? 'No results found.' : 'No models match these filters.'}</p>
+                            </div>
+                          )}
+                          {!hfSearchLoading && !hfSearchError && hfSearchResults.map(result => {
+                            const repoId = result.id || `${result.author}/${result.modelId}`;
+                            const isSelected = hfSelectedRepo === repoId;
+                            return (
+                              <div
+                                key={repoId}
+                                className={`hf-result-card${isSelected ? ' hf-result-card-selected' : ''}`}
+                              >
+                                <div className="hf-result-header" onClick={() => selectHfRepo(repoId)}>
+                                  <div>
+                                    <strong>{result.modelId || repoId}</strong>
+                                    <span className="modal-list-item-meta">
+                                      {' · '}
+                                      {result.author && (
+                                        <img
+                                          className="hf-author-avatar"
+                                          src={`http://127.0.0.1:8080/v1/model/hf-avatar?author=${encodeURIComponent(result.author)}&v=2`}
+                                          alt=""
+                                          onError={(e) => { e.currentTarget.style.display = 'none'; }}
+                                        />
+                                      )}
+                                      {result.author}
+                                    </span>
+                                    {formatParamCount(result.params) && (
+                                      <span className="hf-param-badge">{formatParamCount(result.params)}</span>
+                                    )}
+                                  </div>
+                                  <div className="hf-result-stats">
+                                    <span><Download size={12} /> {formatCount(result.downloads)}</span>
+                                    <span><Heart size={12} /> {formatCount(result.likes)}</span>
+                                  </div>
+                                </div>
+                                {result.tags?.length > 0 && (
+                                  <div className="hf-result-tags">
+                                    {result.tags.slice(0, 6).map(tag => (
+                                      <span key={tag} className="hf-tag-badge">{tag}</span>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })}
                         </div>
                       </div>
 
@@ -3790,6 +4057,13 @@ function AppInner() {
                                 )}
                                 {!hfRepoFilesLoading && hfRepoFiles.length > 0 && (
                                   <div className="hf-files-list">
+                                    <input
+                                      type="text"
+                                      className="control-input"
+                                      placeholder="Filter files..."
+                                      value={hfFileSearch}
+                                      onChange={e => setHfFileSearch(e.target.value)}
+                                    />
                                     <div className="hf-file-row hf-file-row-all">
                                       <div className="modal-list-item-meta">Download every file into a per-model folder</div>
                                       <div className="hf-file-actions">
@@ -3808,7 +4082,10 @@ function AppInner() {
                                     )}
                                     {(() => {
                                       const groups = new Map();
-                                      hfRepoFiles.forEach(file => {
+                                      const visibleFiles = hfFileSearch.trim()
+                                        ? hfRepoFiles.filter(file => file.filename.toLowerCase().includes(hfFileSearch.trim().toLowerCase()))
+                                        : hfRepoFiles;
+                                      visibleFiles.forEach(file => {
                                         const slashIdx = file.filename.lastIndexOf('/');
                                         const dir = slashIdx === -1 ? '' : file.filename.slice(0, slashIdx);
                                         if (!groups.has(dir)) groups.set(dir, []);
@@ -3958,7 +4235,7 @@ function AppInner() {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify(mediaRetention),
-                      }).catch(() => {});
+                      }).catch(() => { });
                     }}
                   >
                     <option value="1800:false">30 minutes</option>
@@ -4518,6 +4795,7 @@ function AppInner() {
                     )}
                   </div>
                   {isGeneratingVideo && <GenProgressBar progress={videoProgress} />}
+                  {modelLoadProgress && <GenProgressBar progress={modelLoadProgress} />}
                   {installProgress && <GenProgressBar progress={installProgress} />}
                 </div>
 
@@ -4721,10 +4999,10 @@ function AppInner() {
       {/* Configure Model Sidebar (left overlay) */}
       {configTarget && (
         <>
-          <div className="config-sidebar-backdrop" onClick={() => setConfigTarget(null)} />
+          <div className="config-sidebar-backdrop" onClick={closeConfigPanel} />
           <aside className="config-sidebar">
             <div className="config-sidebar-header">
-              <button className="config-sidebar-close" onClick={() => setConfigTarget(null)} title="Close">
+              <button className="config-sidebar-close" onClick={closeConfigPanel} title="Close">
                 <X size={16} />
               </button>
               <div className="config-sidebar-title">
@@ -4748,6 +5026,71 @@ function AppInner() {
                     }}>Browse</button>
                   </div>
                   <div className="slider-hint">Auto-detected from the model directory. Leave empty if this is not a vision model.</div>
+                </div>
+              )}
+              {cfgCategory === 'chat' && (
+                <div className="sidebar-section">
+                  <label className="section-label">MTP drafter (multi-token prediction)</label>
+                  <div className="mmproj-row">
+                    <input className="control-input" value={configTarget?.mtp_path || ''} onChange={e => setConfigTarget(current => ({ ...current, mtp_path: e.target.value }))} />
+                    <button className="btn-browse" onClick={async () => {
+                      const defaultPath = configTarget?.model_path ? window.require('path').dirname(configTarget.model_path) : undefined;
+                      const filePath = await browseForFile(defaultPath, [{ name: 'GGUF', extensions: ['gguf'] }]);
+                      if (filePath) setConfigTarget(current => ({ ...current, mtp_path: filePath }));
+                    }}>Browse</button>
+                  </div>
+                  <div className="slider-hint">Auto-detected from the model directory. Leave empty if this model has no drafter.</div>
+                </div>
+              )}
+              {cfgCategory === 'chat' && (
+                <div className="sidebar-section">
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+                    <input type="checkbox" checked={configTarget?.mtp_enabled ?? true} onChange={e => setConfigTarget(current => ({ ...current, mtp_enabled: e.target.checked }))} />
+                    <span className="section-label" style={{ margin: 0 }}>Enable MTP speculative decoding</span>
+                  </label>
+                </div>
+              )}
+              {cfgCategory === 'chat' && (
+                <div className="sidebar-section">
+                  <label className="section-label">Draft tokens per step</label>
+                  <div className="mmproj-row">
+                    <input
+                      className="control-input"
+                      type="number"
+                      min="1"
+                      max="16"
+                      placeholder="4"
+                      value={configTarget?.spec_draft_n_max ?? ''}
+                      onChange={e => {
+                        const raw = e.target.value;
+                        const parsed = raw === '' ? undefined : parseInt(raw, 10);
+                        setConfigTarget(current => ({ ...current, spec_draft_n_max: Number.isNaN(parsed) ? undefined : parsed }));
+                      }}
+                    />
+                  </div>
+                  <div className="slider-hint">Max draft tokens per MTP step. Defaults to 4 when empty.</div>
+                </div>
+              )}
+              {cfgCategory === 'chat' && (
+                <div className="sidebar-section">
+                  <label className="section-label">Min acceptance probability</label>
+                  <div className="mmproj-row">
+                    <input
+                      className="control-input"
+                      type="number"
+                      min="0"
+                      max="1"
+                      step="0.05"
+                      placeholder="0.00"
+                      value={configTarget?.spec_draft_p_min ?? ''}
+                      onChange={e => {
+                        const raw = e.target.value;
+                        const parsed = raw === '' ? undefined : parseFloat(raw);
+                        setConfigTarget(current => ({ ...current, spec_draft_p_min: Number.isNaN(parsed) ? undefined : parsed }));
+                      }}
+                    />
+                  </div>
+                  <div className="slider-hint">Minimum acceptance probability for draft tokens. Defaults to 0.75 when empty.</div>
                 </div>
               )}
               {cfgCategory === 'chat' && (
@@ -4822,6 +5165,7 @@ function AppInner() {
                         const progressPct = download && download.total_bytes > 0
                           ? Math.min(100, (download.downloaded_bytes / download.total_bytes) * 100)
                           : 0;
+                        const assignStatus = componentAssignStatus[comp.target_path];
                         return (
                           <div key={idx} className="hf-file-row" style={{ paddingLeft: 0 }}>
                             <div className="hf-file-info">
@@ -4866,6 +5210,21 @@ function AppInner() {
                                   Missing — place a file manually at: {comp.target_path}
                                 </span>
                               )}
+                              <div className="mmproj-row" style={{ marginTop: '0.25rem' }}>
+                                <button
+                                  className="btn-browse"
+                                  disabled={assignStatus?.status === 'assigning'}
+                                  onClick={() => assignImageComponentOverride(comp)}
+                                >
+                                  {comp.resolved_path ? 'Change file...' : 'Assign file...'}
+                                </button>
+                                {assignStatus?.status === 'assigning' && (
+                                  <span className="modal-list-item-meta">Assigning...</span>
+                                )}
+                                {assignStatus?.status === 'error' && (
+                                  <span className="modal-list-item-meta" style={{ color: '#ef4444' }}>{assignStatus.error}</span>
+                                )}
+                              </div>
                             </div>
                           </div>
                         );
@@ -4948,6 +5307,34 @@ function AppInner() {
               )}
               {cfgCategory === 'video' && (
                 <div className="sidebar-section">
+                  <label className="section-label">Text Encoder</label>
+                  <div className="mmproj-row">
+                    <input className="control-input" value={configTarget?.text_encoder_override_path || ''} onChange={e => setConfigTarget(current => ({ ...current, text_encoder_override_path: e.target.value }))} />
+                    <button className="btn-browse" onClick={async () => {
+                      const defaultPath = configTarget?.model_path ? window.require('path').dirname(configTarget.model_path) : undefined;
+                      const filePath = await browseForFile(defaultPath, [{ name: 'Text Encoder', extensions: ['gguf', 'safetensors', 'ckpt', 'pt', 'bin'] }]);
+                      if (filePath) setConfigTarget(current => ({ ...current, text_encoder_override_path: filePath }));
+                    }}>Browse</button>
+                  </div>
+                  <div className="slider-hint">Overrides auto-detection. Leave empty to use the model's own text encoder / sibling files.</div>
+                </div>
+              )}
+              {cfgCategory === 'video' && (
+                <div className="sidebar-section">
+                  <label className="section-label">VAE</label>
+                  <div className="mmproj-row">
+                    <input className="control-input" value={configTarget?.vae_override_path || ''} onChange={e => setConfigTarget(current => ({ ...current, vae_override_path: e.target.value }))} />
+                    <button className="btn-browse" onClick={async () => {
+                      const defaultPath = configTarget?.model_path ? window.require('path').dirname(configTarget.model_path) : undefined;
+                      const filePath = await browseForFile(defaultPath, [{ name: 'VAE', extensions: ['gguf', 'safetensors', 'ckpt', 'pt', 'bin'] }]);
+                      if (filePath) setConfigTarget(current => ({ ...current, vae_override_path: filePath }));
+                    }}>Browse</button>
+                  </div>
+                  <div className="slider-hint">Overrides auto-detection. Leave empty to use the model's own VAE / sibling files.</div>
+                </div>
+              )}
+              {cfgCategory === 'video' && (
+                <div className="sidebar-section">
                   <div className="slider-hint">Video model. Generation parameters are chosen per request in the studio.</div>
                   {configTarget?.vae_path ? (
                     <div className="modal-list-item-meta" style={{ marginTop: '0.5rem' }}>
@@ -4996,6 +5383,27 @@ function AppInner() {
                             </div>
                           ) : null;
                         })}
+                        {comps.filter(c => !c.resolved_path).map((c, idx) => {
+                          const assignStatus = componentAssignStatus[c.target_path];
+                          return (
+                            <div key={`assign-${idx}`} className="mmproj-row" style={{ marginTop: '0.25rem' }}>
+                              <span className="modal-list-item-meta">{c.kind_name}:</span>
+                              <button
+                                className="btn-browse"
+                                disabled={assignStatus?.status === 'assigning'}
+                                onClick={() => assignComponentFile(c)}
+                              >
+                                Assign file...
+                              </button>
+                              {assignStatus?.status === 'assigning' && (
+                                <span className="modal-list-item-meta">Assigning...</span>
+                              )}
+                              {assignStatus?.status === 'error' && (
+                                <span className="modal-list-item-meta" style={{ color: '#ef4444' }}>{assignStatus.error}</span>
+                              )}
+                            </div>
+                          );
+                        })}
                       </div>
                     );
                   })}
@@ -5007,27 +5415,12 @@ function AppInner() {
               </div>
               <button className="btn-load-model config-sidebar-load" onClick={async () => {
                 const cfg = configTarget;
-                const settings = {
-                  gpu_layers: cfg?.gpu_layers,
-                  context_size: cfg?.context_size,
-                  mmproj_path: cfg?.mmproj_path || undefined,
-                  temperature: cfg?.temperature,
-                  top_p: cfg?.top_p,
-                  system_prompt: cfg?.system_prompt || '',
-                  steps: cfg?.steps,
-                  cfg_scale: cfg?.cfg_scale,
-                  width: cfg?.width,
-                  height: cfg?.height,
-                  seed: cfg?.seed,
-                  guidance_scale: cfg?.guidance_scale,
-                  texture: cfg?.texture,
-                  speed: cfg?.speed,
-                };
+                const settings = buildSettingsFromConfigTarget(cfg);
                 const card = modelCards.find(c => c.id === cfg?.cardId);
                 if (card) {
                   await loadCardModel(card, settings);
                 } else {
-                  const modelId = await handleLoadModel({ model_path: cfg?.model_path, gpu_layers: cfg?.gpu_layers ?? 99, context_size: cfg?.context_size ?? 4096, mmproj_path: cfg?.mmproj_path || undefined });
+                  const modelId = await handleLoadModel({ model_path: cfg?.model_path, gpu_layers: cfg?.gpu_layers ?? 99, context_size: cfg?.context_size ?? 4096, mmproj_path: cfg?.mmproj_path || undefined, mtp_path: cfg?.mtp_path || undefined, mtp_enabled: cfg?.mtp_enabled, spec_draft_n_max: cfg?.spec_draft_n_max, spec_draft_p_min: cfg?.spec_draft_p_min, text_encoder_override_path: cfg?.text_encoder_override_path || undefined, vae_override_path: cfg?.vae_override_path || undefined });
                   if (modelId) applyModelDefaults(cfg);
                 }
               }} disabled={isLoadingModel}>

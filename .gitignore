@@ -26,6 +26,11 @@ temp_edit.py
 **/node_modules/
 **/dist/
 **/dist-ssr/
+**/dist-installer/
+
+# Electron-builder staged resources (populated by CI, never committed)
+apps/dispos-studio/resources/*
+!apps/dispos-studio/resources/.gitkeep
 
 # Local configuration, credentials, and logs
 .env
@@ -46,6 +51,9 @@ Thumbs.db
 *.suo
 *.user
 *.swp
+
+# Demo recording working files (raw footage and clip parts, not the final cut)
+demos/.temp/
 
 # Claude Code local metadata and working files
 CLAUDE.md

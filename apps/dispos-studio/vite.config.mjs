@@ -10,6 +10,10 @@ export default defineConfig({
     // for rebuilds. Stable filenames avoid deleting the asset an open window
     // is still executing after a rebuild.
     rollupOptions: {
+      input: {
+        main: 'index.html',
+        wizard: 'wizard.html',
+      },
       output: {
         entryFileNames: 'assets/[name].js',
         chunkFileNames: 'assets/[name].js',

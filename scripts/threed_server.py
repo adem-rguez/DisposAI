@@ -550,6 +550,105 @@ class TripoSRAdapter(MeshAdapter):
         return _to_trimesh(meshes[0])
 
 
+def _stub_sf3d_native_deps():
+    """stable-fast-3d's `sf3d.system` / `sf3d.models.mesh` modules
+    unconditionally import `texture_baker` / `uv_unwrapper` at import time
+    and construct them eagerly in `SF3D.__init__`/`Mesh.__init__`. Those are
+    native CUDA extensions that must be compiled against the exact CUDA
+    toolkit version torch was built with — a heavy, environment-specific
+    build `setup_3d_env.py` deliberately doesn't attempt. This adapter's
+    `_generate_vertex_colored` never uses either (it bypasses UV unwrapping
+    and texture baking entirely), so install inert stand-in modules when the
+    real ones aren't present instead of letting the whole `sf3d` import fail
+    and silently falling back to the placeholder cube."""
+    # Real imports (not just presence in sys.modules) are checked because
+    # `sf3d`'s own repo checkout — on PYTHONPATH so `import sf3d` works at
+    # all — contains top-level `texture_baker/`/`uv_unwrapper/` directories
+    # with no `__init__.py`. Those resolve as (empty) PEP 420 namespace
+    # packages, so a plain `import texture_baker` "succeeds" without ever
+    # providing the `TextureBaker` class the real compiled package would.
+    import types
+    try:
+        import texture_baker
+        if not hasattr(texture_baker, "TextureBaker"):
+            raise ImportError("texture_baker present but missing TextureBaker (namespace package stand-in)")
+    except ImportError:
+        tb_mod = types.ModuleType("texture_baker")
+
+        class TextureBaker:
+            def __init__(self, *args, **kwargs):
+                pass
+
+        tb_mod.TextureBaker = TextureBaker
+        sys.modules["texture_baker"] = tb_mod
+
+    try:
+        import uv_unwrapper
+        if not hasattr(uv_unwrapper, "Unwrapper"):
+            raise ImportError("uv_unwrapper present but missing Unwrapper (namespace package stand-in)")
+    except ImportError:
+        uw_mod = types.ModuleType("uv_unwrapper")
+
+        class Unwrapper:
+            def __init__(self, *args, **kwargs):
+                pass
+
+        uw_mod.Unwrapper = Unwrapper
+        sys.modules["uv_unwrapper"] = uw_mod
+
+    # `sf3d/models/tokenizers/dinov2.py` (SF3D's own vendored DINOv2 backbone)
+    # imports `find_pruneable_heads_and_indices` from `transformers.pytorch_utils`.
+    # SF3D's requirements.txt pins transformers==4.42.3, which still had it, but
+    # `transformers` is a *shared* dep across every 3D adapter in this venv
+    # (TripoSR/Hunyuan3D/TRELLIS/VGGT all need a much newer version), so it
+    # can't be downgraded just for SF3D. The helper itself is a small, stable,
+    # pure-Python utility that was removed (not behaviorally changed) in newer
+    # transformers — reintroduce it under its old name instead of pinning.
+    import transformers.pytorch_utils as _pytorch_utils
+    if not hasattr(_pytorch_utils, "find_pruneable_heads_and_indices"):
+        def find_pruneable_heads_and_indices(heads, n_heads, head_size, already_pruned_heads):
+            mask = torch.ones(n_heads, head_size)
+            heads = set(heads) - already_pruned_heads
+            for head in heads:
+                head = head - sum(1 if h < head else 0 for h in already_pruned_heads)
+                mask[head] = 0
+            mask = mask.view(-1).contiguous().eq(1)
+            index = torch.arange(len(mask))[mask].long()
+            return heads, index
+
+        _pytorch_utils.find_pruneable_heads_and_indices = find_pruneable_heads_and_indices
+
+    # Same story for `PreTrainedModel.get_head_mask`/`_convert_head_mask_to_5d`
+    # (part of the old `ModuleUtilsMixin`, dropped from newer transformers):
+    # `sf3d`'s vendored `Dinov2Model.forward()` still calls
+    # `self.get_head_mask(...)`. Reintroduce both under their old names on
+    # `PreTrainedModel` itself so any subclass (not just SF3D's) picks them up
+    # — purely additive, since no class in the newer transformers currently
+    # defines these names.
+    from transformers.modeling_utils import PreTrainedModel
+    if not hasattr(PreTrainedModel, "get_head_mask"):
+        def _convert_head_mask_to_5d(self, head_mask, num_hidden_layers):
+            if head_mask.dim() == 1:
+                head_mask = head_mask.unsqueeze(0).unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+                head_mask = head_mask.expand(num_hidden_layers, -1, -1, -1, -1)
+            elif head_mask.dim() == 2:
+                head_mask = head_mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
+            head_mask = head_mask.to(dtype=self.dtype)
+            return head_mask
+
+        def get_head_mask(self, head_mask, num_hidden_layers, is_attention_chunked=False):
+            if head_mask is not None:
+                head_mask = self._convert_head_mask_to_5d(head_mask, num_hidden_layers)
+                if is_attention_chunked is True:
+                    head_mask = head_mask.unsqueeze(-1)
+            else:
+                head_mask = [None] * num_hidden_layers
+            return head_mask
+
+        PreTrainedModel._convert_head_mask_to_5d = _convert_head_mask_to_5d
+        PreTrainedModel.get_head_mask = get_head_mask
+
+
 class SF3DAdapter(MeshAdapter):
     """Best-effort adapter for stabilityai/stable-fast-3d, following its
     documented `sf3d` package API."""
@@ -566,6 +665,7 @@ class SF3DAdapter(MeshAdapter):
 
     def is_available(self):
         try:
+            _stub_sf3d_native_deps()
             from sf3d.system import SF3D  # noqa: F401
             return trimesh is not None
         except ImportError:
@@ -573,6 +673,7 @@ class SF3DAdapter(MeshAdapter):
 
     def _load(self):
         if self._model is None:
+            _stub_sf3d_native_deps()
             from sf3d.system import SF3D
             repo = self.model_path if os.path.isdir(self.model_path) else "stabilityai/stable-fast-3d"
             self._model = SF3D.from_pretrained(repo, config_name="config.yaml", weight_name="model.safetensors")

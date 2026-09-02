@@ -43,7 +43,9 @@ pub fn schemas() -> Vec<ToolSchema> {
         },
         ToolSchema {
             name: "run_model".into(),
-            description: "Send a prompt to one of the models from list_models. The model is \
+            description: "Send a prompt to one of the models from list_models. The 'model' \
+                          argument is always required - never call run_model without it; if you \
+                          are not sure of the exact name, call list_models first. The model is \
                           loaded automatically if it is not already. This call waits for \
                           generation to finish (up to several minutes for image/video/3D/speech \
                           models) and returns the result directly - you do not need to poll for \
@@ -59,7 +61,9 @@ pub fn schemas() -> Vec<ToolSchema> {
                 "properties": {
                     "model": {
                         "type": "string",
-                        "description": "Name of the model to run, exactly as given by list_models"
+                        "description": "Required. Name of the model to run, exactly as given by \
+                                        list_models. Never omit this - call list_models first if \
+                                        you don't already know the exact name."
                     },
                     "prompt": {
                         "type": "string",
@@ -75,7 +79,13 @@ pub fn schemas() -> Vec<ToolSchema> {
                         "type": "string",
                         "description": "Optional media handle from a previous run_model result \
                                         (the '/v1/media/<id>' path, or just the id) to use as \
-                                        image input, e.g. for image-to-3D or image-to-image."
+                                        image input, e.g. for image-to-3D or image-to-image. If \
+                                        this conversation has generated more than one image and \
+                                        the user refers to a specific one ('the first image', \
+                                        'the cat picture'), you MUST pass that image's own handle \
+                                        here explicitly - omitting it falls back to whichever \
+                                        image was generated most recently, which is wrong if that \
+                                        isn't the one the user meant."
                     },
                     "params": {
                         "type": "object",
@@ -472,6 +482,12 @@ async fn run_model(state: &AppState, tool_call: &ToolCall, job_id: &str, convers
                 gpu_layers: None,
                 context_size: None,
                 mmproj_path: found.mmproj_path.clone(),
+                mtp_path: found.mtp_path.clone(),
+                spec_draft_n_max: None,
+                spec_draft_p_min: None,
+                mtp_enabled: None,
+                text_encoder_override_path: None,
+                vae_override_path: None,
             }),
         )
         .await;
@@ -495,6 +511,12 @@ async fn run_model(state: &AppState, tool_call: &ToolCall, job_id: &str, convers
                             gpu_layers: None,
                             context_size: None,
                             mmproj_path: found.mmproj_path.clone(),
+                            mtp_path: found.mtp_path.clone(),
+                            spec_draft_n_max: None,
+                            spec_draft_p_min: None,
+                            mtp_enabled: None,
+                            text_encoder_override_path: None,
+                            vae_override_path: None,
                         }),
                     )
                     .await;
@@ -604,6 +626,12 @@ pub(crate) async fn reload_orchestrator(
             gpu_layers: Some(orch.gpu_layers),
             context_size: Some(orch.context_size),
             mmproj_path: None,
+            mtp_path: None,
+            spec_draft_n_max: None,
+            spec_draft_p_min: None,
+            mtp_enabled: None,
+            text_encoder_override_path: None,
+            vae_override_path: None,
         }),
     )
     .await;

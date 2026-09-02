@@ -19,6 +19,18 @@
 
 ---
 
+## 🎬 Demo
+
+<div align="center">
+
+![DisposAI Demo](demos/demo%2002-09-2026.webp)
+
+<sub>(Dispos Studio walkthrough — chat, image generation, and 3D mesh generation via Dynamic Model Toolization)</sub>
+
+</div>
+
+---
+
 ## 🚀 Why DisposAI?
 
 The name **Dispos** comes from the Latin word *dispositor* (from *disponere*), which means *"arranger"* or *"one who sets things in order"*—reflecting how the system orchestrates and manages your suite of local models.

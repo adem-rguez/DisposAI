@@ -123,6 +123,17 @@ body {
   border: 1px solid rgba(16, 185, 129, 0.3);
   font-size: 0.75rem;
   font-weight: 600;
+  white-space: nowrap;
+}
+
+.status-badge-gpu {
+  padding-left: 0.4rem;
+  border-left: 1px solid rgba(16, 185, 129, 0.3);
+  font-weight: 500;
+  opacity: 0.85;
+  max-width: 14rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .status-dot {
@@ -1728,7 +1739,7 @@ input[type="text"], input[type="number"], select {
   inset: 0;
   background: rgba(0, 0, 0, 0.55);
   backdrop-filter: blur(2px);
-  z-index: 300;
+  z-index: 310;
   display: flex;
   align-items: center;
   justify-content: center;

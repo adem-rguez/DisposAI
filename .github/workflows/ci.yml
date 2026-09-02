@@ -74,3 +74,47 @@ jobs:
         working-directory: sdk/python
         run: pip install .
 
+  package-windows:
+    name: Package Windows Installer
+    runs-on: windows-latest
+    needs: [rust-check, studio-build]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build daemon-core release
+        run: cargo build --release --package daemon-core
+
+      - name: Stage daemon-core.exe into resources
+        run: Copy-Item target\release\daemon-core.exe apps\dispos-studio\resources\daemon-core.exe -Force
+
+      - name: Stage Python setup scripts into resources
+        run: Copy-Item scripts apps\dispos-studio\resources\scripts -Recurse -Force
+
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Build Studio Frontend
+        run: npm run build --prefix apps/dispos-studio
+
+      - name: Build Windows Installer
+        working-directory: apps/dispos-studio
+        run: npx electron-builder --win nsis --publish never
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DisposAI-Setup-windows
+          path: apps/dispos-studio/dist-installer/*.exe
+

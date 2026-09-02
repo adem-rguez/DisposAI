@@ -52,6 +52,13 @@ impl LlamaBackend {
     }
 
     fn find_llama_server_binary() -> Option<PathBuf> {
+        if let Ok(p) = std::env::var("DISPOS_LLAMA_SERVER_BINARY") {
+            let path = PathBuf::from(p);
+            if path.exists() {
+                return Some(path);
+            }
+        }
+
         let lmstudio_dir = std::env::var("USERPROFILE")
             .map(|p| PathBuf::from(p).join(".lmstudio\\extensions\\backends"))
             .ok()?;

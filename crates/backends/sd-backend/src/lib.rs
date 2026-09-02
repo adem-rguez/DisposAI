@@ -373,37 +373,92 @@ impl SdBackend {
     /// the user attempts generation. Returns `None` if the filename doesn't
     /// match a known split-checkpoint architecture family (e.g. it's a
     /// self-contained single-file checkpoint).
+    /// Path to the JSON file storing user-picked component overrides, which
+    /// take priority over `resolve_component`'s filename-pattern search. A
+    /// manual "Change file..." pick can't rely on the pattern search finding
+    /// it back (the user's file often won't contain the kind's fuzzy hint,
+    /// e.g. "qwen3"), so overrides are recorded by exact path instead of
+    /// relying on physically renaming/copying files into place.
+    fn overrides_file(models_root: &Path) -> PathBuf {
+        models_root.join(".component_overrides.json")
+    }
+
+    fn override_key(model_path: &Path, kind_name: &str) -> String {
+        format!("{}::{}", model_path.display(), kind_name)
+    }
+
+    fn load_overrides(models_root: &Path) -> std::collections::HashMap<String, String> {
+        std::fs::read_to_string(Self::overrides_file(models_root))
+            .ok()
+            .and_then(|contents| serde_json::from_str(&contents).ok())
+            .unwrap_or_default()
+    }
+
+    /// Record (or clear, if `source_path` is `None`) a manual override for
+    /// one component of one model, so `detect_image_components` picks it up
+    /// ahead of the fuzzy filename search from then on.
+    pub fn set_component_override(
+        model_path: &Path,
+        kind_name: &str,
+        source_path: Option<&Path>,
+    ) -> std::io::Result<()> {
+        let models_root = Self::resolve_models_root()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "models root not found"))?;
+        let mut overrides = Self::load_overrides(&models_root);
+        let key = Self::override_key(model_path, kind_name);
+        match source_path {
+            Some(path) => { overrides.insert(key, path.display().to_string()); }
+            None => { overrides.remove(&key); }
+        }
+        std::fs::write(Self::overrides_file(&models_root), serde_json::to_string_pretty(&overrides)?)
+    }
+
     pub fn detect_image_components(model_path: &Path) -> Option<Vec<ImageComponentStatus>> {
         let filename = model_path.file_name().and_then(|n| n.to_str())?;
         let spec = match_component_spec(filename)?;
         let diffusion_dir = model_path.parent().unwrap_or_else(|| Path::new("."));
         let models_root = Self::resolve_models_root();
+        let overrides = models_root.as_deref().map(Self::load_overrides).unwrap_or_default();
 
         let statuses = spec
             .components
             .iter()
-            .map(|kind| match Self::resolve_component(kind, diffusion_dir, models_root.as_deref()) {
-                Some(path) => ImageComponentStatus {
-                    kind_name: kind.display_name().to_string(),
-                    resolved_path: Some(path.display().to_string()),
-                    target_path: None,
-                    source: None,
-                },
-                None => {
-                    let shared_dir = models_root
-                        .as_ref()
-                        .map(|root| root.join(kind.shared_subdir().replace('/', std::path::MAIN_SEPARATOR_STR)))
-                        .unwrap_or_else(|| PathBuf::from(format!("models/{}", kind.shared_subdir())));
-                    let source = spec.default_source_for(kind).map(|src| backend_trait::MissingComponentSource {
-                        repo: src.repo.to_string(),
-                        filename: src.filename.to_string(),
-                        target_filename: src.target_filename.to_string(),
-                    });
-                    ImageComponentStatus {
+            .map(|kind| {
+                let override_path = overrides
+                    .get(&Self::override_key(model_path, kind.display_name()))
+                    .map(PathBuf::from)
+                    .filter(|p| p.is_file());
+                if let Some(path) = override_path {
+                    return ImageComponentStatus {
                         kind_name: kind.display_name().to_string(),
-                        resolved_path: None,
-                        target_path: Some(shared_dir.display().to_string()),
-                        source,
+                        resolved_path: Some(path.display().to_string()),
+                        target_path: Some(path.display().to_string()),
+                        source: None,
+                    };
+                }
+                match Self::resolve_component(kind, diffusion_dir, models_root.as_deref()) {
+                    Some(path) => ImageComponentStatus {
+                        kind_name: kind.display_name().to_string(),
+                        resolved_path: Some(path.display().to_string()),
+                        target_path: Some(path.display().to_string()),
+                        source: None,
+                    },
+                    None => {
+                        let shared_dir = models_root
+                            .as_ref()
+                            .map(|root| root.join(kind.shared_subdir().replace('/', std::path::MAIN_SEPARATOR_STR)))
+                            .unwrap_or_else(|| PathBuf::from(format!("models/{}", kind.shared_subdir())));
+                        let source = spec.default_source_for(kind).map(|src| backend_trait::MissingComponentSource {
+                            repo: src.repo.to_string(),
+                            filename: src.filename.to_string(),
+                            target_filename: src.target_filename.to_string(),
+                        });
+                        ImageComponentStatus {
+                            kind_name: kind.display_name().to_string(),
+                            resolved_path: None,
+                            target_path: Some(shared_dir.display().to_string()),
+                            source,
+                        }
                     }
                 }
             })
@@ -434,6 +489,7 @@ impl SdBackend {
 
         let diffusion_dir = model_path.parent().unwrap_or_else(|| Path::new("."));
         let models_root = Self::resolve_models_root();
+        let overrides = models_root.as_deref().map(Self::load_overrides).unwrap_or_default();
 
         let mut clip_l = None;
         let mut clip_g = None;
@@ -443,7 +499,11 @@ impl SdBackend {
         let mut missing: Vec<backend_trait::MissingComponentInfo> = Vec::new();
 
         for kind in spec.components {
-            let resolved = Self::resolve_component(kind, diffusion_dir, models_root.as_deref());
+            let resolved = overrides
+                .get(&Self::override_key(model_path, kind.display_name()))
+                .map(PathBuf::from)
+                .filter(|p| p.is_file())
+                .or_else(|| Self::resolve_component(kind, diffusion_dir, models_root.as_deref()));
             match resolved {
                 Some(path) => match kind {
                     ComponentKind::ClipL => clip_l = Some(path),

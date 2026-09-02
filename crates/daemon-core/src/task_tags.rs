@@ -22,6 +22,7 @@ const KNOWN_TASK_TAGS: &[(&str, Option<Modality>)] = &[
     // Video
     ("text-to-video", Some(Modality::Video)),
     ("image-to-video", Some(Modality::Video)),
+    ("image-text-to-video", Some(Modality::Video)),
     ("video-to-video", Some(Modality::Video)),
     ("video-classification", Some(Modality::Video)),
     ("video-text-to-text", Some(Modality::Video)),

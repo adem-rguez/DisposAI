@@ -5,13 +5,76 @@ use backend_trait::{
     InferenceResponse, InferenceStream, LoadOptions, Modality, VideoParams, VramEstimate,
 };
 use futures::stream;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 use base64::Engine;
+
+/// Snapshot of the GGUF de-quantization progress reported by `transformers`'
+/// tqdm bar on `video_diffusers_server.py`'s stderr during first-time model
+/// load. Polled by `GET /v1/model/load-progress` in daemon-core.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct LoadProgressSnapshot {
+    pub phase: String,
+    pub percent: f32,
+    pub current: u64,
+    pub total: u64,
+}
+
+/// Process-wide slot for the currently in-flight model load's progress, if
+/// any. Set by the stderr-reader thread spawned in `spawn_video_server`;
+/// cleared when that function returns (success or failure).
+static LOAD_PROGRESS: OnceLock<Mutex<Option<LoadProgressSnapshot>>> = OnceLock::new();
+
+fn load_progress_slot() -> &'static Mutex<Option<LoadProgressSnapshot>> {
+    LOAD_PROGRESS.get_or_init(|| Mutex::new(None))
+}
+
+/// Read the current model-load progress snapshot, if a load is in progress
+/// and has emitted at least one parseable tqdm line.
+pub fn current_load_progress() -> Option<LoadProgressSnapshot> {
+    load_progress_slot().lock().ok().and_then(|guard| guard.clone())
+}
+
+fn set_load_progress(snapshot: LoadProgressSnapshot) {
+    if let Ok(mut guard) = load_progress_slot().lock() {
+        *guard = Some(snapshot);
+    }
+}
+
+fn clear_load_progress() {
+    if let Ok(mut guard) = load_progress_slot().lock() {
+        *guard = None;
+    }
+}
+
+/// Parse one tqdm progress line, e.g.:
+/// `"Converting and de-quantizing GGUF tensors...:   4%| | 10/242 [00:02<01:20, 2.8it/s]"`
+/// into `(phase, percent, current, total)`.
+fn parse_tqdm_line(line: &str) -> Option<(String, f32, u64, u64)> {
+    let line = line.trim();
+    let colon_idx = line.find(':')?;
+    let phase = line[..colon_idx].trim().to_string();
+    let rest = &line[colon_idx + 1..];
+    let pct_idx = rest.find('%')?;
+    let percent: f32 = rest[..pct_idx].trim().parse().ok()?;
+    let frac_tok = rest.split_whitespace().find(|tok| {
+        let core = tok.trim_matches(|c: char| !c.is_ascii_digit() && c != '/');
+        let mut parts = core.split('/');
+        matches!((parts.next(), parts.next(), parts.next()),
+            (Some(a), Some(b), None) if !a.is_empty() && !b.is_empty()
+                && a.chars().all(|c| c.is_ascii_digit())
+                && b.chars().all(|c| c.is_ascii_digit()))
+    })?;
+    let core = frac_tok.trim_matches(|c: char| !c.is_ascii_digit() && c != '/');
+    let mut parts = core.split('/');
+    let current: u64 = parts.next()?.parse().ok()?;
+    let total: u64 = parts.next()?.parse().ok()?;
+    Some((phase, percent, current, total))
+}
 
 /// Minimal valid MP4 (empty `ftyp` box), used as the simulation-mode
 /// fallback video when no `video_diffusers_server.py` process is running.
@@ -85,6 +148,12 @@ pub struct VideoBackend {
     /// Presence of this field selects the HTTP generation path.
     process: Option<Child>,
     port: u16,
+    /// Manual override for the LTX-Video text encoder (gguf/safetensors/ckpt/pt/bin).
+    /// `None` falls back to sibling auto-detection.
+    text_encoder_override: Option<PathBuf>,
+    /// Manual override for the LTX-Video VAE (gguf/safetensors/ckpt/pt/bin).
+    /// `None` falls back to sibling auto-detection.
+    vae_override: Option<PathBuf>,
 }
 
 impl VideoBackend {
@@ -95,6 +164,8 @@ impl VideoBackend {
             supported_modalities: vec![Modality::Video],
             process: None,
             port: 0,
+            text_encoder_override: None,
+            vae_override: None,
         }
     }
 
@@ -178,13 +249,60 @@ impl VideoBackend {
         let models_root = Self::resolve_models_root()?;
         let components_dir = Self::ltx_shared_components_dir(&models_root);
 
-        let groups: [(&str, &str, &[&str]); 3] = [
-            ("Text encoder", "text_encoder", LTX_TEXT_ENCODER_FILES),
+        let mut statuses = Vec::new();
+
+        // A single quantized `.gguf` text encoder file (any quant level)
+        // satisfies the text encoder leg on its own, in place of the full
+        // fp16 shard set below (see `_find_text_encoder_gguf` in
+        // video_diffusers_server.py).
+        let text_encoder_dir = components_dir.join("text_encoder");
+        let local_gguf = std::fs::read_dir(&text_encoder_dir).ok().and_then(|entries| {
+            entries.filter_map(|e| e.ok()).find_map(|e| {
+                let path = e.path();
+                let is_gguf = path.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("gguf")).unwrap_or(false);
+                (path.is_file() && is_gguf).then_some(path)
+            })
+        });
+        if let Some(gguf_path) = local_gguf {
+            statuses.push(VideoComponentStatus {
+                group: "Text encoder".to_string(),
+                kind_name: gguf_path.file_name().and_then(|n| n.to_str()).unwrap_or("text_encoder.gguf").to_string(),
+                resolved_path: Some(gguf_path.display().to_string()),
+                target_path: Some(gguf_path.display().to_string()),
+                source: None,
+            });
+        } else {
+            for file in LTX_TEXT_ENCODER_FILES {
+                let local_path = text_encoder_dir.join(file);
+                if local_path.is_file() {
+                    statuses.push(VideoComponentStatus {
+                        group: "Text encoder".to_string(),
+                        kind_name: (*file).to_string(),
+                        resolved_path: Some(local_path.display().to_string()),
+                        target_path: Some(local_path.display().to_string()),
+                        source: None,
+                    });
+                } else {
+                    statuses.push(VideoComponentStatus {
+                        group: "Text encoder".to_string(),
+                        kind_name: (*file).to_string(),
+                        resolved_path: None,
+                        target_path: Some(text_encoder_dir.display().to_string()),
+                        source: Some(backend_trait::MissingComponentSource {
+                            repo: LTX_BASE_REPO.to_string(),
+                            filename: format!("text_encoder/{file}"),
+                            target_filename: (*file).to_string(),
+                        }),
+                    });
+                }
+            }
+        }
+
+        let groups: [(&str, &str, &[&str]); 2] = [
             ("Tokenizer", "tokenizer", LTX_TOKENIZER_FILES),
             ("Scheduler", "scheduler", LTX_SCHEDULER_FILES),
         ];
 
-        let mut statuses = Vec::new();
         for (group, subdir, files) in groups {
             let subdir_path = components_dir.join(subdir);
             for file in files {
@@ -194,7 +312,7 @@ impl VideoBackend {
                         group: group.to_string(),
                         kind_name: (*file).to_string(),
                         resolved_path: Some(local_path.display().to_string()),
-                        target_path: None,
+                        target_path: Some(local_path.display().to_string()),
                         source: None,
                     });
                 } else {
@@ -217,7 +335,12 @@ impl VideoBackend {
 
     /// Spawn `scripts/video_diffusers_server.py` and block (on a worker
     /// thread) until it prints "READY" on stdout or `STARTUP_TIMEOUT` elapses.
-    fn spawn_video_server(model_path: &Path, port: u16) -> Result<Child, String> {
+    fn spawn_video_server(
+        model_path: &Path,
+        port: u16,
+        text_encoder_override: Option<&Path>,
+        vae_override: Option<&Path>,
+    ) -> Result<Child, String> {
         let script_path = PathBuf::from("scripts").join("video_diffusers_server.py");
         if !script_path.exists() {
             return Err(format!(
@@ -239,16 +362,64 @@ impl VideoBackend {
         if let Some(models_root) = Self::resolve_models_root() {
             cmd.arg("--ltx-components-dir").arg(Self::ltx_shared_components_dir(&models_root));
         }
-        cmd.stdout(Stdio::piped()).stderr(Stdio::inherit());
+        // Manual overrides for the LTX-Video text encoder/VAE, bypassing
+        // sibling auto-detection when provided.
+        if let Some(path) = text_encoder_override {
+            cmd.arg("--text-encoder-path").arg(path);
+        }
+        if let Some(path) = vae_override {
+            cmd.arg("--vae-path").arg(path);
+        }
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("Failed to spawn video_diffusers_server.py: {}", e))?;
 
+        clear_load_progress();
+
         let stdout = child
             .stdout
             .take()
             .ok_or_else(|| "Failed to capture stdout of video_diffusers_server.py".to_string())?;
+
+        // tqdm overwrites its progress line in place with `\r`, only emitting
+        // a real `\n` once complete, so intermediate updates would be
+        // invisible to a `read_line`-based reader. Read raw bytes instead and
+        // split on both `\r` and `\n`, forwarding each segment to the real
+        // stderr for terminal visibility while also updating LOAD_PROGRESS
+        // when a segment parses as a tqdm line.
+        if let Some(mut stderr) = child.stderr.take() {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match stderr.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            for &byte in &chunk[..n] {
+                                if byte == b'\r' || byte == b'\n' {
+                                    if !buf.is_empty() {
+                                        let segment = String::from_utf8_lossy(&buf).to_string();
+                                        eprintln!("{}", segment);
+                                        if let Some((phase, percent, current, total)) = parse_tqdm_line(&segment) {
+                                            set_load_progress(LoadProgressSnapshot { phase, percent, current, total });
+                                        }
+                                        buf.clear();
+                                    }
+                                } else {
+                                    buf.push(byte);
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if !buf.is_empty() {
+                    eprintln!("{}", String::from_utf8_lossy(&buf));
+                }
+            });
+        }
 
         let start = Instant::now();
         let mut reader = BufReader::new(stdout);
@@ -256,6 +427,7 @@ impl VideoBackend {
             let mut line = String::new();
             match reader.read_line(&mut line) {
                 Ok(0) => {
+                    clear_load_progress();
                     return Err("video_diffusers_server.py exited before signalling READY".to_string());
                 }
                 Ok(_) => {
@@ -264,24 +436,41 @@ impl VideoBackend {
                     }
                 }
                 Err(e) => {
+                    clear_load_progress();
                     return Err(format!("Error reading video_diffusers_server.py stdout: {}", e));
                 }
             }
             if start.elapsed() > STARTUP_TIMEOUT {
                 let _ = child.kill();
+                clear_load_progress();
                 return Err("Timed out waiting for video_diffusers_server.py to start".to_string());
             }
         }
 
+        clear_load_progress();
         Ok(child)
     }
 
     /// POST the prompt+params to the running `video_diffusers_server.py`
     /// instance and decode the returned base64 MP4.
+    /// POST /cancel to the running `video_diffusers_server.py`, best-effort.
+    /// The server is threaded so this can be handled while /generate is
+    /// still in flight on another thread; it sets a flag the pipeline's
+    /// step callback checks to abort generation early.
+    async fn cancel_video_server(port: u16) {
+        let client = match reqwest::Client::builder().no_proxy().build() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let url = format!("http://127.0.0.1:{}/cancel", port);
+        let _ = client.post(&url).send().await;
+    }
+
     async fn generate_video(
         port: u16,
         prompt: &str,
         params: &VideoParams,
+        cancel: Option<&Arc<AtomicBool>>,
     ) -> Result<Vec<u8>, BackendError> {
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -312,12 +501,32 @@ impl VideoBackend {
         }
 
         let url = format!("http://127.0.0.1:{}/generate", port);
-        let response = client
-            .post(&url)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| BackendError::InferenceError(format!("video_diffusers_server connection error: {}", e)))?;
+        let request_fut = client.post(&url).json(&payload).send();
+
+        let response = if let Some(cancel) = cancel {
+            let cancel = cancel.clone();
+            let cancel_wait = async {
+                loop {
+                    if cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                }
+            };
+            tokio::select! {
+                result = request_fut => {
+                    result.map_err(|e| BackendError::InferenceError(format!("video_diffusers_server connection error: {}", e)))?
+                }
+                _ = cancel_wait => {
+                    Self::cancel_video_server(port).await;
+                    return Err(BackendError::Cancelled);
+                }
+            }
+        } else {
+            request_fut
+                .await
+                .map_err(|e| BackendError::InferenceError(format!("video_diffusers_server connection error: {}", e)))?
+        };
 
         if !response.status().is_success() {
             let status = response.status();
@@ -412,8 +621,17 @@ impl VideoBackend {
         info!("Starting video_diffusers_server.py for: {}", model_path.display());
         let port = next_free_video_port();
         let model_path_owned = model_path.clone();
+        let text_encoder_override_owned = self.text_encoder_override.clone();
+        let vae_override_owned = self.vae_override.clone();
 
-        let child = tokio::task::spawn_blocking(move || Self::spawn_video_server(&model_path_owned, port))
+        let child = tokio::task::spawn_blocking(move || {
+            Self::spawn_video_server(
+                &model_path_owned,
+                port,
+                text_encoder_override_owned.as_deref(),
+                vae_override_owned.as_deref(),
+            )
+        })
             .await
             .map_err(|e| BackendError::LoadError(format!("spawn_blocking join error: {}", e)))?
             .map_err(|e| {
@@ -477,7 +695,7 @@ impl InferenceBackend for VideoBackend {
     async fn load_model(
         &mut self,
         model_path: &Path,
-        _options: &LoadOptions,
+        options: &LoadOptions,
     ) -> Result<(), BackendError> {
         // Kill any previously running video server before deciding on the
         // new model's mode.
@@ -485,6 +703,17 @@ impl InferenceBackend for VideoBackend {
             let _ = child.kill();
             let _ = child.wait();
         }
+
+        self.text_encoder_override = options
+            .text_encoder_override_path
+            .as_ref()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+        self.vae_override = options
+            .vae_override_path
+            .as_ref()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
 
         if !model_path.exists() {
             info!(
@@ -540,7 +769,7 @@ impl InferenceBackend for VideoBackend {
         info!("Executing video generation prompt: '{}'", request.prompt);
 
         let mp4_bytes: Vec<u8> = if self.process.is_some() {
-            Self::generate_video(self.port, &request.prompt, &params).await?
+            Self::generate_video(self.port, &request.prompt, &params, request.cancel.as_ref()).await?
         } else {
             // Simulation mode: no video_diffusers_server running (e.g.
             // missing model file or missing runtime dependencies).
@@ -606,5 +835,17 @@ impl InferenceBackend for VideoBackend {
             return None;
         }
         response.json().await.ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_tqdm_line;
+
+    #[test]
+    fn parses_gguf_dequantize_tqdm_line() {
+        let line = "Converting and de-quantizing GGUF tensors...:   4%| | 10/242 [00:02<01:20, 2.8it/s]";
+        let parsed = parse_tqdm_line(line).expect("should parse tqdm line");
+        assert_eq!(parsed, ("Converting and de-quantizing GGUF tensors...".to_string(), 4.0, 10, 242));
     }
 }

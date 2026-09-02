@@ -11,6 +11,7 @@ by reading the subprocess's stdout line-by-line.
 """
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -20,6 +21,15 @@ from pathlib import Path
 
 def _print_header(title):
     print(f"\n{'=' * 70}\n{title}\n{'=' * 70}")
+
+
+def resolve_venv_root(project_root: Path) -> Path:
+    """Return the root directory for venv folders. If DISPOS_VENV_ROOT env var
+    is set and non-empty, use that; otherwise use project_root."""
+    venv_root = os.environ.get("DISPOS_VENV_ROOT", "").strip()
+    if venv_root:
+        return Path(venv_root)
+    return project_root
 
 
 def _run(cmd, cwd=None):
