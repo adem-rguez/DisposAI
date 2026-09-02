@@ -6,6 +6,14 @@ const { spawn } = require('child_process');
 
 Menu.setApplicationMenu(null);
 
+// Without this, Electron's default app name (package.json's "name":
+// "dispos-studio") puts userData — including the renderer's localStorage,
+// where chat history and the model catalog live — at
+// %APPDATA%\dispos-studio, a folder the installer/uninstaller don't know
+// about and that silently survives reinstalls. Naming it to match the
+// product keeps it under %APPDATA%\DisposAI, consistent with dataRoot.
+app.setName('DisposAI');
+
 // Without an explicit AppUserModelID, Windows groups/caches the taskbar icon
 // under the generic electron.exe identity, so icon-file changes can appear
 // to have no effect between dev runs. Giving this app its own ID avoids that.
@@ -67,15 +75,17 @@ function runPythonSetupScript(scriptName, stepId, sendProgress) {
 
     let child;
     try {
-      child = spawn('python', [scriptPath], { env });
+      child = spawn('python', [scriptPath], { env, windowsHide: true });
     } catch (err) {
       sendProgress({ phase: stepId, status: 'error', message: err.message });
-      resolve();
+      resolve(false);
       return;
     }
+    sendProgress({ phase: stepId, status: 'running', message: 'Starting setup...' });
 
     let buffer = '';
     let sawTerminal = false;
+    let failed = false;
 
     const handleData = (chunk) => {
       buffer += chunk.toString();
@@ -87,6 +97,7 @@ function runPythonSetupScript(scriptName, stepId, sendProgress) {
         try {
           const parsed = JSON.parse(trimmed.slice('PROGRESS: '.length));
           if (parsed.status === 'done' || parsed.status === 'error') sawTerminal = true;
+          if (parsed.status === 'error') failed = true;
           sendProgress({
             phase: stepId,
             status: parsed.status,
@@ -101,14 +112,15 @@ function runPythonSetupScript(scriptName, stepId, sendProgress) {
 
     child.on('error', (err) => {
       sendProgress({ phase: stepId, status: 'error', message: err.message });
-      resolve();
+      resolve(false);
     });
 
     child.on('exit', (code) => {
       if (code !== 0 && !sawTerminal) {
         sendProgress({ phase: stepId, status: 'error', message: 'Setup script exited with code ' + code });
+        failed = true;
       }
-      resolve();
+      resolve(!failed);
     });
   });
 }
@@ -127,16 +139,18 @@ async function runSetupStep(stepId, sendProgress) {
       const { ensureUv } = await getDownloadBinaries();
       await ensureUv(runtimeBinDir, sendProgress);
     } else if (stepId === 'image') {
-      await runPythonSetupScript('setup_sd_env.py', 'image', sendProgress);
+      return await runPythonSetupScript('setup_sd_env.py', 'image', sendProgress);
     } else if (stepId === 'video') {
-      await runPythonSetupScript('setup_video_env.py', 'video', sendProgress);
+      return await runPythonSetupScript('setup_video_env.py', 'video', sendProgress);
     } else if (stepId === 'voice') {
-      await runPythonSetupScript('setup_tts_env.py', 'voice', sendProgress);
+      return await runPythonSetupScript('setup_tts_env.py', 'voice', sendProgress);
     } else if (stepId === 'threed') {
-      await runPythonSetupScript('setup_3d_env.py', 'threed', sendProgress);
+      return await runPythonSetupScript('setup_3d_env.py', 'threed', sendProgress);
     }
+    return true;
   } catch (err) {
     sendProgress({ phase: stepId, status: 'error', message: err.message });
+    return false;
   }
 }
 
@@ -154,17 +168,34 @@ function resolveDaemonPath() {
 // so they survive app updates/reinstalls and don't require admin rights to write.
 // In dev we keep using the existing repo-relative "models" dir so local workflows
 // (start.mjs, cargo, etc.) don't change.
-const dataRoot = app.isPackaged
-  ? path.join(app.getPath('localAppData'), 'DisposAI')
-  : path.join(__dirname, '..', '..');
+// app.getPath('localAppData') is only safe to call once Electron has finished
+// its own startup (calling it earlier, e.g. at module load time, throws
+// "Failed to get 'localAppData' path" in packaged builds), so these are
+// populated by initRuntimePaths() from within app.whenReady() instead of here.
+let dataRoot;
+let runtimeDir;
+let runtimeBinDir;
+let runtimeVenvsDir;
+let modelsDir;
+let installStatePath;
 
-const runtimeDir = path.join(dataRoot, 'runtime');
-const runtimeBinDir = path.join(runtimeDir, 'bin');
-const runtimeVenvsDir = path.join(runtimeDir, 'venvs');
-const modelsDir = app.isPackaged
-  ? path.join(dataRoot, 'models')
-  : path.join(__dirname, '..', '..', 'models');
-const installStatePath = path.join(dataRoot, 'install-state.json');
+function initRuntimePaths() {
+  // app.getPath('localAppData') throws "Failed to get 'localAppData' path" on
+  // some Electron builds even after whenReady(), while other paths (appData,
+  // temp, home) resolve fine. Read the env var directly instead.
+  const localAppData = process.env.LOCALAPPDATA || path.join(app.getPath('home'), 'AppData', 'Local');
+  dataRoot = app.isPackaged
+    ? path.join(localAppData, 'DisposAI')
+    : path.join(__dirname, '..', '..');
+
+  runtimeDir = path.join(dataRoot, 'runtime');
+  runtimeBinDir = path.join(runtimeDir, 'bin');
+  runtimeVenvsDir = path.join(runtimeDir, 'venvs');
+  modelsDir = app.isPackaged
+    ? path.join(dataRoot, 'models')
+    : path.join(__dirname, '..', '..', 'models');
+  installStatePath = path.join(dataRoot, 'install-state.json');
+}
 
 function ensureRuntimeDirs() {
   for (const dir of [dataRoot, runtimeDir, runtimeBinDir, runtimeVenvsDir, modelsDir]) {
@@ -219,6 +250,7 @@ async function ensureDaemon() {
     cwd: path.join(__dirname, '..', '..'),
     stdio: 'inherit',
     env,
+    windowsHide: true,
   });
   for (let attempt = 0; attempt < 60; attempt += 1) {
     if (await daemonIsReady()) {
@@ -325,17 +357,19 @@ ipcMain.on('wizard:start-setup', async (event, selectedComponents) => {
   lastRequestedComponents = selectedComponents || [];
   const sendProgress = (data) => event.sender.send('wizard:progress', data);
 
-  await Promise.allSettled([
+  const results = await Promise.allSettled([
     runSetupStep('binaries', sendProgress),
     runSetupStep('uv', sendProgress),
   ]);
+  let allSucceeded = results.every((r) => r.status === 'fulfilled' && r.value !== false);
 
   for (const stepId of lastRequestedComponents) {
-    await runSetupStep(stepId, sendProgress);
+    const ok = await runSetupStep(stepId, sendProgress);
+    if (ok === false) allSucceeded = false;
   }
 
   try {
-    fs.writeFileSync(installStatePath, JSON.stringify({ setupComplete: true, components: lastRequestedComponents }));
+    fs.writeFileSync(installStatePath, JSON.stringify({ setupComplete: allSucceeded, components: lastRequestedComponents }));
   } catch (err) {
     console.error('[Wizard] Failed to write install state:', err);
   }
@@ -343,16 +377,26 @@ ipcMain.on('wizard:start-setup', async (event, selectedComponents) => {
   event.sender.send('wizard:complete');
 });
 
-ipcMain.on('wizard:retry-step', (event, stepId) => {
-  runSetupStep(stepId, (data) => event.sender.send('wizard:progress', data));
+ipcMain.on('wizard:retry-step', async (event, stepId) => {
+  await runSetupStep(stepId, (data) => event.sender.send('wizard:progress', data));
+  event.sender.send('wizard:complete');
 });
 
 ipcMain.on('wizard:launch-main-app', () => {
+  // Only reached once the wizard UI shows no remaining step errors (including
+  // after retries), so it's safe to mark setup complete here rather than only
+  // at the end of the initial run, which a later successful retry wouldn't update.
+  try {
+    fs.writeFileSync(installStatePath, JSON.stringify({ setupComplete: true, components: lastRequestedComponents }));
+  } catch (err) {
+    console.error('[Wizard] Failed to write install state:', err);
+  }
   if (wizardWin) wizardWin.close();
   createWindow();
 });
 
 app.whenReady().then(async () => {
+  initRuntimePaths();
   ensureRuntimeDirs();
   await ensureDaemon();
   if (!(await daemonIsReady())) {

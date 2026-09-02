@@ -104,20 +104,29 @@ function downloadFile(url, destPath, onProgress, maxRedirects = 5) {
 
 /**
  * Extract a zip to a temp scratch directory, recursively search for a file
- * named `exeName` (case-insensitive), copy it to destDir/exeName, then
- * clean up the scratch directory and the zip file itself.
+ * matching one of `exeNames` (case-insensitive, tried in order — upstream
+ * projects rename their release binaries between versions), copy the first
+ * match to destDir/destName, then clean up the scratch directory and the
+ * zip file itself.
  */
-async function extractAndFindExe(zipPath, exeName, destDir) {
+async function extractAndFindExe(zipPath, exeNames, destDir, destName) {
+  const names = Array.isArray(exeNames) ? exeNames : [exeNames];
+  destName = destName || names[0];
+
   const scratchDir = fs.mkdtempSync(path.join(os.tmpdir(), 'disposai-extract-'));
   try {
     await extractZip(zipPath, { dir: scratchDir });
 
-    const found = findFileRecursive(scratchDir, exeName);
+    let found = null;
+    for (const name of names) {
+      found = findFileRecursive(scratchDir, name);
+      if (found) break;
+    }
     if (!found) {
-      throw new Error(`Could not find ${exeName} inside extracted archive ${zipPath}`);
+      throw new Error(`Could not find any of [${names.join(', ')}] inside extracted archive ${zipPath}`);
     }
 
-    const destPath = path.join(destDir, exeName);
+    const destPath = path.join(destDir, destName);
     fs.copyFileSync(found, destPath);
     return destPath;
   } finally {
@@ -144,21 +153,40 @@ function findFileRecursive(dir, targetName) {
   return null;
 }
 
+/**
+ * Fetches the most recent non-draft release of a GitHub repo, including
+ * prereleases. Some projects (e.g. llama.cpp) only publish their real
+ * binaries as prereleases, so `/releases/latest` (which excludes
+ * prereleases) returns an unrelated stub release with no useful assets.
+ */
+async function fetchLatestRelease(owner, repo) {
+  const releases = await fetchJson(`https://api.github.com/repos/${owner}/${repo}/releases?per_page=5`);
+  const release = (releases || []).find((r) => !r.draft);
+  if (!release) {
+    throw new Error(`No releases found for ${owner}/${repo}`);
+  }
+  return release;
+}
+
 /** Pick the best matching Windows CUDA asset from a release's assets array. */
 function pickWindowsCudaAsset(assets, { requireCuda = true } = {}) {
-  const cudaAsset = assets.find((a) => {
-    const name = a.name.toLowerCase();
-    return name.includes('win') && name.includes('cuda') && name.endsWith('.zip');
-  });
+  // "cudart-*" packages ship only the CUDA runtime DLLs, not the actual
+  // binary, but their name also contains "cuda" and "win", so they must be
+  // excluded explicitly or they get picked over the real binary package.
+  const isRuntimeOnly = (name) => name.startsWith('cudart');
+  const isX64 = (name) => name.includes('x64') && !name.includes('arm64');
+
+  const pick = (predicate) => {
+    const candidates = assets.filter((a) => predicate(a.name.toLowerCase()));
+    return candidates.find((a) => isX64(a.name.toLowerCase())) || candidates[0] || null;
+  };
+
+  const cudaAsset = pick((name) => name.includes('win') && name.includes('cuda') && name.endsWith('.zip') && !isRuntimeOnly(name));
   if (cudaAsset) return cudaAsset;
 
   if (!requireCuda) return null;
 
-  const cpuAsset = assets.find((a) => {
-    const name = a.name.toLowerCase();
-    return name.includes('win') && name.includes('cpu') && name.endsWith('.zip');
-  });
-  return cpuAsset || null;
+  return pick((name) => name.includes('win') && name.includes('cpu') && name.endsWith('.zip') && !isRuntimeOnly(name));
 }
 
 /**
@@ -170,7 +198,8 @@ export async function downloadLlamaServer(destDir, onProgress) {
   try {
     fs.mkdirSync(destDir, { recursive: true });
 
-    const release = await fetchJson('https://api.github.com/repos/ggml-org/llama.cpp/releases/latest');
+    if (onProgress) onProgress({ phase, status: 'running', message: 'Checking latest llama-server release...' });
+    const release = await fetchLatestRelease('ggml-org', 'llama.cpp');
     const asset = pickWindowsCudaAsset(release.assets || []);
     if (!asset) {
       throw new Error('Could not find a Windows CUDA (or CPU fallback) build asset in the latest llama.cpp release');
@@ -178,12 +207,13 @@ export async function downloadLlamaServer(destDir, onProgress) {
 
     const zipPath = path.join(os.tmpdir(), `disposai-llama-server-${Date.now()}.zip`);
     await downloadFile(asset.browser_download_url, zipPath, ({ bytesDownloaded, totalBytes }) => {
-      if (onProgress) onProgress({ phase, status: 'running', bytesDownloaded, totalBytes });
+      if (onProgress) onProgress({ phase, status: 'running', message: 'Downloading llama-server.exe...', bytesDownloaded, totalBytes });
     });
 
+    if (onProgress) onProgress({ phase, status: 'running', message: 'Installing llama-server.exe...' });
     await extractAndFindExe(zipPath, 'llama-server.exe', destDir);
 
-    if (onProgress) onProgress({ phase, status: 'done' });
+    if (onProgress) onProgress({ phase, status: 'done', message: 'llama-server.exe installed' });
   } catch (err) {
     if (onProgress) onProgress({ phase, status: 'error', message: err.message });
     throw err;
@@ -199,7 +229,8 @@ export async function downloadSdBinary(destDir, onProgress) {
   try {
     fs.mkdirSync(destDir, { recursive: true });
 
-    const release = await fetchJson('https://api.github.com/repos/leejet/stable-diffusion.cpp/releases/latest');
+    if (onProgress) onProgress({ phase, status: 'running', message: 'Checking latest sd.exe release...' });
+    const release = await fetchLatestRelease('leejet', 'stable-diffusion.cpp');
     const asset = pickWindowsCudaAsset(release.assets || []);
     if (!asset) {
       throw new Error('Could not find a Windows CUDA (or CPU fallback) build asset in the latest stable-diffusion.cpp release');
@@ -207,12 +238,17 @@ export async function downloadSdBinary(destDir, onProgress) {
 
     const zipPath = path.join(os.tmpdir(), `disposai-sd-${Date.now()}.zip`);
     await downloadFile(asset.browser_download_url, zipPath, ({ bytesDownloaded, totalBytes }) => {
-      if (onProgress) onProgress({ phase, status: 'running', bytesDownloaded, totalBytes });
+      if (onProgress) onProgress({ phase, status: 'running', message: 'Downloading sd.exe...', bytesDownloaded, totalBytes });
     });
 
-    await extractAndFindExe(zipPath, 'sd.exe', destDir);
+    if (onProgress) onProgress({ phase, status: 'running', message: 'Installing sd.exe...' });
+    // stable-diffusion.cpp renamed its CLI binary from sd.exe to sd-cli.exe
+    // upstream; the daemon's sd-backend still expects the file to be named
+    // sd.exe (DISPOS_SD_BINARY, its .lmstudio fallback paths, and `where
+    // sd.exe` all hardcode that name), so keep that as the on-disk name here.
+    await extractAndFindExe(zipPath, ['sd.exe', 'sd-cli.exe'], destDir, 'sd.exe');
 
-    if (onProgress) onProgress({ phase, status: 'done' });
+    if (onProgress) onProgress({ phase, status: 'done', message: 'sd.exe installed' });
   } catch (err) {
     if (onProgress) onProgress({ phase, status: 'error', message: err.message });
     throw err;
@@ -233,10 +269,11 @@ export async function ensureUv(destDir, onProgress) {
     fs.mkdirSync(destDir, { recursive: true });
 
     if (fs.existsSync(uvPath)) {
-      if (onProgress) onProgress({ phase, status: 'done', skipped: true });
+      if (onProgress) onProgress({ phase, status: 'done', skipped: true, message: 'uv already installed' });
       return uvPath;
     }
 
+    if (onProgress) onProgress({ phase, status: 'running', message: 'Checking latest uv release...' });
     const release = await fetchJson('https://api.github.com/repos/astral-sh/uv/releases/latest');
     const asset = (release.assets || []).find((a) => {
       const name = a.name.toLowerCase();
@@ -248,12 +285,13 @@ export async function ensureUv(destDir, onProgress) {
 
     const zipPath = path.join(os.tmpdir(), `disposai-uv-${Date.now()}.zip`);
     await downloadFile(asset.browser_download_url, zipPath, ({ bytesDownloaded, totalBytes }) => {
-      if (onProgress) onProgress({ phase, status: 'running', bytesDownloaded, totalBytes });
+      if (onProgress) onProgress({ phase, status: 'running', message: 'Downloading uv...', bytesDownloaded, totalBytes });
     });
 
+    if (onProgress) onProgress({ phase, status: 'running', message: 'Installing uv...' });
     const resultPath = await extractAndFindExe(zipPath, 'uv.exe', destDir);
 
-    if (onProgress) onProgress({ phase, status: 'done' });
+    if (onProgress) onProgress({ phase, status: 'done', message: 'uv installed' });
     return resultPath;
   } catch (err) {
     if (onProgress) onProgress({ phase, status: 'error', message: err.message });

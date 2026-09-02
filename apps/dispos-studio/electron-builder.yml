@@ -9,6 +9,7 @@ files:
   - electron-main.js
   - preload*.js
   - src/assets/**/*
+  - scripts/download-binaries.mjs
 
 extraResources:
   - from: resources/daemon-core.exe

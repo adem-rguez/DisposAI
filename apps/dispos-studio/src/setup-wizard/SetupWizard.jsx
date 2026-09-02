@@ -67,6 +67,15 @@ function StatusIcon({ status }) {
   return <div className="wiz-status-dot pending" />;
 }
 
+function formatStepStatusText(step) {
+  const parts = [];
+  if (step.message) parts.push(step.message);
+  if (step.status === 'running' && step.totalBytes && step.bytesDownloaded != null) {
+    parts.push(`${formatBytes(step.bytesDownloaded)} / ${formatBytes(step.totalBytes)}`);
+  }
+  return parts.join(' — ');
+}
+
 function StepProgressBar({ step }) {
   if (step.status === 'pending') return <div className="wiz-progress-track wiz-progress-empty" />;
   if (step.status === 'done') return <div className="wiz-progress-track"><div className="wiz-progress-fill done" style={{ width: '100%' }} /></div>;
@@ -110,7 +119,12 @@ export default function SetupWizard() {
   useEffect(() => {
     if (!window.disposWizard) return;
     window.disposWizard.onProgress(applyProgress);
-    window.disposWizard.onComplete(() => setStep(3));
+    window.disposWizard.onComplete(() => {
+      setInstallSteps((prev) => {
+        if (!prev.some((s) => s.status === 'error')) setStep(3);
+        return prev;
+      });
+    });
   }, [applyProgress]);
 
   const handleContinue = () => {
@@ -189,6 +203,9 @@ export default function SetupWizard() {
                   <StepProgressBar step={s} />
                   {s.status === 'error' && s.message && (
                     <div className="wizard-step-error-msg">{s.message}</div>
+                  )}
+                  {s.status !== 'error' && s.status !== 'pending' && formatStepStatusText(s) && (
+                    <div className="wizard-step-status-msg">{formatStepStatusText(s)}</div>
                   )}
                 </div>
                 {s.status === 'error' && (

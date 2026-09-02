@@ -188,6 +188,11 @@ body {
   color: #f87171;
 }
 
+.wizard-step-status-msg {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+}
+
 .wizard-status-icon.done {
   color: var(--accent-green);
 }
