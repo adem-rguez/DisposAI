@@ -3,7 +3,7 @@
 # ⚡ DisposAI
 
 **A high-performance, resident local inference daemon & multimodal AI studio written in Rust.**  
-*Every model at your disposal — powered by Dynamic Model Toolization (DMT), Zero-OOM memory budgeting, native CUDA acceleration, and drop-in OpenAI API compatibility.*
+*Every model at your disposal — powered by Dynamic Model Toolization (DMT), hardware-aware memory budgeting, native CUDA acceleration, and drop-in OpenAI API compatibility.*
 
 [![CI](https://github.com/adem-rguez/DisposAI/actions/workflows/ci.yml/badge.svg)](https://github.com/adem-rguez/DisposAI/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/Rust-1.78%2B-orange?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
@@ -103,7 +103,7 @@ Through **Dynamic Model Toolization (DMT)**, the orchestrator LLM is not confine
 
 ## ✨ Key Features
 
-### 🛡️ 1. Zero-OOM Hardware Profiler & Pre-Download Fit Estimator
+### 🛡️ 1. Hardware-Aware Memory Budgeting
 - **Active Hardware Telemetry**: Automatically probes CPU cores, system RAM, NVIDIA GPU VRAM (via NVML / `nvidia-smi`), and memory headroom.
 - **Pre-Download Mathematical Fit Estimator**: Computes model weights, quantization overhead, and KV-cache sizing for your target context length to predict whether a model will fit in VRAM or RAM **before you spend time and bandwidth downloading it**.
 - **VRAM Arbiter**: Prevents out-of-memory panics by budgeting allocations across concurrently active backends.
